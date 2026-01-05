@@ -380,12 +380,22 @@ class ArbBot:
                     else:
                         logger.warning(balance_msg)
 
-                # Verify trading readiness (balance + allowance)
+                # Verify trading readiness (balance + allowance) - FATAL if not ready
                 ready, ready_msg = await self.execution_engine.verify_trading_ready()
                 if ready:
                     logger.info(ready_msg)
                 else:
-                    logger.warning(ready_msg)
+                    logger.error("=" * 60)
+                    logger.error("FATAL: NOT READY FOR LIVE TRADING")
+                    logger.error("=" * 60)
+                    logger.error(ready_msg)
+                    logger.error("")
+                    logger.error("Options:")
+                    logger.error("  1. Set DRY_RUN=true in .env for paper trading")
+                    logger.error("  2. Deposit USDC to your wallet")
+                    logger.error("  3. Approve USDC spending via Polymarket UI")
+                    logger.error("=" * 60)
+                    raise RuntimeError(f"Not ready for live trading: {ready_msg}")
 
             except Exception as e:
                 logger.error(f"Authentication failed: {e}")
