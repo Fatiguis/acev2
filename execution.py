@@ -2482,17 +2482,21 @@ class ExecutionEngine:
         self,
         token_id: str,
         current_position_side: str,
-        size_usd: float
+        size_usd: float,
+        current_price: float = 0.5
     ) -> Optional[OrderResult]:
         """
-        Add negative exposure to lock in profits.
+        Add negative exposure to lock in profits using post-only GTC for maker rebates.
 
         When price moves favorably, buy the opposing side to lock in gains.
+        Per audit: Profit-lock orders are NOT time-sensitive (position already favorable),
+        so use post-only GTC with 30s timeout for maker rebates, same as hedge orders.
 
         Args:
             token_id: Token to hedge.
             current_position_side: Current position side ("BUY" or "SELL").
             size_usd: Size to hedge in USD.
+            current_price: Current market price for price improvement.
 
         Returns:
             OrderResult or None.
@@ -2503,15 +2507,56 @@ class ExecutionEngine:
 
         # Opposite side to hedge
         hedge_side = SELL if current_position_side == "BUY" else BUY
+        use_post_only = self.config.trading.use_post_only_hedges
+        hedge_timeout = self.config.trading.post_only_hedge_timeout_seconds
 
         try:
-            return await self._place_market_order(
+            result = None
+
+            # Try post-only GTC first for maker rebates (profit-lock is not time-sensitive)
+            if use_post_only:
+                try:
+                    result = await self._place_hedge_post_only(
+                        token_id=token_id,
+                        outcome_name="profit_lock",
+                        side=hedge_side,
+                        size_usd=size_usd,
+                        limit_price=current_price,
+                        timeout_seconds=hedge_timeout
+                    )
+
+                    if result and result.status == OrderStatus.FILLED:
+                        # Track as maker fill
+                        self._maker_fills += 1
+                        self._maker_volume_usd += result.executed_size_usd
+                        logger.info(
+                            f"Profit-lock FILLED (MAKER): {hedge_side} ${result.executed_size_usd:.2f} "
+                            f"(rebate earned!)"
+                        )
+                        self._check_maker_ratio_alert()
+                        return result
+
+                except Exception as e:
+                    logger.warning(f"Post-only profit-lock failed: {e}, falling back to FAK")
+
+            # FAK fallback
+            result = await self._place_market_order(
                 token_id=token_id,
-                outcome_name="hedge",
+                outcome_name="profit_lock",
                 side=hedge_side,
                 size_usd=size_usd,
-                limit_price=0.5  # Will be market order
+                limit_price=current_price
             )
+
+            if result and result.status == OrderStatus.FILLED:
+                # Track as taker fill
+                self._taker_fills += 1
+                self._taker_volume_usd += result.executed_size_usd
+                logger.info(f"Profit-lock FILLED (TAKER): {hedge_side} ${result.executed_size_usd:.2f}")
+                self._check_maker_ratio_alert()
+
+            return result
+
         except Exception as e:
             logger.error(f"Failed to add negative exposure: {e}")
             return None

@@ -350,23 +350,49 @@ class PolymarketWebSocket:
             logger.error(f"Unsubscribe failed: {e}")
 
     async def _resubscribe(self):
-        """Resubscribe to all tokens after reconnection."""
+        """
+        Burst resubscribe to all tokens after reconnection.
+
+        Sends subscriptions in batches to avoid overwhelming the WS server.
+        Clears stale cache data before starting fresh updates.
+        """
         if not self._subscribed_tokens:
             return
 
         token_list = list(self._subscribed_tokens)
-        subscribe_msg = {
-            "type": "subscribe",
-            "channel": "market",
-            "assets_ids": token_list,
-        }
+        total_tokens = len(token_list)
 
-        try:
-            await self._ws.send(json.dumps(subscribe_msg))
-            logger.info(f"Resubscribed to {len(token_list)} tokens after reconnect")
+        # Clear stale cache before rebuilding (per audit: full cache rebuild on reconnect)
+        logger.info(f"Clearing {self._cache.get_stats()['total_books']} stale cache entries before resubscribe")
+        self._cache.clear()
 
-        except Exception as e:
-            logger.error(f"Resubscription failed: {e}")
+        # Burst resubscribe in chunks of 100 (WS can handle batches)
+        # Small delay between batches to avoid server-side throttling
+        BATCH_SIZE = 100
+        BATCH_DELAY = 0.1  # 100ms between batches
+
+        for i in range(0, total_tokens, BATCH_SIZE):
+            batch = token_list[i:i + BATCH_SIZE]
+
+            subscribe_msg = {
+                "type": "subscribe",
+                "channel": "market",
+                "assets_ids": batch,
+            }
+
+            try:
+                await self._ws.send(json.dumps(subscribe_msg))
+                logger.debug(f"Resubscribed batch {i//BATCH_SIZE + 1}: {len(batch)} tokens")
+
+                # Small delay between batches (except last batch)
+                if i + BATCH_SIZE < total_tokens:
+                    await asyncio.sleep(BATCH_DELAY)
+
+            except Exception as e:
+                logger.error(f"Batch resubscription failed at offset {i}: {e}")
+                # Continue with remaining batches
+
+        logger.info(f"Burst resubscribed to {total_tokens} tokens in {(total_tokens + BATCH_SIZE - 1) // BATCH_SIZE} batches")
 
     async def _receive_loop(self):
         """Background loop to receive and process messages."""
@@ -411,12 +437,25 @@ class PolymarketWebSocket:
                 logger.debug(f"Heartbeat error: {e}")
 
     async def _handle_disconnect(self):
-        """Handle websocket disconnection with reconnection."""
+        """
+        Handle websocket disconnection with reconnection.
+
+        Per audit: Clear cache immediately on disconnect to prevent stale data
+        from being used during reconnect window. Cache will be rebuilt fresh
+        after successful reconnect via _resubscribe().
+        """
         if self._state == ConnectionState.DISCONNECTED:
             return
 
         self._state = ConnectionState.RECONNECTING
         self._ws = None
+
+        # Clear cache immediately - stale data could cause bad trades
+        # Cache will rebuild automatically when _resubscribe() triggers fresh updates
+        stale_count = self._cache.get_stats()['total_books']
+        if stale_count > 0:
+            logger.warning(f"Clearing {stale_count} potentially stale cache entries on disconnect")
+            self._cache.clear()
 
         while self._reconnect_attempts < self._max_reconnect_attempts:
             self._reconnect_attempts += 1
@@ -432,6 +471,8 @@ class PolymarketWebSocket:
             await asyncio.sleep(delay)
 
             if await self.connect():
+                # Reconnect successful - _resubscribe() already called in connect()
+                logger.info("WS reconnect complete - cache will rebuild from fresh updates")
                 return
 
         logger.error("Max reconnection attempts reached")

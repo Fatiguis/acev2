@@ -30,6 +30,7 @@ from positions import PositionMonitor, ProfitLocker
 from risk import RiskManager, DepthValidator, TradeRecord
 from edge_model import EdgeExpectancyModel, MarketHeat
 from supervisor import get_supervisor, heartbeat as supervisor_heartbeat
+from clob_client_patch import patch_clob_client
 
 # Optional WebSocket support
 try:
@@ -1435,6 +1436,10 @@ async def main():
 
     # Setup logging
     setup_logging(config.logging)
+
+    # Patch py-clob-client HTTP helpers with global rate limiter
+    # This catches rare 429s from internal client calls (post_order, get_order, etc.)
+    patch_clob_client()
 
     logger.info("Starting Polymarket Arbitrage Bot with supervisor...")
 
