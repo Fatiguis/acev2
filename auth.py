@@ -603,6 +603,7 @@ class AuthManager:
 
         Args:
             min_balance: Minimum required balance (defaults to starting_capital_usd).
+                         If starting_capital_usd is 0, uses min_trade_size_usd as minimum.
 
         Returns:
             Tuple of (sufficient, message).
@@ -613,15 +614,19 @@ class AuthManager:
         if min_balance is None:
             min_balance = self.config.starting_capital_usd
 
+        # If starting_capital_usd is 0 (dynamic mode), use min_trade_size as floor
+        if min_balance <= 0:
+            min_balance = self.config.trading.min_trade_size_usd
+
         balance = self.get_usdc_balance()
 
         if balance is None:
             return False, "Unable to fetch USDC balance"
 
         if balance < min_balance:
-            return False, f"Insufficient balance: ${balance:,.2f} < required ${min_balance:,.2f}"
+            return False, f"Low balance: ${balance:,.2f} (min ${min_balance:,.2f} for trading)"
 
-        return True, f"Balance sufficient: ${balance:,.2f}"
+        return True, f"Balance: ${balance:,.2f}"
 
     def get_matic_balance(self, address: Optional[str] = None, max_retries: int = 3) -> Optional[float]:
         """

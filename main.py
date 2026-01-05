@@ -310,7 +310,10 @@ class ArbBot:
         self._trades_executed = 0
 
         # rn1-style sizing tracking
+        # If starting_capital_usd is 0, we'll set this from actual balance at init
         self._current_capital = config.starting_capital_usd
+        self._last_balance_refresh: Optional[datetime] = None
+        self._balance_refresh_interval = 300  # Refresh balance every 5 minutes
 
     def _is_active_hours(self) -> bool:
         """Check if current time is within active trading hours."""
@@ -458,13 +461,51 @@ class ArbBot:
         """Update tracked capital after a trade."""
         self._current_capital += profit_usd
 
+    async def _refresh_balance(self) -> Optional[float]:
+        """
+        Refresh USDC balance from chain.
+
+        Returns:
+            Current balance in USD, or None if failed.
+        """
+        try:
+            balance = self.execution_engine.check_balance()
+            if balance is not None:
+                self._last_balance_refresh = datetime.now(timezone.utc)
+                logger.debug(f"Balance refreshed: ${balance:,.2f}")
+                return balance
+        except Exception as e:
+            logger.warning(f"Failed to refresh balance: {e}")
+        return None
+
+    async def _maybe_refresh_balance(self):
+        """Periodically refresh balance to keep capital tracking accurate."""
+        if self._last_balance_refresh is None:
+            return
+
+        now = datetime.now(timezone.utc)
+        elapsed = (now - self._last_balance_refresh).total_seconds()
+
+        if elapsed >= self._balance_refresh_interval:
+            balance = await self._refresh_balance()
+            if balance is not None:
+                # Update current capital to actual balance
+                # This catches deposits/withdrawals and corrects drift
+                old_capital = self._current_capital
+                self._current_capital = balance
+                if abs(old_capital - balance) > 1.0:
+                    logger.info(f"Capital updated: ${old_capital:,.2f} -> ${balance:,.2f}")
+
     async def initialize(self):
         """Initialize all modules and connections."""
         logger.info("=" * 60)
         logger.info("POLYMARKET MICROSTRUCTURE ARBITRAGE BOT v2.1")
         logger.info("=" * 60)
         logger.info(f"Mode: {'DRY RUN' if self.config.dry_run else 'LIVE TRADING'}")
-        logger.info(f"Starting capital: ${self.config.starting_capital_usd:,.2f}")
+        if self.config.starting_capital_usd > 0:
+            logger.info(f"Starting capital: ${self.config.starting_capital_usd:,.2f}")
+        else:
+            logger.info("Starting capital: DYNAMIC (will use actual balance)")
         logger.info(f"Min volume filter: ${self.config.trading.min_volume_usd:,.0f}")
         logger.info(f"Min depth: ${self.config.trading.min_depth_usd:,.0f}")
         logger.info(f"Base arb threshold: {self.config.trading.arb_threshold_base * 100:.2f}%")
@@ -480,14 +521,15 @@ class ArbBot:
         logger.info(f"Capital scaling factor: {self.config.trading.capital_scaling_factor}")
         logger.info(f"Min trade size: ${self.config.trading.min_trade_size_usd:.0f}")
 
-        # Show rn1 target metrics
-        rn1_targets = get_rn1_target_metrics(self.config.starting_capital_usd, days=90)
-        logger.info("-" * 60)
-        logger.info("RN1 BENCHMARK TARGETS (90 days)")
-        logger.info(f"Target daily geo return: {rn1_targets['rn1_daily_geo_return_pct']:.1f}%")
-        logger.info(f"Target capital (90d): ${rn1_targets['target_capital']:,.0f}")
-        logger.info(f"Target trades/day: {rn1_targets['trades_per_day_target']}")
-        logger.info(f"Target avg edge: {rn1_targets['avg_edge_pct']:.1f}%")
+        # Show rn1 target metrics (only if starting capital is defined)
+        if self.config.starting_capital_usd > 0:
+            rn1_targets = get_rn1_target_metrics(self.config.starting_capital_usd, days=90)
+            logger.info("-" * 60)
+            logger.info("RN1 BENCHMARK TARGETS (90 days)")
+            logger.info(f"Target daily geo return: {rn1_targets['rn1_daily_geo_return_pct']:.1f}%")
+            logger.info(f"Target capital (90d): ${rn1_targets['target_capital']:,.0f}")
+            logger.info(f"Target trades/day: {rn1_targets['trades_per_day_target']}")
+            logger.info(f"Target avg edge: {rn1_targets['avg_edge_pct']:.1f}%")
 
         # WebSocket mandatory mode
         if self._ws_required:
@@ -549,12 +591,21 @@ class ArbBot:
                 if use_multi_wallet:
                     total_balance = self.wallet_manager.get_total_available_balance()
                     logger.info(f"Total USDC across all wallets: ${total_balance:,.2f}")
+                    actual_balance = total_balance
                 else:
                     balance_ok, balance_msg = self.auth_manager.verify_sufficient_balance()
                     if balance_ok:
                         logger.info(balance_msg)
                     else:
                         logger.warning(balance_msg)
+                    actual_balance = self.auth_manager.get_usdc_balance() or 0.0
+
+                # Dynamic capital: if starting_capital_usd is 0, use actual balance
+                if self.config.starting_capital_usd <= 0 and actual_balance > 0:
+                    self._current_capital = actual_balance
+                    self.metrics_exporter.set_starting_capital(actual_balance)
+                    logger.info(f"Dynamic capital mode: using actual balance ${actual_balance:,.2f}")
+                self._last_balance_refresh = datetime.now(timezone.utc)
 
                 # Verify trading readiness (balance + allowance) - FATAL if not ready
                 ready, ready_msg = await self.execution_engine.verify_trading_ready()
@@ -1166,6 +1217,9 @@ class ArbBot:
                     await self.check_and_claim_winnings()
                     last_claim_check = now
 
+                # Periodic balance refresh (every 5 minutes)
+                await self._maybe_refresh_balance()
+
                 # Hourly stats logging
                 if (now - last_hourly_stats).total_seconds() >= 3600:
                     self._log_hourly_stats()
@@ -1210,6 +1264,9 @@ class ArbBot:
                 if (now - last_claim_check).total_seconds() >= claim_interval:
                     await self.check_and_claim_winnings()
                     last_claim_check = now
+
+                # Periodic balance refresh (every 5 minutes)
+                await self._maybe_refresh_balance()
 
                 # Hourly stats logging
                 if (now - last_hourly_stats).total_seconds() >= 3600:

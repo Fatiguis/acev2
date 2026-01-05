@@ -672,22 +672,26 @@ class ExecutionEngine:
         if self.config.dry_run:
             return True, "Dry run mode - ready"
 
-        # Check balance
-        balance = self.check_balance()
-        if balance is None:
-            return False, "Failed to check USDC balance"
-
         # Use funder address for display (where USDC is held)
         display_wallet = self._funder_address or self._wallet_address
 
-        if balance < 1.0:  # Minimum $1 to trade
-            return False, f"Insufficient USDC balance: ${balance:.2f}. Deposit USDC to wallet {display_wallet}"
+        # Check balance - if RPC fails, continue with warning (not fatal)
+        balance = self.check_balance()
+        if balance is None:
+            logger.warning("Could not verify USDC balance (RPC issue) - will attempt trades anyway")
+            balance_msg = "Balance: unknown (RPC issue)"
+        elif balance < self.config.trading.min_trade_size_usd:
+            # Low balance warning, but not fatal - let trades fail naturally
+            logger.warning(f"Low USDC balance: ${balance:.2f} < min trade ${self.config.trading.min_trade_size_usd:.2f}")
+            balance_msg = f"Balance: ${balance:.2f} (low)"
+        else:
+            balance_msg = f"Balance: ${balance:.2f}"
 
         # Check allowance (no auto-approve for proxy wallets)
         allowance = self.check_allowance()
         if allowance is None:
-            logger.warning("Could not check allowance - will attempt trades anyway")
-            return True, f"Balance: ${balance:.2f}, Allowance: unknown"
+            logger.warning("Could not check allowance (RPC issue) - will attempt trades anyway")
+            return True, f"{balance_msg}, Allowance: unknown"
 
         if allowance < 1.0:
             # Log helpful message for manual approval
@@ -707,7 +711,7 @@ class ExecutionEngine:
             logger.warning("=" * 60)
             return False, "Manual USDC approval required via Polymarket UI"
 
-        return True, f"Ready to trade. Balance: ${balance:.2f}, Allowance: ${allowance:.2f}"
+        return True, f"Ready to trade. {balance_msg}, Allowance: ${allowance:.2f}"
 
     def check_max_approval(self, spender_address: Optional[str] = None) -> bool:
         """

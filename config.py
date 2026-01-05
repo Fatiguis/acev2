@@ -464,8 +464,9 @@ class BotConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     # Starting capital for position sizing calculations
+    # Optional: defaults to 0.0 (uses actual balance dynamically)
     starting_capital_usd: float = field(
-        default_factory=lambda: float(os.getenv("STARTING_CAPITAL", "1000"))
+        default_factory=lambda: float(os.getenv("STARTING_CAPITAL", "0"))
     )
 
     # Dry run mode (no actual trades)
