@@ -73,7 +73,9 @@ async def _retry_rpc_with_backoff(
     raise last_exception
 
 
-# ConditionalTokens ABI (minimal for redeeming)
+# ConditionalTokens ABI (extended per Grok audit - was truncated)
+# Includes redeemPositions, balanceOf, payoutDenominator, payoutNumerators, getConditionId
+# These are needed for proper dispute handling and position status checking
 CONDITIONAL_TOKENS_ABI = json.loads('''
 [
     {
@@ -106,18 +108,54 @@ CONDITIONAL_TOKENS_ABI = json.loads('''
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "index", "type": "uint256"}
+        ],
+        "name": "payoutNumerators",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "oracle", "type": "address"},
+            {"name": "questionId", "type": "bytes32"},
+            {"name": "outcomeSlotCount", "type": "uint256"}
+        ],
+        "name": "getConditionId",
+        "outputs": [{"name": "", "type": "bytes32"}],
+        "stateMutability": "pure",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "conditionId", "type": "bytes32"}
+        ],
+        "name": "getOutcomeSlotCount",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function"
     }
 ]
 ''')
 
 
 class PositionStatus(Enum):
-    """Status of a position."""
+    """
+    Status of a position.
+
+    Per Grok audit: Added detailed dispute handling for UMA Optimistic Oracle.
+    Polymarket uses UMA for resolution - disputes can invalidate outcomes.
+    """
     OPEN = "open"
     WINNING = "winning"
     LOSING = "losing"
     CLAIMED = "claimed"
     DISPUTED = "disputed"  # Market is disputed (payoutDenominator == 0 after resolution)
+    DISPUTE_PENDING = "dispute_pending"  # Dispute raised, awaiting DVM resolution
     UNKNOWN = "unknown"
 
 

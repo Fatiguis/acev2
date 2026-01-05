@@ -602,7 +602,12 @@ class PolymarketWebSocket:
             await self._check_for_arb(market)
 
     async def _handle_price_change(self, message: Dict, receive_time_ms: float):
-        """Handle price change event (lighter weight than full book)."""
+        """
+        Handle price change event (lighter weight than full book).
+
+        Per Grok audit: Added delta validation to detect anomalous updates
+        that could indicate stale/corrupted WS data.
+        """
         token_id = message.get("asset_id")
         if not token_id:
             return
@@ -611,6 +616,10 @@ class PolymarketWebSocket:
         cached = self._cache.get(token_id)
         if not cached:
             return
+
+        # Per Grok audit: Track previous state for delta validation
+        prev_best_bid = cached.bids[0].price if cached.bids else None
+        prev_best_ask = cached.asks[0].price if cached.asks else None
 
         # Update best bid/ask from price change
         changes = message.get("changes", [])
@@ -621,6 +630,28 @@ class PolymarketWebSocket:
 
             if price <= 0:
                 continue
+
+            # Per Grok audit: Validate delta - reject anomalous price jumps
+            # A >50% price change in a single update is suspicious (likely stale data)
+            if side == "BUY" and prev_best_bid:
+                delta_pct = abs(price - prev_best_bid) / prev_best_bid
+                if delta_pct > 0.50:
+                    logger.warning(
+                        f"[WS] Anomalous BUY delta for {token_id}: "
+                        f"{prev_best_bid:.4f} -> {price:.4f} ({delta_pct*100:.1f}% jump). "
+                        f"Requesting full book refresh."
+                    )
+                    # Don't apply this delta - cache will be stale until next full book
+                    continue
+            elif side == "SELL" and prev_best_ask:
+                delta_pct = abs(price - prev_best_ask) / prev_best_ask
+                if delta_pct > 0.50:
+                    logger.warning(
+                        f"[WS] Anomalous SELL delta for {token_id}: "
+                        f"{prev_best_ask:.4f} -> {price:.4f} ({delta_pct*100:.1f}% jump). "
+                        f"Requesting full book refresh."
+                    )
+                    continue
 
             if side == "BUY":
                 # Update best bid

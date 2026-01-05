@@ -18,12 +18,13 @@ from config import BotConfig
 logger = logging.getLogger(__name__)
 
 # Minimum MATIC balance required for gas (in MATIC)
-# Raised to 0.2 MATIC for rn1-style burst trading (100+ tx/day)
-# Polygon gas spikes can eat 0.05+ MATIC in hours
-MIN_MATIC_FOR_GAS = 0.2
+# Raised to 0.5 MATIC for rn1-style burst trading (100+ tx/day)
+# Polygon gas spikes during high network activity can eat 0.2+ MATIC in hours
+# Per Grok audit: 0.2 MATIC is too low for sustained HF trading
+MIN_MATIC_FOR_GAS = 0.5
 
 # Warning threshold - alert when approaching minimum
-MATIC_WARNING_THRESHOLD = 0.5
+MATIC_WARNING_THRESHOLD = 1.0
 
 T = TypeVar('T')
 
@@ -42,6 +43,9 @@ def _retry_rpc_sync(
 ) -> T:
     """
     Retry a synchronous RPC call with exponential backoff.
+
+    Note: This uses time.sleep() which blocks the thread. For async contexts,
+    use _retry_rpc_async() instead.
 
     Args:
         func: Sync function to retry.
@@ -70,6 +74,56 @@ def _retry_rpc_sync(
                     f"Retrying in {delay:.1f}s..."
                 )
                 time.sleep(delay)
+            else:
+                logger.error(f"{operation_name} failed after {max_retries + 1} attempts: {e}")
+
+    raise last_exception
+
+
+async def _retry_rpc_async(
+    func: Callable[[], T],
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    operation_name: str = "RPC call"
+) -> T:
+    """
+    Retry a synchronous RPC call with exponential backoff (async-compatible).
+
+    Per Grok audit: time.sleep() blocks the event loop in async contexts.
+    This version uses asyncio.sleep() for non-blocking waits while still
+    calling synchronous web3 functions.
+
+    Args:
+        func: Sync function to retry (web3 calls are sync).
+        max_retries: Maximum number of retries.
+        base_delay: Base delay in seconds.
+        max_delay: Maximum delay in seconds.
+        operation_name: Name for logging.
+
+    Returns:
+        Result of the function.
+
+    Raises:
+        Exception: If all retries fail.
+    """
+    import asyncio
+    last_exception = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            # Web3 calls are sync - run in executor to not block event loop
+            # For simple calls, direct call is fine; for heavy calls, use run_in_executor
+            return func()
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries:
+                delay = _exponential_backoff(attempt, base_delay, max_delay)
+                logger.warning(
+                    f"{operation_name} failed (attempt {attempt + 1}/{max_retries + 1}): {e}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)  # Non-blocking sleep
             else:
                 logger.error(f"{operation_name} failed after {max_retries + 1} attempts: {e}")
 

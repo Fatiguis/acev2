@@ -120,17 +120,20 @@ class MarketDiscovery:
         self,
         url: str,
         params: Optional[Dict] = None,
-        max_retries: Optional[int] = None
+        max_retries: Optional[int] = None,
+        pre_request_delay: float = 0.1
     ) -> Optional[Any]:
         """
         Fetch JSON from a URL with exponential backoff retry.
 
         Uses global rate limiter for coordinated backoff across all HTTP clients.
+        Per Grok audit: Added explicit pre-request delay to avoid Gamma API rate limits.
 
         Args:
             url: URL to fetch.
             params: Query parameters.
             max_retries: Maximum retry attempts (defaults to config value).
+            pre_request_delay: Delay before each request (Gamma API is undocumented but rate-limited).
 
         Returns:
             Parsed JSON response or None on error.
@@ -144,6 +147,11 @@ class MarketDiscovery:
         # Check if globally rate limited before making request
         if await limiter.wait_if_limited():
             logger.debug(f"Waited for global rate limit before {url}")
+
+        # Per Grok audit: Add explicit rate limiting for Gamma API
+        # Gamma has undocumented rate limits that cause silent failures
+        if "gamma-api" in url:
+            await asyncio.sleep(pre_request_delay)
 
         backoff = self.config.trading.rate_limit_backoff_base
         max_backoff = self.config.trading.rate_limit_backoff_max
@@ -424,12 +432,16 @@ class MarketDiscovery:
         logger.debug(f"Fetched {len(events)} events for {sport_code} (series {series_id})")
         return events
 
-    def filter_high_volume_markets(self, events: List[Event]) -> List[Market]:
+    def filter_high_volume_markets(self, events: List[Event], neg_risk_only: bool = False) -> List[Market]:
         """
         Filter markets by volume threshold.
 
+        Per Grok audit: Added neg_risk_only filter for rn1-style trading.
+        neg_risk markets (winner-take-all) are the primary target for sports arb.
+
         Args:
             events: List of events to filter.
+            neg_risk_only: If True, only return neg_risk markets (default False for backward compat).
 
         Returns:
             List of markets meeting volume criteria.
@@ -440,13 +452,37 @@ class MarketDiscovery:
         for event in events:
             for market in event.markets:
                 if market.volume >= min_volume and market.is_active and not market.is_closed:
+                    # Per Grok audit: Filter for neg_risk markets when requested
+                    if neg_risk_only and not market.neg_risk:
+                        continue
                     market.event_id = event.event_id
                     market.event_title = event.title
                     market.series_id = event.series_id
                     filtered_markets.append(market)
 
-        logger.info(f"Filtered to {len(filtered_markets)} markets with volume >= ${min_volume:,.0f}")
+        neg_risk_count = sum(1 for m in filtered_markets if m.neg_risk)
+        logger.info(
+            f"Filtered to {len(filtered_markets)} markets with volume >= ${min_volume:,.0f} "
+            f"({neg_risk_count} neg_risk)"
+        )
         return filtered_markets
+
+    def filter_neg_risk_markets(self, markets: List[Market]) -> List[Market]:
+        """
+        Filter to only neg_risk markets (winner-take-all).
+
+        Per Grok audit: rn1's primary focus was neg_risk markets for sports arb.
+        These allow shorting without holding tokens (capital efficient).
+
+        Args:
+            markets: List of markets to filter.
+
+        Returns:
+            List of neg_risk markets only.
+        """
+        neg_risk_markets = [m for m in markets if m.neg_risk]
+        logger.info(f"Filtered to {len(neg_risk_markets)} neg_risk markets (from {len(markets)} total)")
+        return neg_risk_markets
 
     def estimate_in_play(self, market: Market) -> bool:
         """

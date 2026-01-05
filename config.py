@@ -41,8 +41,10 @@ class TradingConfig:
     """Trading parameters and thresholds."""
 
     # Minimum market volume in USD to consider for trading
-    # Lowered for in-play focus - live games often have lower volume than politics
-    min_volume_usd: float = 10_000  # Lowered from 15k to catch more in-play opps
+    # Per Grok audit: Lowered to 5k for in-play focus - live sports games often have
+    # lower individual market volume than politics but higher arb frequency.
+    # rn1 captured many small in-play markets with tight spreads.
+    min_volume_usd: float = 5_000  # Lowered from 10k to catch more in-play opps
 
     # Minimum orderbook depth in USD at best price level
     # Lowered to catch more opportunities with smaller depths
@@ -105,8 +107,9 @@ class TradingConfig:
     # Post-only mode: try post-only limit orders first for maker rebates
     # Falls back to FOK market orders if post-only doesn't fill in timeout
     # Maker rebates add ~0.1-0.3% to edge
+    # Per Grok audit: Changed default to true - rn1 preferred maker fills
     use_post_only: bool = field(
-        default_factory=lambda: os.getenv("USE_POST_ONLY", "false").lower() == "true"
+        default_factory=lambda: os.getenv("USE_POST_ONLY", "true").lower() == "true"
     )
 
     # Post-only for HEDGE legs specifically (profit-locking orders)
@@ -116,8 +119,9 @@ class TradingConfig:
         default_factory=lambda: os.getenv("USE_POST_ONLY_HEDGES", "true").lower() == "true"
     )
 
-    # Post-only timeout in seconds before falling back to FOK
-    post_only_timeout_seconds: float = 0.5
+    # Post-only timeout in seconds before falling back to FAK
+    # Per Grok audit: Increased from 0.5s to 1.0s for better maker fill chance
+    post_only_timeout_seconds: float = 1.0
 
     # Post-only timeout for HEDGE orders (longer - hedges are less time-sensitive)
     post_only_hedge_timeout_seconds: float = 30.0
@@ -266,8 +270,9 @@ class TradingConfig:
 class NetworkConfig:
     """Blockchain and API network configuration."""
 
-    # Polygon mainnet chain ID
-    chain_id: int = 137
+    # Polygon mainnet chain ID - HARDCODED per Grok audit
+    # Never allow override - wrong chain_id = lost funds
+    chain_id: int = 137  # MUST be 137 for Polygon mainnet, DO NOT CHANGE
 
     # CLOB API endpoint
     clob_endpoint: str = "https://clob.polymarket.com"

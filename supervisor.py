@@ -42,7 +42,7 @@ class Supervisor:
         max_restarts: int = 10,
         restart_delay_base: float = 5.0,
         restart_delay_max: float = 300.0,
-        heartbeat_timeout: float = 120.0,
+        heartbeat_timeout: float = 30.0,  # Per Grok audit: 120s is too long for HF trading
         cooldown_after_success: float = 300.0,
     ):
         """
@@ -53,6 +53,9 @@ class Supervisor:
             restart_delay_base: Base delay between restarts (exponential backoff).
             restart_delay_max: Maximum delay between restarts.
             heartbeat_timeout: Seconds without heartbeat before force restart.
+                              Per Grok audit: Reduced from 120s to 30s for HF trading.
+                              rn1-style bots should cycle every ~1s, so 30s timeout
+                              catches stuck processes much faster than 2 minutes.
             cooldown_after_success: Seconds of successful running before resetting restart count.
         """
         self.max_restarts = max_restarts

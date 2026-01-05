@@ -1,14 +1,36 @@
-"""Cancel all open orders."""
+"""
+Cancel all open orders.
 
-import asyncio
+Per Grok audit fixes:
+- Check dry_run flag properly (don't use private _dry_run)
+- Handle KeyError on missing order fields
+- Add rate limiting between operations
+"""
+
+import time
 from config import load_config
 from auth import AuthManager
+
+
+def fetch_with_rate_limit(func, *args, delay: float = 0.5, **kwargs):
+    """Execute function with rate limiting."""
+    time.sleep(delay)  # Pre-request delay to avoid bursts
+    return func(*args, **kwargs)
+
 
 def main():
     config = load_config()
 
-    # Override dry_run for this script
-    config._dry_run = False
+    # Check if dry_run is set - warn user but allow override
+    if config.dry_run:
+        print("WARNING: DRY_RUN is enabled in config.")
+        print("This script will cancel real orders regardless.")
+        print("Press Ctrl+C to abort, or wait 3 seconds to continue...")
+        try:
+            time.sleep(3)
+        except KeyboardInterrupt:
+            print("\nAborted.")
+            return
 
     auth = AuthManager(config)
     client = auth.initialize()
@@ -16,8 +38,8 @@ def main():
     print("Fetching open orders...")
 
     try:
-        # Get all open orders
-        open_orders = client.get_orders()
+        # Get all open orders with rate limiting
+        open_orders = fetch_with_rate_limit(client.get_orders, delay=0.2)
 
         if not open_orders:
             print("No open orders found.")
@@ -26,24 +48,57 @@ def main():
         print(f"Found {len(open_orders)} open order(s)")
 
         for order in open_orders:
-            order_id = order.get("id") or order.get("order_id") or order.get("orderID")
+            # Safe extraction with fallbacks (handles KeyError/missing fields)
+            order_id = None
+            for key in ["id", "order_id", "orderID", "orderId"]:
+                try:
+                    order_id = order.get(key)
+                    if order_id:
+                        break
+                except (KeyError, AttributeError, TypeError):
+                    continue
+
             if order_id:
                 print(f"  - Order: {order_id}")
+            else:
+                print(f"  - Order: (unknown id) - raw: {str(order)[:80]}...")
 
-        # Cancel all orders
+        # Cancel all orders with rate limiting
         print("\nCancelling all orders...")
+        time.sleep(0.5)  # Rate limit before cancel
         result = client.cancel_all()
         print(f"Cancel result: {result}")
 
-        # Verify cancellation
-        remaining = client.get_orders()
+        # Verify cancellation with rate limiting
+        time.sleep(1.0)  # Wait for cancellation to propagate
+        remaining = fetch_with_rate_limit(client.get_orders, delay=0.5)
         if remaining:
             print(f"\nWarning: {len(remaining)} orders still open")
+            print("Retrying individual cancellation...")
+            for order in remaining:
+                order_id = None
+                for key in ["id", "order_id", "orderID", "orderId"]:
+                    try:
+                        order_id = order.get(key)
+                        if order_id:
+                            break
+                    except (KeyError, AttributeError, TypeError):
+                        continue
+                if order_id:
+                    try:
+                        time.sleep(0.3)  # Rate limit between cancels
+                        client.cancel(order_id)
+                        print(f"  Cancelled: {order_id}")
+                    except Exception as e:
+                        print(f"  Failed to cancel {order_id}: {e}")
         else:
             print("\nAll orders cancelled successfully!")
 
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()
