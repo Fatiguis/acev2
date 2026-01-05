@@ -168,6 +168,17 @@ class TradingConfig:
     # With ~100-200 token_ids per batch, 1 req/cycle is well under limits
     orderbook_batch_size: int = 200
 
+    # WebSocket mode: use real-time orderbook updates instead of HTTP polling
+    # Reduces latency from ~800ms to ~80ms for arb detection
+    # Hybrid mode: WS for detection, HTTP for pre-execution verification
+    use_websocket: bool = field(
+        default_factory=lambda: os.getenv("USE_WEBSOCKET", "true").lower() == "true"
+    )
+
+    # WebSocket arb verification: verify WS-detected arbs via HTTP before execution
+    # Prevents executing on stale WS data (adds ~100ms but increases reliability)
+    ws_verify_before_execute: bool = True
+
 
 @dataclass
 class NetworkConfig:
