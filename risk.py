@@ -558,6 +558,46 @@ class RiskManager:
         """Get current unhedged exposure in USD."""
         return self._current_unhedged_exposure
 
+    def check_position_age_risk(self, positions: List[Position]) -> List[Position]:
+        """
+        Check for positions approaching resolution that may need early exit.
+
+        Per Grok audit: UMA disputes can lock funds. Positions nearing resolution
+        should be flagged for potential early exit to avoid dispute risk.
+
+        Args:
+            positions: List of current open positions.
+
+        Returns:
+            List of positions that are at risk (>24h old or near resolution).
+        """
+        at_risk = []
+        now = datetime.now(timezone.utc)
+
+        for pos in positions:
+            # Check if position is old (>24 hours) - higher dispute risk
+            if hasattr(pos, 'opened_at') and pos.opened_at:
+                age_hours = (now - pos.opened_at).total_seconds() / 3600
+                if age_hours > 24:
+                    logger.warning(
+                        f"Position {pos.token_id[:16]}... is {age_hours:.1f}h old - "
+                        f"consider exiting to avoid resolution/dispute risk"
+                    )
+                    at_risk.append(pos)
+                    continue
+
+            # Check if market is near resolution (if end_date available)
+            if hasattr(pos, 'market_end_date') and pos.market_end_date:
+                hours_to_end = (pos.market_end_date - now).total_seconds() / 3600
+                if 0 < hours_to_end < 6:  # Within 6 hours of resolution
+                    logger.warning(
+                        f"Position {pos.token_id[:16]}... is {hours_to_end:.1f}h from resolution - "
+                        f"exit immediately to avoid UMA dispute lock"
+                    )
+                    at_risk.append(pos)
+
+        return at_risk
+
     def is_halted(self) -> tuple[bool, Optional[str]]:
         """Check if trading is halted."""
         return self._is_halted, self._halt_reason

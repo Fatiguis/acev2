@@ -54,7 +54,8 @@ class EdgeModelConfig:
     estimated_competitors_blazing: int = 20
 
     # Volume capture thresholds (vs rn1-tier bots)
-    rn1_typical_size_usd: float = 10000.0  # rn1 average trade size
+    # Per Grok audit: rn1 avg trade was $27 (KuCoin verified), not $10k
+    rn1_typical_size_usd: float = 27.0     # rn1 average trade size (KuCoin verified)
     rn1_latency_ms: float = 50.0           # rn1 estimated latency
     our_latency_ms_http: float = 800.0     # Our HTTP polling latency
     our_latency_ms_ws: float = 80.0        # Our WebSocket latency

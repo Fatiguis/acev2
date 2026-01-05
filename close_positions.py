@@ -41,7 +41,9 @@ def get_opposite_token_id(client, token_id: str) -> str | None:
     Get the opposite outcome token ID for hedging.
 
     For binary markets, there's exactly one opposite outcome.
-    For multi-outcome markets, this returns None (more complex hedging needed).
+    For multi-outcome markets (neg-risk), this provides guidance but returns None.
+
+    Per Grok audit: Added multi-outcome detection and user guidance.
 
     Args:
         client: CLOB client.
@@ -68,6 +70,21 @@ def get_opposite_token_id(client, token_id: str) -> str | None:
             for t in tokens:
                 if t.get("token_id") != token_id:
                     return t.get("token_id")
+
+        elif len(tokens) > 2:
+            # Per Grok audit: Multi-outcome market (neg-risk via neg-risk-ctf-adapter)
+            # For multi-outcome, hedging is more complex:
+            # - For neg-risk markets, buying opposite = buying "NO" equivalent
+            # - Find the token with best liquidity that's NOT our current token
+            # This is a simplified heuristic - full implementation would:
+            # 1. Query all outcome books
+            # 2. Find lowest-ask token that hedges our position
+            print(f"    Multi-outcome market detected ({len(tokens)} outcomes)")
+            print(f"    Per Grok audit: Multi-outcome hedging requires manual review")
+            print(f"    Consider using data-api to find all outcome tokens")
+            # For now, return None for multi-outcome - requires manual handling
+            # In production, implement proper neg-risk hedge calculation
+            return None
 
         return None
 

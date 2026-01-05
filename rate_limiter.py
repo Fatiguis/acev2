@@ -144,6 +144,8 @@ async def handle_response_status(status: int, endpoint: str = "") -> bool:
     """
     Handle HTTP response status with rate limit detection.
 
+    Per Grok audit: Handle non-429 rate limit responses (some APIs return 503/5xx).
+
     Args:
         status: HTTP status code.
         endpoint: Endpoint name for logging.
@@ -153,7 +155,11 @@ async def handle_response_status(status: int, endpoint: str = "") -> bool:
     """
     limiter = get_global_limiter()
 
-    if status == 429:
+    # Per Grok audit: Handle various rate limit status codes
+    # 429 = Rate limited (standard)
+    # 503 = Service unavailable (often rate limit)
+    # 520-529 = Cloudflare/proxy rate limits
+    if status == 429 or status == 503 or (520 <= status <= 529):
         await limiter.record_429(endpoint)
         await limiter.wait_if_limited()
         return True  # Should retry
@@ -162,3 +168,23 @@ async def handle_response_status(status: int, endpoint: str = "") -> bool:
         await limiter.record_success()
 
     return False  # No retry needed
+
+
+def is_rate_limit_error(exception: Exception) -> bool:
+    """
+    Check if an exception indicates a rate limit.
+
+    Per Grok audit: py-clob-client exceptions vary - check string patterns.
+
+    Args:
+        exception: The exception to check.
+
+    Returns:
+        True if this looks like a rate limit error.
+    """
+    error_str = str(exception).lower()
+    rate_limit_patterns = [
+        '429', 'rate limit', 'too many', 'throttl',
+        'exceeded', 'slow down', 'quota', 'limit exceeded'
+    ]
+    return any(pattern in error_str for pattern in rate_limit_patterns)

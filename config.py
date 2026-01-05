@@ -548,6 +548,14 @@ def load_config() -> BotConfig:
     """Load and validate configuration."""
     config = BotConfig()
 
+    # Per Grok audit: Enforce chain_id=137 for Polygon mainnet
+    # Wrong chain_id = lost funds. This is non-negotiable.
+    if config.network.chain_id != 137:
+        raise ValueError(
+            f"CRITICAL: chain_id must be 137 (Polygon mainnet), got {config.network.chain_id}. "
+            f"Wrong chain_id will result in lost funds. This is hardcoded for safety."
+        )
+
     # Check for valid authentication: either private key (EOA) or API creds (proxy)
     has_private_key = bool(config.wallet.private_key)
     has_api_creds = bool(config.wallet.all_api_creds)

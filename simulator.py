@@ -31,7 +31,10 @@ RN1_PROFILE = {
     "total_trades": 15396,
     "total_position_value": 417000,  # USD
     "avg_trade_size": 27.1,  # USD per trade
-    "win_rate": 0.68,  # Estimated 68% win rate on arbs
+    # Per Grok audit: Hedged arbs should approach ~100% win rate if properly hedged
+    # 0.68 was observed win rate which includes partial fills and execution failures
+    # For fully hedged arbs, theoretical win rate is ~95%+ (accounting for slippage)
+    "win_rate": 0.95,  # Hedged arb win rate (0.68 was pre-hedge observed rate)
 
     # Sport distribution (observed)
     "sport_weights": {

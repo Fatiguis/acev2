@@ -169,11 +169,13 @@ class ClobClientWrapper:
             client: The ClobClient instance to wrap.
         """
         self._client = client
+        # Per Grok audit: Added get_balance and get_account_balance to rate limited methods
         self._rate_limited_methods = {
             'post_order', 'cancel_order', 'cancel_orders', 'cancel_all_orders',
             'get_order', 'get_orders', 'get_trades', 'get_last_trade_price',
             'get_book', 'get_books', 'get_midpoint', 'get_midpoints',
             'get_price', 'get_prices', 'get_spread', 'get_spreads',
+            'get_balance', 'get_account_balance',  # Per Grok audit: needed for HF funds check
         }
 
     def __getattr__(self, name: str):
