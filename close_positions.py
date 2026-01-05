@@ -1,11 +1,26 @@
 """Close all open positions by selling them at market price."""
 
 import sys
+import time
 from config import load_config
 from auth import AuthManager
 from py_clob_client.clob_types import MarketOrderArgs, OrderType
 from py_clob_client.order_builder.constants import SELL
 import requests
+
+
+def fetch_with_backoff(url: str, max_retries: int = 3, base_backoff: float = 2.0) -> requests.Response:
+    """Fetch URL with exponential backoff for rate limiting."""
+    for attempt in range(max_retries):
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 429:
+            backoff = base_backoff * (2 ** attempt)
+            print(f"Rate limited, waiting {backoff:.1f}s...")
+            time.sleep(backoff)
+            continue
+        return resp
+    return resp  # Return last response even if still 429
+
 
 def main():
     # Check for --confirm flag
@@ -19,10 +34,10 @@ def main():
     print(f"Checking positions for funder: {funder}")
 
     try:
-        # Query positions from the data API
+        # Query positions from the data API with rate limit handling
         print("\nFetching positions from Polymarket API...")
         url = f"https://data-api.polymarket.com/positions?user={funder}"
-        resp = requests.get(url, timeout=10)
+        resp = fetch_with_backoff(url)
 
         if resp.status_code != 200:
             print(f"Failed to fetch positions: HTTP {resp.status_code}")

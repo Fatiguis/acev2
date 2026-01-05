@@ -21,13 +21,10 @@ from orderbook import ArbOpportunity, ArbType
 
 logger = logging.getLogger(__name__)
 
-# IOC (Immediate or Cancel) - allows partial fills unlike FOK
-# py-clob-client may not have IOC directly, we'll use GTC with immediate cancel as fallback
-try:
-    from py_clob_client.clob_types import OrderType as ClobOrderType
-    HAS_IOC = hasattr(ClobOrderType, 'IOC')
-except:
-    HAS_IOC = False
+# FAK (Fill-And-Kill) is Polymarket's IOC equivalent - allows partial fills
+# Unlike FOK (all-or-nothing), FAK fills whatever is available and cancels the rest
+# This is critical for rn1-style high-frequency trading (2-5x more fills)
+HAS_FAK = hasattr(OrderType, 'FAK')  # Should always be True in py-clob-client
 
 # Idempotency tracking for preventing duplicate arbs on restart
 from collections import OrderedDict
@@ -501,8 +498,8 @@ class ExecutionEngine:
         self._session_high_capital = config.starting_capital_usd  # Track session high for drawdown
         self._current_capital = config.starting_capital_usd
 
-        # IOC mode settings
-        self._use_ioc = True  # Use IOC instead of FOK for more fills
+        # FAK (Fill-And-Kill) mode settings - Polymarket's IOC equivalent
+        self._use_ioc = True  # Use FAK instead of FOK for more fills (2-5x fill rate)
         self._partial_hedge_slippage_threshold = 0.003  # 0.3% max slippage for partial hedging
 
     def set_client(self, client: ClobClient):
@@ -1899,9 +1896,10 @@ class ExecutionEngine:
         use_ioc: bool = True
     ) -> OrderResult:
         """
-        Place a market order using IOC (Immediate or Cancel) for more fills.
+        Place a market order using FAK (Fill-And-Kill) for more fills.
 
-        IOC allows partial fills unlike FOK, increasing trade frequency 2-5x.
+        FAK is Polymarket's IOC equivalent - fills available liquidity and auto-cancels remainder.
+        This increases trade frequency 2-5x vs FOK (all-or-nothing).
         On partial fills, immediately hedges the unbalanced leg if slippage < 0.3%.
 
         Args:
@@ -1913,7 +1911,7 @@ class ExecutionEngine:
             retry_on_no_match: If True, retry once on "no match" error.
             client: Optional CLOB client to use (for wallet rotation).
             wallet_state: Optional wallet state for tracking (from WalletManager).
-            use_ioc: If True, use IOC mode (partial fills allowed). Default True.
+            use_ioc: If True, use FAK mode (partial fills allowed). Default True.
 
         Returns:
             OrderResult with execution details.
@@ -1931,38 +1929,39 @@ class ExecutionEngine:
 
         max_attempts = 2 if retry_on_no_match else 1
 
-        # Determine order type: IOC for more fills, FOK as fallback
-        # IOC = Immediate or Cancel (partial fills allowed)
-        # FOK = Fill or Kill (all or nothing)
-        use_ioc_mode = use_ioc and self._use_ioc
+        # Determine order type: FAK for more fills, FOK as fallback
+        # FAK = Fill-And-Kill (Polymarket's IOC - partial fills allowed, remainder auto-cancelled)
+        # FOK = Fill or Kill (all or nothing - higher rejection rate)
+        use_fak_mode = use_ioc and self._use_ioc and HAS_FAK
 
         for attempt in range(max_attempts):
             try:
                 # Create market order args
-                # Note: py-clob-client may not have IOC directly
-                # We simulate IOC using GTC with immediate status check and cancel
+                # FAK (Fill-And-Kill) is Polymarket's native IOC equivalent
+                # It fills whatever liquidity is available and auto-cancels the rest
+                order_type_to_use = OrderType.FAK if use_fak_mode else OrderType.FOK
                 order_args = MarketOrderArgs(
                     token_id=token_id,
                     amount=size_usd,
                     side=side,
-                    order_type=OrderType.GTC if use_ioc_mode else OrderType.FOK
+                    order_type=order_type_to_use
                 )
 
                 # Create and sign the order
                 signed_order = execution_client.create_market_order(order_args)
 
                 # Submit the order
-                order_type_used = OrderType.GTC if use_ioc_mode else OrderType.FOK
-                response = execution_client.post_order(signed_order, order_type_used)
+                response = execution_client.post_order(signed_order, order_type_to_use)
 
                 # Parse response
                 if response and response.get("success"):
                     order_id = response.get("orderID")
                     result.order_id = order_id
 
-                    if use_ioc_mode:
-                        # IOC mode: check fill status after brief wait, cancel remainder
-                        await asyncio.sleep(0.1)  # 100ms for fills to process
+                    if use_fak_mode:
+                        # FAK mode: check actual fill amount (FAK auto-cancels remainder)
+                        # Brief wait for order to process
+                        await asyncio.sleep(0.05)  # 50ms for fills to process
 
                         try:
                             order_status = execution_client.get_order(order_id)
@@ -1977,35 +1976,27 @@ class ExecutionEngine:
                                 if filled_size >= total_size * 0.99:  # ~100% filled
                                     result.status = OrderStatus.FILLED
                                     logger.debug(
-                                        f"IOC filled: {side} {outcome_name} @ {limit_price:.4f} "
+                                        f"FAK filled: {side} {outcome_name} @ {limit_price:.4f} "
                                         f"for ${result.executed_size_usd:.2f}"
                                     )
                                 elif filled_size > 0:
-                                    # Partial fill - cancel remainder
+                                    # Partial fill - FAK auto-cancelled remainder
                                     result.status = OrderStatus.PARTIAL
                                     result.unfilled_size_usd = size_usd - result.executed_size_usd
-                                    try:
-                                        execution_client.cancel(order_id)
-                                    except Exception:
-                                        pass  # Best effort cancel
 
                                     logger.info(
-                                        f"IOC partial: {side} {outcome_name} "
+                                        f"FAK partial: {side} {outcome_name} "
                                         f"${result.executed_size_usd:.2f} filled, "
-                                        f"${result.unfilled_size_usd:.2f} cancelled"
+                                        f"${result.unfilled_size_usd:.2f} auto-cancelled"
                                     )
                                 else:
-                                    # No fill, cancel order
+                                    # No fill - FAK order completed with 0 fills
                                     result.status = OrderStatus.CANCELLED
-                                    try:
-                                        execution_client.cancel(order_id)
-                                    except Exception:
-                                        pass
-                                    logger.debug(f"IOC no fill: {outcome_name}")
+                                    logger.debug(f"FAK no fill: {outcome_name}")
 
                         except Exception as e:
                             # If can't check status, assume filled (optimistic)
-                            logger.debug(f"IOC status check failed: {e}, assuming filled")
+                            logger.debug(f"FAK status check failed: {e}, assuming filled")
                             result.status = OrderStatus.FILLED
                             result.executed_size_usd = size_usd
 
@@ -2360,5 +2351,6 @@ class ExecutionEngine:
             "session_high_capital": self._session_high_capital,
             "drawdown_pct": drawdown_pct,
             "idempotency_tracked": self._idempotency_tracker.get_stats()["tracked_arbs"],
-            "ioc_mode": self._use_ioc
+            "fak_mode": self._use_ioc,  # FAK = Fill-And-Kill (Polymarket's IOC)
+            "has_fak_support": HAS_FAK
         }

@@ -13,6 +13,7 @@ from typing import List, Dict, Optional, Any
 import aiohttp
 
 from config import BotConfig
+from rate_limiter import get_global_limiter, handle_response_status
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,8 @@ class MarketDiscovery:
         """
         Fetch JSON from a URL with exponential backoff retry.
 
+        Uses global rate limiter for coordinated backoff across all HTTP clients.
+
         Args:
             url: URL to fetch.
             params: Query parameters.
@@ -136,6 +139,12 @@ class MarketDiscovery:
             max_retries = self.config.trading.max_rate_limit_retries
 
         session = await self._get_session()
+        limiter = get_global_limiter()
+
+        # Check if globally rate limited before making request
+        if await limiter.wait_if_limited():
+            logger.debug(f"Waited for global rate limit before {url}")
+
         backoff = self.config.trading.rate_limit_backoff_base
         max_backoff = self.config.trading.rate_limit_backoff_max
 
@@ -143,16 +152,13 @@ class MarketDiscovery:
             try:
                 async with session.get(url, params=params) as response:
                     if response.status == 200:
+                        await limiter.record_success()
                         return await response.json()
                     elif response.status == 429:
+                        # Use global rate limiter for coordinated backoff
+                        await handle_response_status(429, url)
                         if attempt < max_retries:
-                            sleep_time = min(backoff * (2 ** attempt), max_backoff)
-                            logger.warning(
-                                f"Rate limited on {url}, "
-                                f"backing off {sleep_time:.1f}s (attempt {attempt + 1}/{max_retries})"
-                            )
-                            await asyncio.sleep(sleep_time)
-                            continue
+                            continue  # Retry after global backoff
                         else:
                             logger.error(f"Rate limit exhausted after {max_retries} retries: {url}")
                             return None
@@ -754,9 +760,9 @@ class MarketDiscovery:
         """
         Main discovery method: fetch and filter target markets.
 
-        Uses resilient multi-tier approach:
-        1. Primary: Gamma API for sports events
-        2. Fallback: CLOB API for active markets
+        Uses resilient multi-tier approach (per Round 2 audit):
+        1. Primary: CLOB /markets API (reliable, fast, has active trading markets)
+        2. Fallback: Gamma API for sports events (enriches with event data if CLOB fails)
         3. Cache: Return cached markets if all APIs fail
 
         Args:
@@ -766,30 +772,37 @@ class MarketDiscovery:
             List of target markets for arbitrage scanning.
         """
         markets = []
+        min_volume = self.config.trading.min_volume_usd
 
-        # Try primary: Gamma API
+        # Try primary: CLOB /markets API (more reliable than Gamma per audit)
         try:
-            events = await self.fetch_all_priority_sports()
-            if events:
-                markets = self.filter_high_volume_markets(events)
-                self._consecutive_gamma_failures = 0
-                logger.debug(f"Gamma API success: {len(markets)} markets")
-            else:
-                self._consecutive_gamma_failures += 1
-                logger.warning(f"Gamma API returned no events (failure {self._consecutive_gamma_failures})")
-        except Exception as e:
-            self._consecutive_gamma_failures += 1
-            logger.warning(f"Gamma API failed: {e} (failure {self._consecutive_gamma_failures})")
-
-        # If Gamma failed too many times, try CLOB fallback
-        if not markets and self._consecutive_gamma_failures >= self._max_gamma_failures_before_fallback:
-            logger.warning("Gamma API unreliable, attempting CLOB fallback...")
             clob_markets = await self.fetch_markets_from_clob()
             if clob_markets:
-                # Filter by volume (CLOB doesn't have series info)
-                min_volume = self.config.trading.min_volume_usd
+                # Filter by volume
                 markets = [m for m in clob_markets if m.volume >= min_volume and m.is_active]
-                logger.info(f"CLOB fallback: {len(markets)} markets after volume filter")
+                logger.debug(f"CLOB API success: {len(markets)} markets after volume filter")
+        except Exception as e:
+            logger.warning(f"CLOB API failed: {e}")
+
+        # If CLOB failed or returned few markets, supplement with Gamma
+        # Gamma has richer event/sports data but is less reliable
+        if len(markets) < 10:  # Supplement if we have few markets
+            try:
+                events = await self.fetch_all_priority_sports()
+                if events:
+                    gamma_markets = self.filter_high_volume_markets(events)
+                    # Merge: add Gamma markets not already in CLOB list
+                    existing_ids = {m.condition_id for m in markets}
+                    for gm in gamma_markets:
+                        if gm.condition_id not in existing_ids:
+                            markets.append(gm)
+                    self._consecutive_gamma_failures = 0
+                    logger.debug(f"Gamma supplement: total {len(markets)} markets")
+                else:
+                    self._consecutive_gamma_failures += 1
+            except Exception as e:
+                self._consecutive_gamma_failures += 1
+                logger.debug(f"Gamma supplement failed: {e}")
 
         # If still no markets, use fallback cache
         if not markets:
@@ -823,10 +836,9 @@ class MarketDiscovery:
             self._cached_markets = markets
             self._last_refresh = datetime.now(timezone.utc)
 
-            # Update fallback cache (only if we got fresh data)
-            if self._consecutive_gamma_failures == 0:
-                self._fallback_cache = markets.copy()
-                self._fallback_cache_time = datetime.now(timezone.utc)
+            # Update fallback cache (always update if we got fresh data)
+            self._fallback_cache = markets.copy()
+            self._fallback_cache_time = datetime.now(timezone.utc)
 
         # Log in-play breakdown
         in_play_count = sum(1 for m in markets if self.estimate_in_play(m))

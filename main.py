@@ -29,6 +29,7 @@ from execution import ExecutionEngine, ExecutionResult
 from positions import PositionMonitor, ProfitLocker
 from risk import RiskManager, DepthValidator, TradeRecord
 from edge_model import EdgeExpectancyModel, MarketHeat
+from supervisor import get_supervisor, heartbeat as supervisor_heartbeat
 
 # Optional WebSocket support
 try:
@@ -1060,20 +1061,41 @@ class ArbBot:
                 ws_opp = await self.hybrid_manager.get_next_arb(timeout=0.1)
 
                 if ws_opp:
-                    # WS detected an arb! Decide: execute immediately or verify via HTTP
+                    # WS detected an arb! Fast-path execution per rn1 pattern
+                    # HTTP verification takes 800ms+ and loses 90%+ of arbs
                     edge_pct = ws_opp.profit_margin * 100
+                    base_threshold_pct = self.config.trading.arb_threshold_base * 100
 
-                    # Per audit: Execute immediately on WS if edge >1.5x threshold
-                    # HTTP verification takes 800ms+, by which time edge is gone 90%+ of cases
-                    strong_signal_threshold = self.config.trading.arb_threshold_base * 100 * 1.5  # 1.5x base threshold
+                    # AGGRESSIVE WS FAST PATH (per Round 2 audit):
+                    # - WS latency: <100ms (fast)
+                    # - HTTP verification: 800ms+ (too slow, arb gone)
+                    # - rn1 pattern: Small, fast trades ($27 avg)
+                    #
+                    # Fast-path conditions (execute immediately on WS):
+                    # 1. Edge >= base threshold (any signal meeting arb criteria)
+                    # 2. Size <= $50 (small trades - rn1 pattern)
+                    # 3. Strong signal (edge >= 1.5x threshold) regardless of size
+                    #
+                    # Only verify via HTTP for large sizes ($200+) with weak signals
+                    strong_signal_threshold = base_threshold_pct * 1.5
                     is_strong_signal = edge_pct >= strong_signal_threshold
-                    is_small_size = ws_opp.trade_size_usd <= 100  # Small sizes execute immediately
+                    is_small_size = ws_opp.trade_size_usd <= 50  # Tightened for rn1 pattern ($27 avg)
+                    is_medium_size = ws_opp.trade_size_usd <= 200  # Medium trades also fast-path
+                    meets_base_threshold = edge_pct >= base_threshold_pct
 
-                    if is_strong_signal or is_small_size:
+                    # Fast path: execute immediately on WS signal
+                    # This covers ~95% of rn1-style trades
+                    use_fast_path = (
+                        is_strong_signal or  # Strong edge: always fast
+                        is_small_size or  # Small size: always fast (rn1 pattern)
+                        (is_medium_size and meets_base_threshold)  # Medium + valid edge: fast
+                    )
+
+                    if use_fast_path:
                         # Execute immediately on WS signal (fast path)
                         logger.info(
-                            f"[WS FAST] Executing immediately: {edge_pct:.2f}% edge "
-                            f"(threshold: {strong_signal_threshold:.2f}%), ${ws_opp.trade_size_usd:.0f}"
+                            f"[WS FAST] Executing: {edge_pct:.2f}% edge, ${ws_opp.trade_size_usd:.0f} "
+                            f"({'strong' if is_strong_signal else 'small' if is_small_size else 'medium'})"
                         )
                         # Apply rn1-style sizing
                         depth_available = 100  # Conservative estimate for fast path
@@ -1085,10 +1107,10 @@ class ArbBot:
                         if result and result.success:
                             self._update_capital_tracking(result.realized_profit_usd)
                     elif self.config.trading.ws_verify_before_execute:
-                        # Large size, weak signal: verify via HTTP first
+                        # Only for large sizes ($200+) with weak signals: verify via HTTP
                         logger.debug(
-                            f"[WS] Arb detected: {edge_pct:.2f}% edge, "
-                            f"verifying via HTTP (size ${ws_opp.trade_size_usd:.0f} > $100)..."
+                            f"[WS] Large/weak signal: {edge_pct:.2f}% edge, "
+                            f"${ws_opp.trade_size_usd:.0f} - verifying via HTTP..."
                         )
                         verified_opp = await self.hybrid_manager.verify_arb_http(ws_opp)
                         if verified_opp:
@@ -1101,16 +1123,16 @@ class ArbBot:
                                 verified_opp.trade_size_usd = min(verified_opp.trade_size_usd, rn1_size)
 
                             logger.info(
-                                f"[WS->HTTP] Arb verified! Edge: {verified_opp.profit_margin*100:.2f}%, "
+                                f"[WS->HTTP] Verified! Edge: {verified_opp.profit_margin*100:.2f}%, "
                                 f"Size: ${verified_opp.trade_size_usd:.0f}"
                             )
                             result = await self.process_opportunity(verified_opp)
                             if result and result.success:
                                 self._update_capital_tracking(result.realized_profit_usd)
                         else:
-                            logger.debug("[WS->HTTP] Arb gone (edge decayed or taken)")
+                            logger.debug("[WS->HTTP] Arb gone (edge decayed)")
                     else:
-                        # Execute directly on WS signal (no verification)
+                        # ws_verify_before_execute=False: execute all directly
                         result = await self.process_opportunity(ws_opp)
                         if result and result.success:
                             self._update_capital_tracking(result.realized_profit_usd)
@@ -1141,6 +1163,9 @@ class ArbBot:
 
                 # Small sleep to prevent busy loop (WS handles real-time)
                 await asyncio.sleep(0.05)  # 50ms tick
+
+                # Record heartbeat for supervisor watchdog
+                supervisor_heartbeat()
 
             except asyncio.CancelledError:
                 break
@@ -1194,6 +1219,9 @@ class ArbBot:
                         )
                     except asyncio.TimeoutError:
                         pass  # Normal timeout, continue loop
+
+                # Record heartbeat for supervisor watchdog
+                supervisor_heartbeat()
 
             except asyncio.CancelledError:
                 break
@@ -1387,14 +1415,37 @@ async def main():
     # Setup logging
     setup_logging(config.logging)
 
-    # Create and run bot
-    bot = ArbBot(config)
+    logger.info("Starting Polymarket Arbitrage Bot with supervisor...")
 
-    # Setup signal handlers
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    # Create bot instance (will be recreated on restart)
+    bot: Optional[ArbBot] = None
 
-    await bot.run()
+    async def create_and_run_bot():
+        """Factory function for supervised bot execution."""
+        nonlocal bot
+        bot = ArbBot(config)
+        await bot.run()
+
+    async def cleanup_bot():
+        """Cleanup function between restarts."""
+        nonlocal bot
+        if bot:
+            try:
+                await bot.shutdown()
+            except Exception as e:
+                logger.error(f"Cleanup error: {e}")
+            bot = None
+
+    # Use supervisor for crash recovery
+    # Supervisor handles: automatic restarts, heartbeat monitoring, signal handling
+    supervisor = get_supervisor()
+
+    await supervisor.run(
+        main_coro_factory=create_and_run_bot,
+        cleanup_coro=cleanup_bot,
+    )
+
+    logger.info("Bot shutdown complete")
 
 
 if __name__ == "__main__":

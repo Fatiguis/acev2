@@ -18,6 +18,7 @@ from eth_account import Account
 import aiohttp
 
 from config import BotConfig
+from rate_limiter import get_global_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +213,8 @@ class PositionMonitor:
         """
         Fetch current positions from the CLOB API.
 
+        Uses global rate limiter for coordinated backoff across all HTTP clients.
+
         Returns:
             List of current positions.
         """
@@ -221,6 +224,11 @@ class PositionMonitor:
 
         session = await self._get_session()
         url = f"{self.config.network.clob_endpoint}/positions"
+        limiter = get_global_limiter()
+
+        # Check if globally rate limited before making request
+        if await limiter.wait_if_limited():
+            logger.debug("Waited for global rate limit before fetching positions")
 
         # Note: This endpoint requires L2 authentication headers
         # The actual implementation would use the authenticated client
@@ -231,8 +239,13 @@ class PositionMonitor:
             # This is a placeholder that would be replaced with actual API call
             async with session.get(url) as response:
                 if response.status == 200:
+                    await limiter.record_success()
                     data = await response.json()
                     return self._parse_positions(data)
+                elif response.status == 429:
+                    await limiter.record_429("positions")
+                    logger.warning("Rate limited fetching positions")
+                    return []
                 else:
                     logger.debug(f"Failed to fetch positions: HTTP {response.status}")
                     return []
