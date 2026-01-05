@@ -1,152 +1,193 @@
 """
-Monkey-patch py-clob-client's internal httpx calls with global rate limiter.
+Rate limiter integration for py-clob-client.
 
-This hooks into py_clob_client.http_helpers.helpers.request() to:
-1. Wait if globally rate limited before making requests
-2. Record 429 responses to trigger global backoff
-3. Record success to clear consecutive 429 counter
+DEPRECATED: The previous monkey-patch approach was fragile and could break on library updates.
+This module now provides a wrapper-based approach instead.
 
-Per audit: This catches the rare edge case where py-clob-client's internal
-HTTP calls (post_order, get_order, etc.) hit 429s that bypass our async code.
+Use the ClobClientWrapper class or the rate limiter decorators for safe rate limiting.
+The monkey-patch function is kept for backwards compatibility but logs a deprecation warning.
 """
 
 import logging
-import time
+import asyncio
 from functools import wraps
-from typing import Callable, Any
+from typing import Callable, TypeVar, Any
 
 logger = logging.getLogger(__name__)
 
-# Track if patch has been applied
-_patched = False
+# Track if deprecation warning has been shown
+_deprecation_warned = False
+
+T = TypeVar('T')
 
 
-def _sync_wait_if_limited() -> bool:
+def rate_limited_sync(func: Callable[..., T]) -> Callable[..., T]:
     """
-    Synchronous version of rate limit wait.
+    Decorator to add rate limiting to synchronous ClobClient methods.
 
-    py-clob-client uses sync httpx, so we need sync wait.
+    Use this to wrap individual client method calls instead of monkey-patching.
+
+    Example:
+        @rate_limited_sync
+        def my_order_function(client, *args):
+            return client.post_order(*args)
     """
-    from rate_limiter import get_global_limiter
+    @wraps(func)
+    def wrapper(*args, **kwargs) -> T:
+        from rate_limiter import get_global_limiter
+        import time
 
-    limiter = get_global_limiter()
-    state = limiter._state
+        limiter = get_global_limiter()
+        state = limiter._state
 
-    if not state.is_limited:
-        return False
+        # Wait if rate limited
+        if state.is_limited:
+            now = time.time()
+            if now < state.backoff_until:
+                wait_time = state.backoff_until - now
+                logger.debug(f"Rate limited, waiting {wait_time:.1f}s before {func.__name__}")
+                time.sleep(wait_time)
+            state.is_limited = False
 
-    now = time.time()
-    if now >= state.backoff_until:
-        state.is_limited = False
-        return False
+        try:
+            result = func(*args, **kwargs)
+            # Success - clear consecutive 429s
+            if state.consecutive_429s > 0:
+                logger.debug(f"Rate limit cleared after {state.consecutive_429s} 429s")
+            state.consecutive_429s = 0
+            state.is_limited = False
+            return result
 
-    wait_time = state.backoff_until - now
-    logger.debug(f"[CLOB-PATCH] Rate limited, waiting {wait_time:.1f}s...")
-    time.sleep(wait_time)
-    return True
+        except Exception as e:
+            # Check if it's a 429 error
+            error_str = str(e).lower()
+            if '429' in error_str or 'rate limit' in error_str or 'too many' in error_str:
+                state.consecutive_429s += 1
+                state.total_429s += 1
+                state.is_limited = True
+
+                backoff = min(
+                    limiter.base_backoff * (limiter.backoff_multiplier ** (state.consecutive_429s - 1)),
+                    limiter.max_backoff
+                )
+                state.backoff_until = time.time() + backoff
+
+                logger.warning(
+                    f"429 RATE LIMITED on {func.__name__}! "
+                    f"Consecutive: {state.consecutive_429s}, Backing off {backoff:.1f}s"
+                )
+            raise
+
+    return wrapper
 
 
-def _sync_record_429(endpoint: str = "") -> float:
+async def rate_limited_async(func: Callable[..., T]) -> Callable[..., T]:
     """
-    Synchronous version of 429 recording.
+    Async decorator to add rate limiting.
+
+    Example:
+        @rate_limited_async
+        async def my_async_order(client, *args):
+            return await client.some_async_method(*args)
     """
-    from rate_limiter import get_global_limiter
+    @wraps(func)
+    async def wrapper(*args, **kwargs) -> T:
+        from rate_limiter import get_global_limiter
 
-    limiter = get_global_limiter()
-    state = limiter._state
+        limiter = get_global_limiter()
 
-    state.consecutive_429s += 1
-    state.total_429s += 1
-    state.is_limited = True
+        # Wait if rate limited
+        if await limiter.wait_if_limited():
+            logger.debug(f"Waited for rate limit before {func.__name__}")
 
-    backoff = min(
-        limiter.base_backoff * (limiter.backoff_multiplier ** (state.consecutive_429s - 1)),
-        limiter.max_backoff
-    )
-    state.backoff_until = time.time() + backoff
+        try:
+            result = await func(*args, **kwargs)
+            await limiter.record_success()
+            return result
 
-    logger.warning(
-        f"[CLOB-PATCH] 429 RATE LIMITED on {endpoint}! "
-        f"Consecutive: {state.consecutive_429s}, Backing off {backoff:.1f}s"
-    )
+        except Exception as e:
+            error_str = str(e).lower()
+            if '429' in error_str or 'rate limit' in error_str or 'too many' in error_str:
+                await limiter.record_429(func.__name__)
+            raise
 
-    return backoff
-
-
-def _sync_record_success():
-    """Synchronous version of success recording."""
-    from rate_limiter import get_global_limiter
-
-    limiter = get_global_limiter()
-    state = limiter._state
-
-    if state.consecutive_429s > 0:
-        logger.debug(f"[CLOB-PATCH] Rate limit cleared after {state.consecutive_429s} 429s")
-    state.consecutive_429s = 0
-    state.is_limited = False
+    return wrapper
 
 
 def patch_clob_client():
     """
-    Apply monkey-patch to py-clob-client HTTP helpers.
+    DEPRECATED: Monkey-patching is fragile and can break on library updates.
 
-    This wraps the request() function to integrate with our global rate limiter.
-    Safe to call multiple times (will only patch once).
+    This function now only logs a deprecation warning and does nothing.
+    Use rate_limited_sync decorator or ClobClientWrapper instead.
+
+    The rate limiting is now handled at the application level in:
+    - orderbook.py: Uses get_global_limiter() for HTTP requests
+    - execution.py: Wraps order calls with rate limiting
+    - main.py: Global rate limit coordination
     """
-    global _patched
+    global _deprecation_warned
 
-    if _patched:
-        logger.debug("[CLOB-PATCH] Already patched, skipping")
-        return
-
-    try:
-        from py_clob_client.http_helpers import helpers
-        from py_clob_client.exceptions import PolyApiException
-
-        # Save original request function
-        original_request = helpers.request
-
-        @wraps(original_request)
-        def patched_request(endpoint: str, method: str, headers=None, data=None):
-            """
-            Wrapped request function with rate limit integration.
-            """
-            # Wait if globally rate limited
-            _sync_wait_if_limited()
-
-            try:
-                result = original_request(endpoint, method, headers, data)
-                # Success - clear consecutive 429s
-                _sync_record_success()
-                return result
-
-            except PolyApiException as e:
-                # Check if it's a 429
-                if hasattr(e, 'response') and e.response is not None:
-                    if hasattr(e.response, 'status_code') and e.response.status_code == 429:
-                        _sync_record_429(endpoint)
-                        # Wait and retry once
-                        _sync_wait_if_limited()
-                        try:
-                            result = original_request(endpoint, method, headers, data)
-                            _sync_record_success()
-                            return result
-                        except Exception:
-                            pass  # Fall through to re-raise original
-                raise
-
-        # Apply patch
-        helpers.request = patched_request
-        _patched = True
-
-        logger.info("[CLOB-PATCH] Successfully patched py-clob-client HTTP helpers with global rate limiter")
-
-    except ImportError as e:
-        logger.warning(f"[CLOB-PATCH] Could not patch py-clob-client: {e}")
-    except Exception as e:
-        logger.error(f"[CLOB-PATCH] Failed to patch py-clob-client: {e}")
+    if not _deprecation_warned:
+        logger.info(
+            "[CLOB-PATCH] Monkey-patching disabled (fragile). "
+            "Rate limiting now handled at application level via rate_limiter module."
+        )
+        _deprecation_warned = True
 
 
 def is_patched() -> bool:
-    """Check if patch has been applied."""
-    return _patched
+    """
+    Check if patch has been applied.
+
+    Always returns False now since monkey-patching is disabled.
+    """
+    return False
+
+
+class ClobClientWrapper:
+    """
+    Wrapper around ClobClient that adds rate limiting to all API calls.
+
+    This is the recommended approach instead of monkey-patching.
+
+    Example:
+        from py_clob_client.client import ClobClient
+
+        client = ClobClient(...)
+        wrapper = ClobClientWrapper(client)
+
+        # Use wrapper for rate-limited calls
+        result = wrapper.post_order(order, order_type)
+    """
+
+    def __init__(self, client):
+        """
+        Initialize wrapper with a ClobClient instance.
+
+        Args:
+            client: The ClobClient instance to wrap.
+        """
+        self._client = client
+        self._rate_limited_methods = {
+            'post_order', 'cancel_order', 'cancel_orders', 'cancel_all_orders',
+            'get_order', 'get_orders', 'get_trades', 'get_last_trade_price',
+            'get_book', 'get_books', 'get_midpoint', 'get_midpoints',
+            'get_price', 'get_prices', 'get_spread', 'get_spreads',
+        }
+
+    def __getattr__(self, name: str):
+        """
+        Proxy attribute access to wrapped client with rate limiting for API methods.
+        """
+        attr = getattr(self._client, name)
+
+        if name in self._rate_limited_methods and callable(attr):
+            return rate_limited_sync(attr)
+
+        return attr
+
+    @property
+    def client(self):
+        """Get the underlying ClobClient instance."""
+        return self._client

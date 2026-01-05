@@ -94,6 +94,14 @@ class RiskManager:
         self._unrealized_pnl = 0.0  # Current unrealized PnL from open positions
         self._force_hedge_triggered = False
 
+        # Maker ratio tracking (per audit)
+        self._maker_fills = 0
+        self._taker_fills = 0
+        self._maker_ratio_warning_shown = False
+
+        # Unhedged exposure tracking (per audit)
+        self._current_unhedged_exposure = 0.0
+
     def update_capital(self, new_capital: float):
         """Update current capital."""
         self._current_capital = new_capital
@@ -155,6 +163,11 @@ class RiskManager:
         # Check if trading is halted
         if self._is_halted:
             return False, f"Trading halted: {self._halt_reason}"
+
+        # Check unhedged exposure (per audit)
+        exposure_ok, exposure_msg = self.check_unhedged_exposure_ok()
+        if not exposure_ok:
+            return False, exposure_msg
 
         # Calculate dynamic threshold based on trade size and outcomes
         num_outcomes = len(opportunity.market.outcomes)
@@ -237,6 +250,10 @@ class RiskManager:
         # Cap at max percentage of capital
         max_size = self._current_capital * (self.config.trading.max_size_per_trade_percent / 100)
         position_size = min(safe_size, max_size)
+
+        # ABSOLUTE cap regardless of capital (per audit: $200 max)
+        absolute_max = self.config.trading.absolute_max_trade_size_usd
+        position_size = min(position_size, absolute_max)
 
         # Reduce size based on consecutive losses (risk scaling)
         if self._consecutive_losses > 0:
@@ -425,7 +442,114 @@ class RiskManager:
         self._halt_reason = None
         self._consecutive_losses = 0
         self._force_hedge_triggered = False
+        self._current_unhedged_exposure = 0.0  # Reset exposure on resume
         logger.info("Trading resumed manually")
+
+    def record_fill_type(self, is_maker: bool):
+        """
+        Record whether a fill was maker or taker for ratio tracking.
+
+        Args:
+            is_maker: True if fill was maker (post-only), False if taker.
+        """
+        if is_maker:
+            self._maker_fills += 1
+        else:
+            self._taker_fills += 1
+
+    def get_maker_ratio(self) -> float:
+        """
+        Get current maker fill ratio.
+
+        Returns:
+            Ratio of maker fills to total fills (0-1).
+        """
+        total = self._maker_fills + self._taker_fills
+        if total == 0:
+            return 1.0  # No fills yet, assume good
+        return self._maker_fills / total
+
+    def check_maker_ratio_ok(self) -> tuple[bool, str]:
+        """
+        Check if maker ratio is above target threshold.
+
+        Per audit: rn1 preferred maker orders for fee rebates.
+        Pause taker orders if ratio drops below target.
+
+        Returns:
+            Tuple of (ok, reason).
+        """
+        ratio = self.get_maker_ratio()
+        target = self.config.trading.maker_ratio_target
+
+        # Need at least 10 fills to have meaningful ratio
+        total_fills = self._maker_fills + self._taker_fills
+        if total_fills < 10:
+            return True, f"Maker ratio: {ratio*100:.0f}% (insufficient data)"
+
+        if ratio < target:
+            if not self._maker_ratio_warning_shown:
+                logger.warning(
+                    f"Maker ratio {ratio*100:.0f}% below target {target*100:.0f}%. "
+                    f"Consider using more post-only orders."
+                )
+                self._maker_ratio_warning_shown = True
+            return False, f"Maker ratio {ratio*100:.0f}% below target {target*100:.0f}%"
+
+        self._maker_ratio_warning_shown = False
+        return True, f"Maker ratio: {ratio*100:.0f}%"
+
+    def update_unhedged_exposure(self, exposure_usd: float):
+        """
+        Update current unhedged exposure from partial fills.
+
+        Args:
+            exposure_usd: Current net unhedged exposure in USD.
+        """
+        self._current_unhedged_exposure = exposure_usd
+
+    def add_unhedged_exposure(self, amount_usd: float):
+        """
+        Add to unhedged exposure (from partial fill).
+
+        Args:
+            amount_usd: Amount to add to exposure.
+        """
+        self._current_unhedged_exposure += amount_usd
+        logger.debug(f"Unhedged exposure now: ${self._current_unhedged_exposure:.2f}")
+
+    def reduce_unhedged_exposure(self, amount_usd: float):
+        """
+        Reduce unhedged exposure (from successful hedge).
+
+        Args:
+            amount_usd: Amount to reduce from exposure.
+        """
+        self._current_unhedged_exposure = max(0, self._current_unhedged_exposure - amount_usd)
+        logger.debug(f"Unhedged exposure reduced to: ${self._current_unhedged_exposure:.2f}")
+
+    def check_unhedged_exposure_ok(self) -> tuple[bool, str]:
+        """
+        Check if unhedged exposure is below maximum threshold.
+
+        Per audit: Pause new arbs if exposure from partial fills exceeds limit.
+
+        Returns:
+            Tuple of (ok, reason).
+        """
+        max_exposure = self.config.trading.max_unhedged_exposure_usd
+
+        if self._current_unhedged_exposure > max_exposure:
+            return False, (
+                f"Unhedged exposure ${self._current_unhedged_exposure:.2f} "
+                f"exceeds max ${max_exposure:.2f}. Hedge positions before new arbs."
+            )
+
+        return True, f"Unhedged exposure: ${self._current_unhedged_exposure:.2f}"
+
+    def get_unhedged_exposure(self) -> float:
+        """Get current unhedged exposure in USD."""
+        return self._current_unhedged_exposure
 
     def is_halted(self) -> tuple[bool, Optional[str]]:
         """Check if trading is halted."""
@@ -456,7 +580,12 @@ class RiskManager:
             "total_return_pct": metrics.total_return_pct,
             "projected_30d_multiple": self.estimate_compound_growth(20, 30),
             "is_halted": self._is_halted,
-            "halt_reason": self._halt_reason
+            "halt_reason": self._halt_reason,
+            # New audit metrics
+            "maker_fills": self._maker_fills,
+            "taker_fills": self._taker_fills,
+            "maker_ratio_pct": self.get_maker_ratio() * 100,
+            "unhedged_exposure_usd": self._current_unhedged_exposure,
         }
 
 

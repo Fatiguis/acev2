@@ -60,8 +60,28 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("MAX_TRADE_SIZE_USD", "50"))
     )
 
+    # ABSOLUTE maximum trade size regardless of capital (safety cap per audit)
+    # Even with $1M capital, never exceed this per trade
+    absolute_max_trade_size_usd: float = 200.0
+
     # Minimum trade size (gas must be covered)
     min_trade_size_usd: float = 10.0
+
+    # Maximum unhedged exposure before pausing new arbs (per audit)
+    # If net exposure from partial fills exceeds this, stop taking new arbs
+    max_unhedged_exposure_usd: float = field(
+        default_factory=lambda: float(os.getenv("MAX_UNHEDGED_EXPOSURE_USD", "100"))
+    )
+
+    # Maker fill ratio target - pause taker orders if below this
+    # rn1 preferred maker orders for fee rebates
+    maker_ratio_target: float = field(
+        default_factory=lambda: float(os.getenv("MAKER_RATIO_TARGET", "0.70"))
+    )
+
+    # Orderbook staleness threshold in milliseconds
+    # Skip books older than this to avoid executing on stale data
+    orderbook_max_age_ms: float = 200.0
 
     # Capital scaling: increase max_trade_size as capital grows
     # Formula: max_size = base_max * (current_capital / starting_capital) ^ scaling_factor

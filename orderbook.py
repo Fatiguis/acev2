@@ -735,6 +735,69 @@ class OrderbookPoller:
 
         return min_depth if min_depth != float('inf') else 0.0
 
+    def _check_orderbook_freshness(self, orderbooks: List[Orderbook]) -> tuple[bool, str]:
+        """
+        Check if orderbooks are fresh enough for trading.
+
+        Per audit: Skip books older than 200ms to avoid executing on stale data.
+
+        Args:
+            orderbooks: List of orderbooks to check.
+
+        Returns:
+            Tuple of (is_fresh, reason).
+        """
+        max_age_ms = self.config.trading.orderbook_max_age_ms
+        now = datetime.now(timezone.utc)
+
+        for ob in orderbooks:
+            age_ms = (now - ob.timestamp).total_seconds() * 1000
+            if age_ms > max_age_ms:
+                return False, f"Orderbook for {ob.outcome_name} is {age_ms:.0f}ms old (max {max_age_ms}ms)"
+
+        return True, ""
+
+    def _get_weighted_price_across_levels(
+        self,
+        orderbook: Orderbook,
+        side: str,
+        num_levels: int = 3,
+        target_size_usd: float = 50.0
+    ) -> tuple[float, float]:
+        """
+        Get volume-weighted average price across multiple levels.
+
+        Per audit: Sum depth across top 3-5 levels for more realistic edge detection.
+
+        Args:
+            orderbook: The orderbook to analyze.
+            side: "ask" or "bid".
+            num_levels: Number of levels to consider.
+            target_size_usd: Target trade size for weighting.
+
+        Returns:
+            Tuple of (weighted_avg_price, total_depth_usd).
+        """
+        levels = orderbook.asks if side == "ask" else orderbook.bids
+        if not levels:
+            return (1.0 if side == "ask" else 0.0), 0.0
+
+        total_size = 0.0
+        weighted_sum = 0.0
+        total_depth_usd = 0.0
+
+        for i, level in enumerate(levels[:num_levels]):
+            level_usd = level.size * level.price
+            total_depth_usd += level_usd
+            weighted_sum += level.price * level.size
+            total_size += level.size
+
+        if total_size == 0:
+            return (1.0 if side == "ask" else 0.0), 0.0
+
+        weighted_avg = weighted_sum / total_size
+        return weighted_avg, total_depth_usd
+
     def detect_arb_opportunity(
         self,
         market_orderbooks: MarketOrderbooks
@@ -747,7 +810,8 @@ class OrderbookPoller:
         - Sell arb: sum(best_bids) > 1 + dynamic_threshold
 
         Uses dynamic threshold based on trade size and gas costs.
-        Includes stale book detection and slippage checks.
+        Includes stale book detection, freshness check, and slippage checks.
+        Per audit: Also considers depth across multiple levels for realistic edge.
 
         Args:
             market_orderbooks: Orderbooks for all market outcomes.
@@ -765,16 +829,36 @@ class OrderbookPoller:
 
         min_depth = self.config.trading.min_depth_usd
 
-        # Check for stale orderbooks first
+        # Check orderbook freshness (per audit: skip books >200ms old)
+        is_fresh, freshness_reason = self._check_orderbook_freshness(orderbooks)
+        if not is_fresh:
+            logger.debug(f"Stale timestamp for {market.question[:40]}: {freshness_reason}")
+            self._stale_books_skipped += 1
+            return None
+
+        # Check for stale orderbooks (price sanity check)
         is_stale, stale_reason = self._is_stale_orderbook(orderbooks)
         if is_stale:
             logger.debug(f"Stale orderbook detected for {market.question[:40]}: {stale_reason}")
             self._stale_books_skipped += 1
             return None
 
-        # Calculate sum of best asks and best bids
+        # Calculate sum of best asks and best bids (L1)
         sum_asks = sum(ob.best_ask_price for ob in orderbooks)
         sum_bids = sum(ob.best_bid_price for ob in orderbooks)
+
+        # Also calculate weighted price across 3 levels (per audit)
+        # This gives more realistic edge when L1 is thin
+        sum_asks_weighted = 0.0
+        sum_bids_weighted = 0.0
+        min_depth_across_levels = float('inf')
+
+        for ob in orderbooks:
+            ask_weighted, ask_depth = self._get_weighted_price_across_levels(ob, "ask", num_levels=3)
+            bid_weighted, bid_depth = self._get_weighted_price_across_levels(ob, "bid", num_levels=3)
+            sum_asks_weighted += ask_weighted
+            sum_bids_weighted += bid_weighted
+            min_depth_across_levels = min(min_depth_across_levels, ask_depth, bid_depth)
 
         # Check minimum depth at best levels
         min_ask_depth_usd = min(
@@ -795,6 +879,16 @@ class OrderbookPoller:
 
         # Check for buy arbitrage (buy all outcomes cheaper than $1)
         if sum_asks < (1.0 - dynamic_threshold) and min_ask_depth_usd >= min_depth:
+            # Per audit: Also validate using weighted prices across 3 levels
+            # L1 might show an edge, but deeper levels might not
+            weighted_margin = 1.0 - sum_asks_weighted
+            if weighted_margin < dynamic_threshold * 0.5:
+                logger.debug(
+                    f"L1 edge {(1.0 - sum_asks)*100:.2f}% but weighted edge only "
+                    f"{weighted_margin*100:.2f}% - likely thin L1, skipping"
+                )
+                return None
+
             # Check slippage - now returns size reduction factor instead of rejecting
             slippage_ok, slippage_reason, size_factor = self._check_slippage(orderbooks, ArbType.BUY_ARB)
             if not slippage_ok:
@@ -851,6 +945,16 @@ class OrderbookPoller:
 
         # Check for sell arbitrage (sell all outcomes for more than $1)
         if sum_bids > (1.0 + dynamic_threshold) and min_bid_depth_usd >= min_depth:
+            # Per audit: Also validate using weighted prices across 3 levels
+            # L1 might show an edge, but deeper levels might not
+            weighted_margin = sum_bids_weighted - 1.0
+            if weighted_margin < dynamic_threshold * 0.5:
+                logger.debug(
+                    f"L1 edge {(sum_bids - 1.0)*100:.2f}% but weighted edge only "
+                    f"{weighted_margin*100:.2f}% - likely thin L1, skipping"
+                )
+                return None
+
             # Check slippage - now returns size reduction factor instead of rejecting
             slippage_ok, slippage_reason, size_factor = self._check_slippage(orderbooks, ArbType.SELL_ARB)
             if not slippage_ok:
