@@ -275,6 +275,18 @@ class ArbBot:
         self.hybrid_manager: Optional[HybridOrderbookManager] = None
         self._use_websocket = HAS_WEBSOCKET and config.trading.use_websocket
 
+        # Circuit breaker for rate limiting and error protection
+        self._circuit_breaker_open = False
+        self._circuit_breaker_failures = 0
+        self._circuit_breaker_threshold = 5  # Open after 5 consecutive failures
+        self._circuit_breaker_reset_time: Optional[datetime] = None
+        self._circuit_breaker_cooldown_seconds = 60  # 1 minute cooldown
+
+        # Request rate tracking
+        self._request_count_window = 0
+        self._request_window_start: Optional[datetime] = None
+        self._max_requests_per_minute = 80  # Stay under 100/min limit
+
         # State
         self._target_markets: List[Market] = []
         self._last_market_refresh: Optional[datetime] = None
@@ -461,8 +473,73 @@ class ArbBot:
         self._print_stats()
         logger.info("Shutdown complete")
 
+    def _check_circuit_breaker(self) -> bool:
+        """
+        Check if circuit breaker allows operations.
+
+        Returns:
+            True if operations allowed, False if circuit is open.
+        """
+        if not self._circuit_breaker_open:
+            return True
+
+        # Check if cooldown has passed
+        if self._circuit_breaker_reset_time:
+            if datetime.now(timezone.utc) >= self._circuit_breaker_reset_time:
+                logger.info("Circuit breaker reset after cooldown")
+                self._circuit_breaker_open = False
+                self._circuit_breaker_failures = 0
+                self._circuit_breaker_reset_time = None
+                return True
+
+        return False
+
+    def _record_success(self):
+        """Record successful operation, reset failure count."""
+        self._circuit_breaker_failures = 0
+
+    def _record_failure(self):
+        """Record failed operation, potentially open circuit breaker."""
+        self._circuit_breaker_failures += 1
+
+        if self._circuit_breaker_failures >= self._circuit_breaker_threshold:
+            self._circuit_breaker_open = True
+            self._circuit_breaker_reset_time = datetime.now(timezone.utc) + timedelta(
+                seconds=self._circuit_breaker_cooldown_seconds
+            )
+            logger.warning(
+                f"Circuit breaker OPEN after {self._circuit_breaker_failures} failures. "
+                f"Cooldown: {self._circuit_breaker_cooldown_seconds}s"
+            )
+
+    def _check_rate_limit(self) -> bool:
+        """
+        Check if we're within rate limits.
+
+        Returns:
+            True if request allowed, False if should wait.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Reset window if >1 minute has passed
+        if self._request_window_start is None or (now - self._request_window_start).total_seconds() >= 60:
+            self._request_window_start = now
+            self._request_count_window = 0
+
+        # Check if under limit
+        if self._request_count_window >= self._max_requests_per_minute:
+            return False
+
+        self._request_count_window += 1
+        return True
+
     async def refresh_markets(self):
         """Refresh the list of target markets."""
+        # Check circuit breaker
+        if not self._check_circuit_breaker():
+            logger.warning("Circuit breaker open, skipping market refresh")
+            return
+
         logger.info("Refreshing target markets...")
         try:
             self._target_markets = await self.market_discovery.discover_target_markets(
@@ -483,8 +560,11 @@ class ArbBot:
                 await self.hybrid_manager.subscribe_markets(self._target_markets)
                 logger.info(f"WebSocket subscribed to {len(self._target_markets)} markets")
 
+            self._record_success()
+
         except Exception as e:
             logger.error(f"Failed to refresh markets: {e}")
+            self._record_failure()
 
     async def poll_and_detect(self) -> List[ArbOpportunity]:
         """

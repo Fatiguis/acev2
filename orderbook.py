@@ -180,6 +180,105 @@ class OrderbookPoller:
         self._burst_volume_spike_mult = 2.0  # Volume spike threshold (2x = unusual activity)
         self._burst_poll_interval = 0.4  # Fast polling during bursts (400ms)
 
+        # Slippage prediction with EMA (addresses 22% partial fill rate)
+        self._spread_ema: Dict[str, float] = {}  # token_id -> EMA of spread
+        self._depth_ema: Dict[str, float] = {}   # token_id -> EMA of depth
+        self._volatility_ema: Dict[str, float] = {}  # token_id -> EMA of price volatility
+        self._last_prices: Dict[str, float] = {}  # token_id -> last mid price
+        self._ema_alpha = 0.3  # EMA smoothing factor (0.3 = responsive to recent changes)
+        self._slippage_predictions: Dict[str, float] = {}  # token_id -> predicted slippage %
+
+    def update_slippage_prediction(self, orderbook: Orderbook):
+        """
+        Update slippage prediction EMA for an orderbook.
+
+        Uses exponential moving averages of:
+        - Spread (wider spread = higher slippage risk)
+        - Depth (lower depth = higher slippage risk)
+        - Price volatility (higher volatility = higher slippage risk)
+
+        Predicted slippage formula:
+        slippage_pct = base_spread + volatility_factor + depth_penalty
+
+        Args:
+            orderbook: The orderbook to update predictions for.
+        """
+        token_id = orderbook.token_id
+        alpha = self._ema_alpha
+
+        # Update spread EMA
+        spread = orderbook.get_spread()
+        if token_id in self._spread_ema:
+            self._spread_ema[token_id] = alpha * spread + (1 - alpha) * self._spread_ema[token_id]
+        else:
+            self._spread_ema[token_id] = spread
+
+        # Update depth EMA (use L1 depth)
+        depth = orderbook.best_ask_size + orderbook.best_bid_size
+        if token_id in self._depth_ema:
+            self._depth_ema[token_id] = alpha * depth + (1 - alpha) * self._depth_ema[token_id]
+        else:
+            self._depth_ema[token_id] = depth
+
+        # Update volatility EMA (price change from last)
+        mid = orderbook.mid_price
+        if token_id in self._last_prices:
+            price_change = abs(mid - self._last_prices[token_id]) / self._last_prices[token_id] if self._last_prices[token_id] > 0 else 0
+            if token_id in self._volatility_ema:
+                self._volatility_ema[token_id] = alpha * price_change + (1 - alpha) * self._volatility_ema[token_id]
+            else:
+                self._volatility_ema[token_id] = price_change
+        self._last_prices[token_id] = mid
+
+        # Calculate predicted slippage
+        # Formula: spread contributes directly, volatility amplifies, low depth penalizes
+        spread_component = self._spread_ema.get(token_id, 0.05)
+        volatility_component = self._volatility_ema.get(token_id, 0) * 2  # 2x multiplier for volatility
+        depth_value = self._depth_ema.get(token_id, 100)
+
+        # Depth penalty: higher slippage when depth is low
+        # At depth=100, penalty=0; at depth=10, penalty=0.01 (1%)
+        depth_penalty = max(0, 0.1 / max(depth_value, 1) - 0.001)
+
+        predicted_slippage = spread_component + volatility_component + depth_penalty
+        self._slippage_predictions[token_id] = predicted_slippage
+
+    def get_predicted_slippage(self, token_id: str) -> float:
+        """
+        Get predicted slippage for a token.
+
+        Args:
+            token_id: The token ID.
+
+        Returns:
+            Predicted slippage as decimal (e.g., 0.02 = 2%).
+        """
+        return self._slippage_predictions.get(token_id, 0.02)  # Default 2%
+
+    def should_skip_due_to_slippage(self, token_ids: List[str], edge_pct: float) -> Tuple[bool, str]:
+        """
+        Check if predicted slippage exceeds the edge.
+
+        Args:
+            token_ids: List of token IDs in the arb.
+            edge_pct: The arbitrage edge as decimal.
+
+        Returns:
+            Tuple of (should_skip, reason).
+        """
+        total_slippage = 0
+        for tid in token_ids:
+            total_slippage += self.get_predicted_slippage(tid)
+
+        # Average slippage across outcomes
+        avg_slippage = total_slippage / len(token_ids) if token_ids else 0
+
+        # Skip if predicted slippage > 50% of edge
+        if avg_slippage > edge_pct * 0.5:
+            return True, f"Predicted slippage {avg_slippage*100:.2f}% > 50% of edge {edge_pct*100:.2f}%"
+
+        return False, ""
+
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
         if self._session is None or self._session.closed:

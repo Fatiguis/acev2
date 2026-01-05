@@ -359,6 +359,26 @@ class SportsConfig:
         "mma": 10500,      # MMA/UFC
     })
 
+    # Politics tags for diversification (rn1 uses 10% politics)
+    # These are event tag IDs from Gamma API
+    politics_tags: List[str] = field(default_factory=lambda: [
+        "politics",
+        "elections",
+        "us-politics",
+        "world-politics",
+        "trump",
+        "biden",
+        "congress",
+    ])
+
+    # Additional market categories to scan (beyond sports)
+    # This provides diversification when sports volume is low
+    additional_categories: List[str] = field(default_factory=lambda: [
+        "politics",
+        "crypto",
+        "pop-culture",
+    ])
+
     # Tag ID for game bets filtering
     game_bets_tag_id: int = 100639
 
