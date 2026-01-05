@@ -602,8 +602,7 @@ class AuthManager:
         Verify the wallet has sufficient USDC balance for trading.
 
         Args:
-            min_balance: Minimum required balance (defaults to starting_capital_usd).
-                         If starting_capital_usd is 0, uses min_trade_size_usd as minimum.
+            min_balance: Minimum required balance (defaults to min_capital_required).
 
         Returns:
             Tuple of (sufficient, message).
@@ -612,11 +611,8 @@ class AuthManager:
             return True, f"Dry run mode - simulated balance ${self.config.starting_capital_usd:,.2f}"
 
         if min_balance is None:
-            min_balance = self.config.starting_capital_usd
-
-        # If starting_capital_usd is 0 (dynamic mode), use min_trade_size as floor
-        if min_balance <= 0:
-            min_balance = self.config.trading.min_trade_size_usd
+            # Use min_capital_required ($900) as the hard floor
+            min_balance = self.config.min_capital_required
 
         balance = self.get_usdc_balance()
 
@@ -624,7 +620,7 @@ class AuthManager:
             return False, "Unable to fetch USDC balance"
 
         if balance < min_balance:
-            return False, f"Low balance: ${balance:,.2f} (min ${min_balance:,.2f} for trading)"
+            return False, f"Insufficient balance: ${balance:,.2f} < ${min_balance:,.2f} required"
 
         return True, f"Balance: ${balance:,.2f}"
 

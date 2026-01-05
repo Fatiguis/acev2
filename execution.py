@@ -662,6 +662,8 @@ class ExecutionEngine:
         """
         Verify the wallet is ready for trading (balance + allowance).
 
+        HARD ERRORS on RPC failures - rn1 needs flawless on-chain operations.
+
         Note: For proxy wallets (most Polymarket users), USDC allowance must be
         approved manually via the Polymarket UI. Auto-approve is not supported
         for proxy wallets as on-chain transactions require relayer handling.
@@ -675,23 +677,23 @@ class ExecutionEngine:
         # Use funder address for display (where USDC is held)
         display_wallet = self._funder_address or self._wallet_address
 
-        # Check balance - if RPC fails, continue with warning (not fatal)
+        # Check balance - HARD ERROR on RPC failure (rn1 needs flawless on-chain)
         balance = self.check_balance()
         if balance is None:
-            logger.warning("Could not verify USDC balance (RPC issue) - will attempt trades anyway")
-            balance_msg = "Balance: unknown (RPC issue)"
-        elif balance < self.config.trading.min_trade_size_usd:
-            # Low balance warning, but not fatal - let trades fail naturally
-            logger.warning(f"Low USDC balance: ${balance:.2f} < min trade ${self.config.trading.min_trade_size_usd:.2f}")
-            balance_msg = f"Balance: ${balance:.2f} (low)"
-        else:
-            balance_msg = f"Balance: ${balance:.2f}"
+            return False, "Failed to check USDC balance (RPC issue) - fix RPC connection"
 
-        # Check allowance (no auto-approve for proxy wallets)
+        # Hard block on insufficient capital (rn1 pattern: $1k min start)
+        min_capital = self.config.min_capital_required
+        if balance < min_capital:
+            return False, (
+                f"Insufficient capital: ${balance:.2f} < ${min_capital:.2f} required. "
+                f"rn1 started with $1k - deposit USDC to wallet {display_wallet}"
+            )
+
+        # Check allowance - HARD ERROR on RPC failure
         allowance = self.check_allowance()
         if allowance is None:
-            logger.warning("Could not check allowance (RPC issue) - will attempt trades anyway")
-            return True, f"{balance_msg}, Allowance: unknown"
+            return False, "Failed to check USDC allowance (RPC issue) - fix RPC connection"
 
         if allowance < 1.0:
             # Log helpful message for manual approval
@@ -711,7 +713,7 @@ class ExecutionEngine:
             logger.warning("=" * 60)
             return False, "Manual USDC approval required via Polymarket UI"
 
-        return True, f"Ready to trade. {balance_msg}, Allowance: ${allowance:.2f}"
+        return True, f"Ready to trade. Balance: ${balance:.2f}, Allowance: ${allowance:.2f}"
 
     def check_max_approval(self, spender_address: Optional[str] = None) -> bool:
         """

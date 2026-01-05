@@ -464,10 +464,14 @@ class BotConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     # Starting capital for position sizing calculations
-    # Optional: defaults to 0.0 (uses actual balance dynamically)
+    # rn1 started with $1k - this is the minimum viable capital
     starting_capital_usd: float = field(
-        default_factory=lambda: float(os.getenv("STARTING_CAPITAL", "0"))
+        default_factory=lambda: float(os.getenv("STARTING_CAPITAL", "1000"))
     )
+
+    # Minimum capital required to start trading (hard block below this)
+    # rn1 pattern: $1k start, conservative sizing. Below ~$900 is not viable.
+    min_capital_required: float = 900.0
 
     # Dry run mode (no actual trades)
     dry_run: bool = field(

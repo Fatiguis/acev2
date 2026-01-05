@@ -496,16 +496,22 @@ class ArbBot:
                 if abs(old_capital - balance) > 1.0:
                     logger.info(f"Capital updated: ${old_capital:,.2f} -> ${balance:,.2f}")
 
+                # Re-check allowance after balance refresh (per audit)
+                # Ensure allowance >= 2x new capital for safe trading headroom
+                if not self.config.dry_run and self.config.wallet.signature_type == 0:
+                    required_allowance = balance * 2
+                    client = self.execution_engine._client
+                    if client:
+                        self.auth_manager.ensure_sufficient_allowance(client, required_allowance)
+
     async def initialize(self):
         """Initialize all modules and connections."""
         logger.info("=" * 60)
         logger.info("POLYMARKET MICROSTRUCTURE ARBITRAGE BOT v2.1")
         logger.info("=" * 60)
         logger.info(f"Mode: {'DRY RUN' if self.config.dry_run else 'LIVE TRADING'}")
-        if self.config.starting_capital_usd > 0:
-            logger.info(f"Starting capital: ${self.config.starting_capital_usd:,.2f}")
-        else:
-            logger.info("Starting capital: DYNAMIC (will use actual balance)")
+        logger.info(f"Starting capital: ${self.config.starting_capital_usd:,.2f}")
+        logger.info(f"Min capital required: ${self.config.min_capital_required:,.2f}")
         logger.info(f"Min volume filter: ${self.config.trading.min_volume_usd:,.0f}")
         logger.info(f"Min depth: ${self.config.trading.min_depth_usd:,.0f}")
         logger.info(f"Base arb threshold: {self.config.trading.arb_threshold_base * 100:.2f}%")
@@ -521,15 +527,14 @@ class ArbBot:
         logger.info(f"Capital scaling factor: {self.config.trading.capital_scaling_factor}")
         logger.info(f"Min trade size: ${self.config.trading.min_trade_size_usd:.0f}")
 
-        # Show rn1 target metrics (only if starting capital is defined)
-        if self.config.starting_capital_usd > 0:
-            rn1_targets = get_rn1_target_metrics(self.config.starting_capital_usd, days=90)
-            logger.info("-" * 60)
-            logger.info("RN1 BENCHMARK TARGETS (90 days)")
-            logger.info(f"Target daily geo return: {rn1_targets['rn1_daily_geo_return_pct']:.1f}%")
-            logger.info(f"Target capital (90d): ${rn1_targets['target_capital']:,.0f}")
-            logger.info(f"Target trades/day: {rn1_targets['trades_per_day_target']}")
-            logger.info(f"Target avg edge: {rn1_targets['avg_edge_pct']:.1f}%")
+        # Show rn1 target metrics
+        rn1_targets = get_rn1_target_metrics(self.config.starting_capital_usd, days=90)
+        logger.info("-" * 60)
+        logger.info("RN1 BENCHMARK TARGETS (90 days)")
+        logger.info(f"Target daily geo return: {rn1_targets['rn1_daily_geo_return_pct']:.1f}%")
+        logger.info(f"Target capital (90d): ${rn1_targets['target_capital']:,.0f}")
+        logger.info(f"Target trades/day: {rn1_targets['trades_per_day_target']}")
+        logger.info(f"Target avg edge: {rn1_targets['avg_edge_pct']:.1f}%")
 
         # WebSocket mandatory mode
         if self._ws_required:
@@ -600,11 +605,6 @@ class ArbBot:
                         logger.warning(balance_msg)
                     actual_balance = self.auth_manager.get_usdc_balance() or 0.0
 
-                # Dynamic capital: if starting_capital_usd is 0, use actual balance
-                if self.config.starting_capital_usd <= 0 and actual_balance > 0:
-                    self._current_capital = actual_balance
-                    self.metrics_exporter.set_starting_capital(actual_balance)
-                    logger.info(f"Dynamic capital mode: using actual balance ${actual_balance:,.2f}")
                 self._last_balance_refresh = datetime.now(timezone.utc)
 
                 # Verify trading readiness (balance + allowance) - FATAL if not ready
