@@ -280,6 +280,7 @@ class ArbBot:
         self._ws_disconnected_time: Optional[datetime] = None
         self._ws_paused_for_reconnect = False
         self._ws_reconnect_attempts = 0
+        self._ws_disconnect_alerted = False  # Track if 10s disconnect alert sent
 
         # Circuit breaker for rate limiting and error protection
         self._circuit_breaker_open = False
@@ -332,12 +333,17 @@ class ArbBot:
         """
         Check WebSocket status and handle mandatory WS mode.
 
+        Features:
+        - Alert if disconnected >10s
+        - Pause trading if disconnected past grace period during active hours
+
         Returns:
             True if trading is allowed, False if paused for WS reconnect.
         """
         if not self._ws_required or not self._is_active_hours():
             # WS not required or outside active hours
             self._ws_paused_for_reconnect = False
+            self._ws_disconnect_alerted = False
             return True
 
         # Check if WS is connected
@@ -354,6 +360,7 @@ class ArbBot:
             self._ws_disconnected_time = None
             self._ws_paused_for_reconnect = False
             self._ws_reconnect_attempts = 0
+            self._ws_disconnect_alerted = False
             return True
 
         # WS is disconnected during active hours with mandatory mode
@@ -361,13 +368,26 @@ class ArbBot:
 
         if self._ws_disconnected_time is None:
             self._ws_disconnected_time = now
+            self._ws_disconnect_alerted = False
             logger.warning(
                 f"WebSocket disconnected during active hours. "
                 f"Grace period: {self.config.trading.ws_reconnect_grace_period}s"
             )
 
-        # Check grace period
+        # Check disconnect duration for 10s alert
         disconnect_duration = (now - self._ws_disconnected_time).total_seconds()
+        alert_threshold = self.config.trading.ws_disconnect_alert_seconds
+
+        if disconnect_duration >= alert_threshold and not self._ws_disconnect_alerted:
+            # Send 10s disconnect alert
+            logger.warning("=" * 60)
+            logger.warning(f"WS DISCONNECT ALERT: WebSocket offline for >{alert_threshold:.0f}s!")
+            logger.warning(f"Duration: {disconnect_duration:.0f}s")
+            logger.warning("Trading with HTTP fallback (slower, less competitive)")
+            logger.warning("=" * 60)
+            self._ws_disconnect_alerted = True
+
+        # Check grace period
         grace_period = self.config.trading.ws_reconnect_grace_period
 
         if disconnect_duration < grace_period:
@@ -551,6 +571,13 @@ class ArbBot:
                     logger.error("=" * 60)
                     raise RuntimeError(f"Not ready for live trading: {ready_msg}")
 
+                # Check USDC MAX approval (non-fatal but recommended)
+                max_ok, max_msg = await self.execution_engine.ensure_max_approval()
+                if max_ok:
+                    logger.info(f"USDC approval: {max_msg}")
+                else:
+                    logger.warning(f"USDC approval: {max_msg}")
+
             except Exception as e:
                 logger.error(f"Authentication failed: {e}")
                 raise
@@ -729,6 +756,10 @@ class ArbBot:
         Process and potentially execute an arbitrage opportunity.
 
         Uses burst parallel execution for deep arbs during burst mode.
+        Includes:
+        - Pre-execution book refresh for slippage check
+        - Circuit breaker check
+        - Idempotency check
 
         Args:
             opportunity: The opportunity to process.
@@ -761,8 +792,12 @@ class ArbBot:
         is_burst = self.orderbook_poller.is_burst_market(opportunity.market.condition_id)
 
         # Execute the trade (use burst parallel for deep arbs during burst mode)
+        # Pass orderbook_poller for pre-execution book refresh
         logger.info(f"Executing opportunity: {opportunity}")
-        result = await self.execution_engine.execute_burst_parallel(opportunity, is_burst_mode=is_burst)
+        result = await self.execution_engine.execute_opportunity(
+            opportunity,
+            orderbook_poller=self.orderbook_poller
+        )
 
         if result.success:
             self._trades_executed += 1
@@ -1159,6 +1194,9 @@ class ArbBot:
         logger.info(f"Stale skipped: {ob_stats['stale_books_skipped']} | Slippage rejected: {ob_stats['slippage_rejected']}")
         logger.info(f"Burst markets: {ob_stats['burst_markets']} | Poll interval: {self._get_dynamic_poll_interval():.1f}s")
         logger.info(f"Big arb alerts: {self._big_arb_alerts_sent} | Active hours: {self._is_active_hours()}")
+        # New enhanced stats
+        logger.info(f"Drawdown: {exec_stats.get('drawdown_pct', 0):.2f}% | Circuit breaker: {'ACTIVE' if exec_stats.get('circuit_breaker_active') else 'OK'}")
+        logger.info(f"IOC mode: {exec_stats.get('ioc_mode', False)} | Idempotency tracked: {exec_stats.get('idempotency_tracked', 0)}")
 
         # WebSocket stats if enabled
         if self._use_websocket and self.hybrid_manager:

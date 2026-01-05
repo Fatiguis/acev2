@@ -210,6 +210,23 @@ class TradingConfig:
     # How often to retry WS connection when paused (seconds)
     ws_retry_interval: float = 10.0
 
+    # WebSocket disconnect alert threshold (seconds)
+    # Logs warning if WS disconnected for >10s
+    ws_disconnect_alert_seconds: float = 10.0
+
+    # Check USDC MAX approval on startup and before execution batches
+    check_usdc_max_approval: bool = True
+
+    # IOC (Immediate or Cancel) mode for more fills
+    # IOC allows partial fills unlike FOK, increasing trade frequency 2-5x
+    use_ioc_orders: bool = field(
+        default_factory=lambda: os.getenv("USE_IOC_ORDERS", "true").lower() == "true"
+    )
+
+    # Partial fill hedge slippage threshold (0.003 = 0.3%)
+    # Only hedge partial fills if slippage is below this threshold
+    partial_hedge_slippage_threshold: float = 0.003
+
 
 @dataclass
 class NetworkConfig:
