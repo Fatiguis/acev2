@@ -18,7 +18,12 @@ from config import BotConfig
 logger = logging.getLogger(__name__)
 
 # Minimum MATIC balance required for gas (in MATIC)
-MIN_MATIC_FOR_GAS = 0.01  # ~$0.005-0.02 worth, enough for several txs
+# Raised to 0.2 MATIC for rn1-style burst trading (100+ tx/day)
+# Polygon gas spikes can eat 0.05+ MATIC in hours
+MIN_MATIC_FOR_GAS = 0.2
+
+# Warning threshold - alert when approaching minimum
+MATIC_WARNING_THRESHOLD = 0.5
 
 T = TypeVar('T')
 
@@ -225,7 +230,60 @@ class AuthManager:
         self._client = client
         logger.info("Authenticated CLOB client initialized successfully")
 
+        # For EOA wallets (signature_type=0), ensure token approvals are set
+        # py-clob-client docs: EOA wallets require USDC + ConditionalTokens approvals BEFORE trading
+        if self.config.wallet.signature_type == 0:
+            self._ensure_eoa_approvals(client)
+
         return client
+
+    def _ensure_eoa_approvals(self, client: ClobClient):
+        """
+        Ensure EOA wallet has necessary token approvals for trading.
+
+        EOA wallets (signature_type=0) require:
+        1. USDC approval for the exchange
+        2. ConditionalTokens approval (for neg_risk markets)
+
+        Without these, post_order() fails silently or with obscure errors.
+
+        Args:
+            client: The authenticated CLOB client.
+        """
+        logger.info("EOA wallet detected - checking/setting token approvals...")
+
+        try:
+            # Approve USDC spending (required for all trades)
+            logger.info("Approving USDC spending...")
+            usdc_result = client.approve_usdc()
+            if usdc_result:
+                logger.info(f"USDC approval: {usdc_result}")
+            else:
+                logger.info("USDC approval submitted")
+        except Exception as e:
+            # Some errors are expected if already approved
+            error_str = str(e).lower()
+            if "already approved" in error_str or "allowance" in error_str:
+                logger.info("USDC already approved")
+            else:
+                logger.warning(f"USDC approval warning: {e}")
+
+        try:
+            # Approve ConditionalTokens (required for neg_risk markets)
+            logger.info("Approving ConditionalTokens...")
+            ct_result = client.approve_conditional_tokens()
+            if ct_result:
+                logger.info(f"ConditionalTokens approval: {ct_result}")
+            else:
+                logger.info("ConditionalTokens approval submitted")
+        except Exception as e:
+            error_str = str(e).lower()
+            if "already approved" in error_str or "allowance" in error_str:
+                logger.info("ConditionalTokens already approved")
+            else:
+                logger.warning(f"ConditionalTokens approval warning: {e}")
+
+        logger.info("EOA token approvals check complete")
 
     def _verify_api_creds(self, client: ClobClient) -> bool:
         """
@@ -465,7 +523,7 @@ class AuthManager:
             msg = (
                 f"INSUFFICIENT MATIC FOR GAS!\n"
                 f"  Current: {matic_balance:.6f} MATIC\n"
-                f"  Required: {MIN_MATIC_FOR_GAS:.4f} MATIC\n"
+                f"  Required: {MIN_MATIC_FOR_GAS:.4f} MATIC (raised for rn1-style burst trading)\n"
                 f"  Wallet: {self._wallet_address}\n"
                 f"  \n"
                 f"  Fund your wallet with MATIC:\n"
@@ -474,6 +532,13 @@ class AuthManager:
                 f"    - Use Polygon faucet (for small amounts)"
             )
             return False, msg
+
+        # Warning if approaching minimum
+        if matic_balance < MATIC_WARNING_THRESHOLD:
+            logger.warning(
+                f"MATIC balance low: {matic_balance:.4f} MATIC "
+                f"(warning threshold: {MATIC_WARNING_THRESHOLD} MATIC)"
+            )
 
         return True, f"MATIC balance OK: {matic_balance:.6f} MATIC"
 

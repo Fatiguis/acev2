@@ -4,12 +4,17 @@ Sets up structured logging for the arbitrage bot.
 """
 
 import logging
+import logging.handlers
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from config import LoggingConfig
+
+# Log rotation settings (prevent disk full on Render)
+MAX_LOG_SIZE_MB = 50  # Max 50MB per log file
+BACKUP_COUNT = 5  # Keep 5 backup files (250MB total max)
 
 
 class ColoredFormatter(logging.Formatter):
@@ -56,16 +61,25 @@ def setup_logging(config: LoggingConfig) -> logging.Logger:
         console_handler.setFormatter(console_formatter)
         root_logger.addHandler(console_handler)
 
-    # File handler
+    # File handler with rotation (prevent disk full on Render)
     if config.log_file:
         log_path = Path(config.log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        file_handler = logging.FileHandler(config.log_file)
+        # Use RotatingFileHandler instead of FileHandler
+        # This prevents unbounded log growth that crashes Render
+        file_handler = logging.handlers.RotatingFileHandler(
+            config.log_file,
+            maxBytes=MAX_LOG_SIZE_MB * 1024 * 1024,  # Convert MB to bytes
+            backupCount=BACKUP_COUNT,
+            encoding='utf-8'
+        )
         file_handler.setLevel(logging.DEBUG)  # Log everything to file
         file_formatter = logging.Formatter(config.format)
         file_handler.setFormatter(file_formatter)
         root_logger.addHandler(file_handler)
+
+        root_logger.info(f"Log rotation enabled: max {MAX_LOG_SIZE_MB}MB per file, {BACKUP_COUNT} backups")
 
     # Reduce noise from third-party libraries
     logging.getLogger("urllib3").setLevel(logging.WARNING)

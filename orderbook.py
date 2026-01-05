@@ -13,6 +13,7 @@ import aiohttp
 
 from config import BotConfig, calculate_dynamic_threshold
 from market_discovery import Market, Outcome
+from rate_limiter import get_global_limiter, handle_response_status
 
 logger = logging.getLogger(__name__)
 
@@ -307,13 +308,19 @@ class OrderbookPoller:
         params = {"token_id": token_id}
 
         try:
+            # Check global rate limiter before request
+            limiter = get_global_limiter()
+            if await limiter.wait_if_limited():
+                logger.debug(f"Waited for rate limit before fetching {token_id}")
+
             async with session.get(url, params=params) as response:
                 if response.status == 200:
+                    await limiter.record_success()
                     data = await response.json()
                     return self._parse_orderbook(data, token_id, outcome_name)
                 elif response.status == 429:
-                    logger.warning(f"Rate limited fetching orderbook for {token_id}")
-                    await asyncio.sleep(self.config.trading.rate_limit_backoff_base)
+                    # Use global rate limiter with exponential backoff
+                    await handle_response_status(429, f"orderbook/{token_id}")
                     return None
                 else:
                     logger.debug(f"Failed to fetch orderbook for {token_id}: HTTP {response.status}")

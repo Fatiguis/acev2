@@ -1060,13 +1060,36 @@ class ArbBot:
                 ws_opp = await self.hybrid_manager.get_next_arb(timeout=0.1)
 
                 if ws_opp:
-                    # WS detected an arb! Verify via HTTP before execution
-                    logger.debug(
-                        f"[WS] Arb detected: {ws_opp.profit_margin*100:.2f}% edge, "
-                        f"verifying via HTTP..."
-                    )
+                    # WS detected an arb! Decide: execute immediately or verify via HTTP
+                    edge_pct = ws_opp.profit_margin * 100
 
-                    if self.config.trading.ws_verify_before_execute:
+                    # Per audit: Execute immediately on WS if edge >1.5x threshold
+                    # HTTP verification takes 800ms+, by which time edge is gone 90%+ of cases
+                    strong_signal_threshold = self.config.trading.arb_threshold_base * 100 * 1.5  # 1.5x base threshold
+                    is_strong_signal = edge_pct >= strong_signal_threshold
+                    is_small_size = ws_opp.trade_size_usd <= 100  # Small sizes execute immediately
+
+                    if is_strong_signal or is_small_size:
+                        # Execute immediately on WS signal (fast path)
+                        logger.info(
+                            f"[WS FAST] Executing immediately: {edge_pct:.2f}% edge "
+                            f"(threshold: {strong_signal_threshold:.2f}%), ${ws_opp.trade_size_usd:.0f}"
+                        )
+                        # Apply rn1-style sizing
+                        depth_available = 100  # Conservative estimate for fast path
+                        rn1_size = self._get_rn1_style_trade_size(depth_available)
+                        if rn1_size > 0:
+                            ws_opp.trade_size_usd = min(ws_opp.trade_size_usd, rn1_size)
+
+                        result = await self.process_opportunity(ws_opp)
+                        if result and result.success:
+                            self._update_capital_tracking(result.realized_profit_usd)
+                    elif self.config.trading.ws_verify_before_execute:
+                        # Large size, weak signal: verify via HTTP first
+                        logger.debug(
+                            f"[WS] Arb detected: {edge_pct:.2f}% edge, "
+                            f"verifying via HTTP (size ${ws_opp.trade_size_usd:.0f} > $100)..."
+                        )
                         verified_opp = await self.hybrid_manager.verify_arb_http(ws_opp)
                         if verified_opp:
                             # Apply rn1-style sizing
@@ -1078,16 +1101,16 @@ class ArbBot:
                                 verified_opp.trade_size_usd = min(verified_opp.trade_size_usd, rn1_size)
 
                             logger.info(
-                                f"[WS→HTTP] Arb verified! Edge: {verified_opp.profit_margin*100:.2f}%, "
+                                f"[WS->HTTP] Arb verified! Edge: {verified_opp.profit_margin*100:.2f}%, "
                                 f"Size: ${verified_opp.trade_size_usd:.0f}"
                             )
                             result = await self.process_opportunity(verified_opp)
                             if result and result.success:
                                 self._update_capital_tracking(result.realized_profit_usd)
                         else:
-                            logger.debug("[WS→HTTP] Arb gone (edge decayed or taken)")
+                            logger.debug("[WS->HTTP] Arb gone (edge decayed or taken)")
                     else:
-                        # Execute directly on WS signal (faster but riskier)
+                        # Execute directly on WS signal (no verification)
                         result = await self.process_opportunity(ws_opp)
                         if result and result.success:
                             self._update_capital_tracking(result.realized_profit_usd)

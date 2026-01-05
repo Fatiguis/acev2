@@ -37,7 +37,9 @@ import time
 class IdempotencyTracker:
     """Track recent arb IDs to prevent duplicates on restart/reconnect."""
 
-    def __init__(self, ttl_seconds: int = 60):
+    def __init__(self, ttl_seconds: int = 300):
+        # TTL increased to 300s (5 min) from 60s per audit
+        # Fast reconnects or WS->HTTP fallback can re-detect same arb within minutes
         self.ttl_seconds = ttl_seconds
         self._recent_arbs: OrderedDict[str, float] = OrderedDict()  # arb_id -> timestamp
         self._max_entries = 1000  # Prevent unbounded growth

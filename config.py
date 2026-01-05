@@ -605,6 +605,15 @@ def calculate_rn1_style_size(
     # Cap at max_trade_size_usd
     base_size = min(pct_size, config.max_trade_size_usd)
 
+    # CRITICAL: Hard-cap initial trade sizes to $30 until capital > $10k
+    # Per audit: rn1 averaged $27/trade starting from $1k
+    # Aggressive sizing too early = blowup risk on partials
+    EARLY_STAGE_CAPITAL_THRESHOLD = 10000  # $10k
+    EARLY_STAGE_MAX_SIZE = 30  # $30 hard cap
+
+    if current_capital < EARLY_STAGE_CAPITAL_THRESHOLD:
+        base_size = min(base_size, EARLY_STAGE_MAX_SIZE)
+
     # Apply capital scaling
     # As capital grows, we can increase size (but sub-linearly for safety)
     capital_ratio = current_capital / starting_capital
@@ -615,6 +624,10 @@ def calculate_rn1_style_size(
     else:
         # Don't scale down if capital decreased (maintain same risk)
         scaled_size = base_size
+
+    # Re-apply early stage cap after scaling (safety)
+    if current_capital < EARLY_STAGE_CAPITAL_THRESHOLD:
+        scaled_size = min(scaled_size, EARLY_STAGE_MAX_SIZE)
 
     # Apply depth constraint (safety multiplier already in depth_validator)
     final_size = min(scaled_size, depth_available)
