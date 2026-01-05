@@ -89,12 +89,26 @@ class TradingConfig:
         default_factory=lambda: os.getenv("USE_POST_ONLY", "false").lower() == "true"
     )
 
+    # Post-only for HEDGE legs specifically (profit-locking orders)
+    # Hedges are less time-sensitive than primary arb legs, so can wait for maker rebates
+    # Uses 30s timeout (vs 0.5s for primary) before FAK fallback
+    use_post_only_hedges: bool = field(
+        default_factory=lambda: os.getenv("USE_POST_ONLY_HEDGES", "true").lower() == "true"
+    )
+
     # Post-only timeout in seconds before falling back to FOK
     post_only_timeout_seconds: float = 0.5
+
+    # Post-only timeout for HEDGE orders (longer - hedges are less time-sensitive)
+    post_only_hedge_timeout_seconds: float = 30.0
 
     # Price improvement for post-only orders (in cents/price units)
     # e.g., 0.01 = post 1 cent better than current best for more likely fills
     post_only_price_improvement: float = 0.01
+
+    # Maker vs taker ratio tracking
+    # Alert if maker fill ratio drops below this threshold
+    maker_ratio_alert_threshold: float = 0.30  # Alert if <30% maker fills
 
     # Fixed gas buffer in USD (Polygon gas ~$0.01-0.05 per tx)
     gas_buffer_usd: float = 0.05

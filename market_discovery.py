@@ -100,7 +100,7 @@ class MarketDiscovery:
         # Resilient caching for API failures
         self._fallback_cache: List[Market] = []  # Longer-term cache for complete API failure
         self._fallback_cache_time: Optional[datetime] = None
-        self._fallback_cache_ttl_seconds = 1800  # 30 min fallback cache
+        self._fallback_cache_ttl_seconds = 259200  # 72h aggressive fallback cache per audit
         self._consecutive_gamma_failures = 0
         self._max_gamma_failures_before_fallback = 3
 
@@ -655,10 +655,16 @@ class MarketDiscovery:
 
     async def fetch_markets_from_clob(self) -> List[Market]:
         """
-        Fallback: Fetch active markets directly from CLOB API.
+        PRIMARY: Fetch active markets directly from CLOB API.
 
-        This is used when Gamma API is completely unavailable.
-        CLOB /markets endpoint returns active trading markets.
+        Per Round 4 audit: CLOB /markets is the RELIABLE source for active markets.
+        Gamma API is flaky with undocumented rate limits and outages.
+        rn1 dominates live sports by always having fresh active market list.
+
+        Features:
+        - 15 retries with 15s exponential backoff (vs 2 before)
+        - Prioritizes neg_risk markets (rn1 focus)
+        - Parses all market data including open_interest
 
         Returns:
             List of Market objects from CLOB.
@@ -667,14 +673,18 @@ class MarketDiscovery:
             url = f"{self.clob_endpoint}/markets"
             params = {"active": "true", "closed": "false"}
 
-            data = await self._fetch_json_with_retry(url, params, max_retries=2)
+            # 15 retries with aggressive backoff per audit
+            data = await self._fetch_json_with_retry(url, params, max_retries=15)
             if not data:
+                logger.warning("CLOB /markets returned no data after retries")
                 return []
 
             markets = []
+            neg_risk_count = 0
+
             for market_data in data:
                 try:
-                    # CLOB market format differs slightly from Gamma
+                    # CLOB market format
                     condition_id = market_data.get("condition_id", "")
                     if not condition_id:
                         continue
@@ -695,10 +705,16 @@ class MarketDiscovery:
                     if not outcomes:
                         continue
 
-                    # Parse neg_risk
+                    # Parse neg_risk (critical for rn1-style trading)
                     neg_risk = market_data.get("neg_risk", False)
                     if isinstance(neg_risk, str):
                         neg_risk = neg_risk.lower() == "true"
+
+                    if neg_risk:
+                        neg_risk_count += 1
+
+                    # Parse additional fields from CLOB
+                    open_interest = float(market_data.get("open_interest", 0) or 0)
 
                     market = Market(
                         market_id=market_data.get("market_id", condition_id),
@@ -707,7 +723,7 @@ class MarketDiscovery:
                         slug=market_data.get("market_slug", ""),
                         outcomes=outcomes,
                         volume=float(market_data.get("volume", 0) or 0),
-                        liquidity=float(market_data.get("liquidity", 0) or 0),
+                        liquidity=float(market_data.get("liquidity", 0) or 0) + open_interest,
                         is_active=market_data.get("active", True),
                         is_closed=market_data.get("closed", False),
                         neg_risk=neg_risk,
@@ -718,11 +734,11 @@ class MarketDiscovery:
                     logger.debug(f"Failed to parse CLOB market: {e}")
                     continue
 
-            logger.info(f"CLOB fallback: fetched {len(markets)} markets")
+            logger.info(f"CLOB PRIMARY: fetched {len(markets)} markets ({neg_risk_count} neg_risk)")
             return markets
 
         except Exception as e:
-            logger.error(f"CLOB fallback failed: {e}")
+            logger.error(f"CLOB primary fetch failed: {e}")
             return []
 
     def _is_in_play_from_status(self, market_data: Dict) -> bool:
@@ -799,10 +815,13 @@ class MarketDiscovery:
         """
         Main discovery method: fetch and filter target markets.
 
-        Uses resilient multi-tier approach (per Round 2 audit):
-        1. Primary: CLOB /markets API (reliable, fast, has active trading markets)
-        2. Fallback: Gamma API for sports events (enriches with event data if CLOB fails)
-        3. Cache: Return cached markets if all APIs fail
+        Per Round 4 audit - TRUE CLOB-PRIMARY approach:
+        1. PRIMARY: CLOB /markets API (reliable, 15 retries, has all active markets)
+        2. PARALLEL ENRICH: Gamma API for question/slug/series (fire-and-forget cache)
+        3. AGGRESSIVE CACHE: 72h fallback if all APIs fail
+
+        rn1 dominates live sports by ALWAYS having fresh market list.
+        Gamma is known flaky - never depend on it for primary discovery.
 
         Args:
             include_pre_match: Whether to include pre-match markets (not just in-play).
@@ -813,19 +832,37 @@ class MarketDiscovery:
         markets = []
         min_volume = self.config.trading.min_volume_usd
 
-        # Try primary: CLOB /markets API (more reliable than Gamma per audit)
+        # PRIMARY: CLOB /markets API - ALWAYS try this first
+        # This is the RELIABLE source per audit
+        clob_success = False
         try:
             clob_markets = await self.fetch_markets_from_clob()
             if clob_markets:
-                # Filter by volume
+                # Filter by volume and active status
                 markets = [m for m in clob_markets if m.volume >= min_volume and m.is_active]
-                logger.debug(f"CLOB API success: {len(markets)} markets after volume filter")
-        except Exception as e:
-            logger.warning(f"CLOB API failed: {e}")
 
-        # If CLOB failed or returned few markets, supplement with Gamma
-        # Gamma has richer event/sports data but is less reliable
-        if len(markets) < 10:  # Supplement if we have few markets
+                # PRIORITIZE neg_risk markets (rn1 focus on winner-take-all sports)
+                neg_risk_markets = [m for m in markets if m.neg_risk]
+                non_neg_risk = [m for m in markets if not m.neg_risk]
+                markets = neg_risk_markets + non_neg_risk  # neg_risk first
+
+                clob_success = True
+                logger.info(f"CLOB PRIMARY: {len(markets)} markets ({len(neg_risk_markets)} neg_risk priority)")
+        except Exception as e:
+            logger.error(f"CLOB PRIMARY failed: {e}")
+
+        # PARALLEL ENRICH: Fire-and-forget Gamma enrichment (don't block on it)
+        # Only for question/slug/series data - NOT for market discovery
+        if clob_success and len(markets) > 0:
+            # Launch Gamma enrichment as background task (don't await)
+            try:
+                asyncio.create_task(self._enrich_markets_from_gamma(markets))
+            except Exception:
+                pass  # Enrichment failure is non-fatal
+
+        # FALLBACK: Only if CLOB completely failed, try Gamma
+        if not clob_success or len(markets) == 0:
+            logger.warning("CLOB failed - falling back to Gamma API (less reliable)")
             try:
                 events = await self.fetch_all_priority_sports()
                 if events:
@@ -884,6 +921,58 @@ class MarketDiscovery:
         logger.info(f"Discovered {len(markets)} markets ({in_play_count} in-play, {len(markets) - in_play_count} pre-match)")
 
         return markets
+
+    async def _enrich_markets_from_gamma(self, markets: List[Market]):
+        """
+        Fire-and-forget enrichment of CLOB markets with Gamma data.
+
+        This runs in background to add question/slug/series/tags to markets
+        without blocking the main discovery flow.
+
+        Args:
+            markets: List of markets to enrich (modified in place).
+        """
+        try:
+            # Fetch Gamma events in parallel (don't block main flow)
+            events = await self.fetch_all_priority_sports()
+            if not events:
+                return
+
+            # Build lookup by condition_id
+            gamma_lookup = {}
+            for event in events:
+                for market in event.markets:
+                    gamma_lookup[market.condition_id] = {
+                        "question": market.question,
+                        "slug": market.slug,
+                        "series_id": market.series_id,
+                        "start_date": market.start_date,
+                        "end_date": market.end_date,
+                    }
+
+            # Enrich CLOB markets with Gamma data
+            enriched = 0
+            for market in markets:
+                gamma_data = gamma_lookup.get(market.condition_id)
+                if gamma_data:
+                    if not market.question or market.question == "Unknown":
+                        market.question = gamma_data.get("question", market.question)
+                    if not market.slug:
+                        market.slug = gamma_data.get("slug", "")
+                    if not market.series_id:
+                        market.series_id = gamma_data.get("series_id", "")
+                    if not market.start_date:
+                        market.start_date = gamma_data.get("start_date")
+                    if not market.end_date:
+                        market.end_date = gamma_data.get("end_date")
+                    enriched += 1
+
+            if enriched > 0:
+                logger.debug(f"Gamma enriched {enriched}/{len(markets)} markets")
+
+        except Exception as e:
+            # Enrichment failure is non-fatal - log and continue
+            logger.debug(f"Gamma enrichment failed (non-fatal): {e}")
 
     def get_cached_markets(self) -> List[Market]:
         """Get cached markets from last discovery."""

@@ -502,6 +502,13 @@ class ExecutionEngine:
         self._use_ioc = True  # Use FAK instead of FOK for more fills (2-5x fill rate)
         self._partial_hedge_slippage_threshold = 0.003  # 0.3% max slippage for partial hedging
 
+        # Maker vs Taker tracking for post-only orders
+        self._maker_fills = 0  # Post-only GTC orders that filled as maker
+        self._taker_fills = 0  # FAK/FOK orders that filled as taker
+        self._maker_volume_usd = 0.0  # Volume from maker fills
+        self._taker_volume_usd = 0.0  # Volume from taker fills
+        self._maker_ratio_alert_sent = False  # Only alert once per session
+
     def set_client(self, client: ClobClient):
         """Set the CLOB client."""
         self.client = client
@@ -1329,11 +1336,11 @@ class ExecutionEngine:
         opportunity: ArbOpportunity
     ) -> List[OrderResult]:
         """
-        Aggressively hedge partial fills by selling filled positions.
+        Hedge partial fills using post-only GTC for maker rebates, with FAK fallback.
 
         When we have partial fills, we're left with directional exposure.
-        This method immediately places opposing market orders on over-exposed
-        outcomes with up to 5 retries and 100ms spacing.
+        If use_post_only_hedges is enabled (default True), first tries post-only GTC
+        orders with 30s timeout for maker rebates. Falls back to FAK if not filled.
 
         Args:
             result: Execution result with partial fills.
@@ -1343,8 +1350,8 @@ class ExecutionEngine:
             List of hedge order results.
         """
         hedge_orders = []
-        max_hedge_retries = 5
-        retry_delay = 0.1  # 100ms between retries
+        use_post_only_hedges = self.config.trading.use_post_only_hedges
+        hedge_timeout = self.config.trading.post_only_hedge_timeout_seconds
 
         for order in result.orders:
             if order.status == OrderStatus.FILLED and order.executed_size_usd > 0:
@@ -1352,7 +1359,45 @@ class ExecutionEngine:
                 hedge_side = SELL if order.side == "BUY" else BUY
                 remaining_size = order.executed_size_usd
 
-                # Aggressive retry loop for hedge orders
+                # Try post-only GTC first for maker rebates (hedges are less time-sensitive)
+                if use_post_only_hedges and remaining_size > 0:
+                    try:
+                        hedge_order = await self._place_hedge_post_only(
+                            token_id=order.token_id,
+                            outcome_name=f"hedge_{order.outcome_name}",
+                            side=hedge_side,
+                            size_usd=remaining_size,
+                            limit_price=order.price,
+                            timeout_seconds=hedge_timeout
+                        )
+                        hedge_orders.append(hedge_order)
+
+                        if hedge_order.status == OrderStatus.FILLED:
+                            remaining_size -= hedge_order.executed_size_usd
+                            # Track as maker fill
+                            self._maker_fills += 1
+                            self._maker_volume_usd += hedge_order.executed_size_usd
+                            logger.info(
+                                f"Hedge filled (MAKER): {hedge_side} {order.outcome_name} "
+                                f"${hedge_order.executed_size_usd:.2f} (rebate earned!)"
+                            )
+                        elif hedge_order.status == OrderStatus.PARTIAL:
+                            remaining_size -= hedge_order.executed_size_usd
+                            # Partial counts as maker for filled portion
+                            self._maker_fills += 1
+                            self._maker_volume_usd += hedge_order.executed_size_usd
+                            logger.warning(
+                                f"Partial hedge (MAKER): {order.outcome_name} "
+                                f"${hedge_order.executed_size_usd:.2f} filled, "
+                                f"${remaining_size:.2f} needs FAK fallback"
+                            )
+                    except Exception as e:
+                        logger.warning(f"Post-only hedge failed: {e}, falling back to FAK")
+
+                # FAK fallback for remaining size (aggressive hedge)
+                max_hedge_retries = 5
+                retry_delay = 0.1  # 100ms between retries
+
                 for retry in range(max_hedge_retries):
                     if remaining_size <= 0:
                         break
@@ -1370,15 +1415,20 @@ class ExecutionEngine:
 
                         if hedge_order.status == OrderStatus.FILLED:
                             remaining_size -= hedge_order.executed_size_usd
+                            # Track as taker fill
+                            self._taker_fills += 1
+                            self._taker_volume_usd += hedge_order.executed_size_usd
                             logger.info(
-                                f"Hedge filled: {hedge_side} {order.outcome_name} "
+                                f"Hedge filled (TAKER/FAK): {hedge_side} {order.outcome_name} "
                                 f"${hedge_order.executed_size_usd:.2f}"
                             )
                             break
                         elif hedge_order.status == OrderStatus.PARTIAL:
                             remaining_size -= hedge_order.executed_size_usd
+                            self._taker_fills += 1
+                            self._taker_volume_usd += hedge_order.executed_size_usd
                             logger.warning(
-                                f"Partial hedge: {order.outcome_name} "
+                                f"Partial hedge (TAKER): {order.outcome_name} "
                                 f"${hedge_order.executed_size_usd:.2f} filled, "
                                 f"${remaining_size:.2f} remaining"
                             )
@@ -1405,6 +1455,9 @@ class ExecutionEngine:
                         remaining_size if order.side == "BUY" else -remaining_size
                     )
 
+        # Check maker ratio and alert if below threshold
+        self._check_maker_ratio_alert()
+
         return hedge_orders
 
     def _update_market_exposure(self, market_id: str, exposure_delta: float):
@@ -1427,6 +1480,148 @@ class ExecutionEngine:
                 f"EXPOSURE WARNING: {market_id} exposure ${new_exposure:.2f} "
                 f"exceeds max ${max_exposure:.2f} ({self._max_exposure_pct*100:.0f}% of capital)"
             )
+
+    async def _place_hedge_post_only(
+        self,
+        token_id: str,
+        outcome_name: str,
+        side: str,
+        size_usd: float,
+        limit_price: float,
+        timeout_seconds: float = 30.0,
+        client: Optional[ClobClient] = None
+    ) -> OrderResult:
+        """
+        Place a post-only GTC order for hedge/profit-lock with longer timeout.
+
+        Hedges are less time-sensitive than primary arb legs, so we can wait
+        longer for maker fills to earn rebates (~0.1-0.3%).
+
+        Args:
+            token_id: Token ID to trade.
+            outcome_name: Name of outcome for logging.
+            side: BUY or SELL.
+            size_usd: Size in USD.
+            limit_price: Reference price (will be improved for post-only).
+            timeout_seconds: How long to wait before returning (default 30s).
+            client: Optional CLOB client to use.
+
+        Returns:
+            OrderResult with execution details.
+        """
+        execution_client = client or self.client
+        base_improvement = self.config.trading.post_only_price_improvement
+
+        result = OrderResult(
+            token_id=token_id,
+            outcome_name=outcome_name,
+            side="BUY" if side == BUY else "SELL",
+            requested_size_usd=size_usd,
+            price=limit_price
+        )
+
+        # Conservative price improvement for hedges (we want fills, not best price)
+        # Hedges just need to close position, so be more aggressive on price
+        price_improvement = base_improvement + 0.005  # Add 0.5 cents for hedges
+
+        # Calculate improved price for post-only
+        # For BUY hedge: post above current best bid (more likely to fill)
+        # For SELL hedge: post below current best ask (more likely to fill)
+        if side == BUY:
+            post_price = min(limit_price + price_improvement, 0.99)
+        else:
+            post_price = max(limit_price - price_improvement, 0.01)
+
+        try:
+            # Calculate size in shares from USD
+            size_shares = size_usd / post_price if post_price > 0 else 0
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=post_price,
+                size=size_shares,
+                side=side,
+            )
+
+            signed_order = execution_client.create_order(order_args)
+
+            # Submit as GTC (Good Till Cancelled)
+            response = execution_client.post_order(signed_order, OrderType.GTC)
+
+            if response and response.get("success"):
+                order_id = response.get("orderID")
+                result.order_id = order_id
+
+                # Wait for fill with longer timeout for hedges
+                filled = await self._wait_for_fill(execution_client, order_id, timeout_seconds)
+
+                if filled:
+                    result.status = OrderStatus.FILLED
+                    result.executed_size_usd = size_usd
+                    logger.info(
+                        f"Hedge post-only FILLED: {side} {outcome_name} @ {post_price:.4f} "
+                        f"for ${size_usd:.2f} (MAKER REBATE!)"
+                    )
+                    return result
+                else:
+                    # Cancel unfilled order - will fall back to FAK in caller
+                    try:
+                        execution_client.cancel(order_id)
+                        logger.debug(f"Hedge post-only timed out after {timeout_seconds}s, cancelled {order_id}")
+                    except Exception:
+                        pass
+
+                    result.status = OrderStatus.CANCELLED
+                    result.error = f"Timeout after {timeout_seconds}s"
+                    return result
+            else:
+                error_msg = response.get("errorMsg", "Unknown error") if response else "No response"
+                result.status = OrderStatus.FAILED
+                result.error = error_msg
+                return result
+
+        except Exception as e:
+            result.status = OrderStatus.FAILED
+            result.error = str(e)
+            return result
+
+    def _check_maker_ratio_alert(self):
+        """
+        Check maker vs taker ratio and log alert if below threshold.
+
+        Only alerts once per session to avoid log spam.
+        """
+        total_fills = self._maker_fills + self._taker_fills
+        if total_fills < 10:
+            return  # Need minimum sample size
+
+        maker_ratio = self._maker_fills / total_fills if total_fills > 0 else 0
+
+        if maker_ratio < self.config.trading.maker_ratio_alert_threshold:
+            if not self._maker_ratio_alert_sent:
+                self._maker_ratio_alert_sent = True
+                logger.warning(
+                    f"MAKER RATIO ALERT: Only {maker_ratio*100:.1f}% maker fills "
+                    f"(threshold: {self.config.trading.maker_ratio_alert_threshold*100:.0f}%). "
+                    f"Maker: {self._maker_fills}, Taker: {self._taker_fills}. "
+                    f"Consider increasing post_only_hedge_timeout_seconds."
+                )
+
+    def get_maker_taker_stats(self) -> dict:
+        """Get maker vs taker statistics."""
+        total_fills = self._maker_fills + self._taker_fills
+        total_volume = self._maker_volume_usd + self._taker_volume_usd
+
+        return {
+            "maker_fills": self._maker_fills,
+            "taker_fills": self._taker_fills,
+            "total_fills": total_fills,
+            "maker_ratio": self._maker_fills / total_fills if total_fills > 0 else 0,
+            "maker_volume_usd": self._maker_volume_usd,
+            "taker_volume_usd": self._taker_volume_usd,
+            "total_volume_usd": total_volume,
+            "maker_volume_ratio": self._maker_volume_usd / total_volume if total_volume > 0 else 0,
+        }
 
     def get_market_exposure(self, market_id: str) -> float:
         """Get current exposure for a market."""
@@ -2331,6 +2526,9 @@ class ExecutionEngine:
         if self._session_high_capital > 0:
             drawdown_pct = (self._session_high_capital - self._current_capital) / self._session_high_capital * 100
 
+        # Get maker/taker stats
+        maker_taker = self.get_maker_taker_stats()
+
         return {
             "execution_count": self._execution_count,
             "total_volume_usd": self._total_volume,
@@ -2352,5 +2550,11 @@ class ExecutionEngine:
             "drawdown_pct": drawdown_pct,
             "idempotency_tracked": self._idempotency_tracker.get_stats()["tracked_arbs"],
             "fak_mode": self._use_ioc,  # FAK = Fill-And-Kill (Polymarket's IOC)
-            "has_fak_support": HAS_FAK
+            "has_fak_support": HAS_FAK,
+            # Maker vs Taker tracking (for post-only hedge orders)
+            "maker_fills": maker_taker["maker_fills"],
+            "taker_fills": maker_taker["taker_fills"],
+            "maker_ratio_pct": maker_taker["maker_ratio"] * 100,
+            "maker_volume_usd": maker_taker["maker_volume_usd"],
+            "taker_volume_usd": maker_taker["taker_volume_usd"],
         }
