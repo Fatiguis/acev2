@@ -91,9 +91,17 @@ class MarketDiscovery:
         """
         self.config = config
         self.gamma_endpoint = config.network.gamma_endpoint
+        self.clob_endpoint = config.network.clob_endpoint
         self._session: Optional[aiohttp.ClientSession] = None
         self._cached_markets: List[Market] = []
         self._last_refresh: Optional[datetime] = None
+
+        # Resilient caching for API failures
+        self._fallback_cache: List[Market] = []  # Longer-term cache for complete API failure
+        self._fallback_cache_time: Optional[datetime] = None
+        self._fallback_cache_ttl_seconds = 1800  # 30 min fallback cache
+        self._consecutive_gamma_failures = 0
+        self._max_gamma_failures_before_fallback = 3
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create an aiohttp session."""
@@ -436,9 +444,13 @@ class MarketDiscovery:
 
     def estimate_in_play(self, market: Market) -> bool:
         """
-        Estimate if a market is currently in-play using config durations.
+        Estimate if a market is currently in-play using multiple signals.
 
-        Uses game_durations from SportsConfig for precise sport-specific timing.
+        Priority order:
+        1. Explicit in-play markers (tags, enableOrderBook status)
+        2. Time-based heuristics (start_date <= now < estimated_end)
+
+        Uses game_durations from SportsConfig for sport-specific timing.
 
         Args:
             market: Market to check.
@@ -448,6 +460,11 @@ class MarketDiscovery:
         """
         now = datetime.now(timezone.utc)
 
+        # Quick reject: not active or closed
+        if not market.is_active or market.is_closed:
+            return False
+
+        # Check time-based heuristics
         if market.start_date:
             if market.start_date > now:
                 return False  # Event hasn't started
@@ -461,7 +478,65 @@ class MarketDiscovery:
             if now < estimated_end:
                 return True
 
+            # If past estimated end, check if market is still active
+            # (overtime, extra time, delays, etc.)
+            if market.is_active and not market.is_closed:
+                # If market still active past estimated end, likely still in-play
+                # Add 60-minute buffer for overtime/delays
+                extended_end = estimated_end + timedelta(minutes=60)
+                if now < extended_end:
+                    return True
+
+        # If no start_date, check if market has recent activity
+        # Active market with volume suggests it's tradeable
+        if market.is_active and market.volume > 0 and market.best_ask is not None:
+            return True
+
         return False
+
+    def get_in_play_score(self, market: Market) -> float:
+        """
+        Get in-play confidence score for prioritization.
+
+        Higher scores = more confident the market is actively in-play.
+        Used for sorting/prioritizing markets.
+
+        Args:
+            market: Market to score.
+
+        Returns:
+            Score from 0.0 (not in-play) to 1.0 (definitely in-play).
+        """
+        if not self.estimate_in_play(market):
+            return 0.0
+
+        score = 0.5  # Base score if we think it's in-play
+
+        now = datetime.now(timezone.utc)
+
+        # Boost score based on time into game
+        if market.start_date:
+            minutes_into_game = (now - market.start_date).total_seconds() / 60
+            duration = self._get_sport_duration(market)
+
+            # Peak score in middle of game (most volatility)
+            game_progress = minutes_into_game / duration
+            if 0.2 <= game_progress <= 0.8:
+                score += 0.3  # In the meat of the game
+            elif 0.8 < game_progress <= 1.0:
+                score += 0.2  # Late game (still good for arbs)
+
+        # Boost for high volume (more liquidity = better arb execution)
+        if market.volume >= 50000:
+            score += 0.1
+        elif market.volume >= 20000:
+            score += 0.05
+
+        # Boost for neg_risk markets (easier to trade)
+        if market.neg_risk:
+            score += 0.05
+
+        return min(1.0, score)
 
     def _get_sport_duration(self, market: Market) -> int:
         """
@@ -533,6 +608,113 @@ class MarketDiscovery:
         logger.info(f"Identified {len(in_play)} in-play markets")
         return in_play
 
+    async def fetch_markets_from_clob(self) -> List[Market]:
+        """
+        Fallback: Fetch active markets directly from CLOB API.
+
+        This is used when Gamma API is completely unavailable.
+        CLOB /markets endpoint returns active trading markets.
+
+        Returns:
+            List of Market objects from CLOB.
+        """
+        try:
+            url = f"{self.clob_endpoint}/markets"
+            params = {"active": "true", "closed": "false"}
+
+            data = await self._fetch_json_with_retry(url, params, max_retries=2)
+            if not data:
+                return []
+
+            markets = []
+            for market_data in data:
+                try:
+                    # CLOB market format differs slightly from Gamma
+                    condition_id = market_data.get("condition_id", "")
+                    if not condition_id:
+                        continue
+
+                    # Parse tokens
+                    tokens = market_data.get("tokens", [])
+                    if len(tokens) < 2:
+                        continue
+
+                    outcomes = []
+                    for token in tokens:
+                        token_id = token.get("token_id", "")
+                        outcome_name = token.get("outcome", "")
+                        price = float(token.get("price", 0.5))
+                        if token_id:
+                            outcomes.append(Outcome(name=outcome_name, token_id=token_id, price=price))
+
+                    if not outcomes:
+                        continue
+
+                    # Parse neg_risk
+                    neg_risk = market_data.get("neg_risk", False)
+                    if isinstance(neg_risk, str):
+                        neg_risk = neg_risk.lower() == "true"
+
+                    market = Market(
+                        market_id=market_data.get("market_id", condition_id),
+                        condition_id=condition_id,
+                        question=market_data.get("question", "Unknown"),
+                        slug=market_data.get("market_slug", ""),
+                        outcomes=outcomes,
+                        volume=float(market_data.get("volume", 0) or 0),
+                        liquidity=float(market_data.get("liquidity", 0) or 0),
+                        is_active=market_data.get("active", True),
+                        is_closed=market_data.get("closed", False),
+                        neg_risk=neg_risk,
+                    )
+                    markets.append(market)
+
+                except Exception as e:
+                    logger.debug(f"Failed to parse CLOB market: {e}")
+                    continue
+
+            logger.info(f"CLOB fallback: fetched {len(markets)} markets")
+            return markets
+
+        except Exception as e:
+            logger.error(f"CLOB fallback failed: {e}")
+            return []
+
+    def _is_in_play_from_status(self, market_data: Dict) -> bool:
+        """
+        Check if market is in-play using API status fields.
+
+        Looks for explicit in-play indicators from the API:
+        - enableOrderBook: True (active trading)
+        - game_start_time: Past but game not ended
+        - Tags containing 'in-play', 'live', etc.
+
+        Args:
+            market_data: Raw market data from API.
+
+        Returns:
+            True if market appears to be in-play based on status.
+        """
+        # Check for explicit in-play tag
+        tags = market_data.get("tags", [])
+        if isinstance(tags, list):
+            tag_labels = [t.get("label", "").lower() if isinstance(t, dict) else str(t).lower() for t in tags]
+            if any(label in ["in-play", "live", "in play", "in_play"] for label in tag_labels):
+                return True
+
+        # Check if orderbook is enabled (live trading = likely in-play)
+        if market_data.get("enableOrderBook") is True:
+            # Also check it's not closed/resolved
+            if not market_data.get("closed", False) and market_data.get("active", True):
+                # Check game_start_time if available
+                game_start = market_data.get("game_start_time") or market_data.get("startDate")
+                if game_start:
+                    start_dt = self._parse_datetime(str(game_start))
+                    if start_dt and start_dt <= datetime.now(timezone.utc):
+                        return True
+
+        return False
+
     def _parse_event(self, event_data: Dict) -> Optional[Event]:
         """
         Parse event data including its markets.
@@ -572,35 +754,84 @@ class MarketDiscovery:
         """
         Main discovery method: fetch and filter target markets.
 
+        Uses resilient multi-tier approach:
+        1. Primary: Gamma API for sports events
+        2. Fallback: CLOB API for active markets
+        3. Cache: Return cached markets if all APIs fail
+
         Args:
             include_pre_match: Whether to include pre-match markets (not just in-play).
 
         Returns:
             List of target markets for arbitrage scanning.
         """
-        # Fetch all priority sports events
-        events = await self.fetch_all_priority_sports()
+        markets = []
 
-        # Filter by volume
-        markets = self.filter_high_volume_markets(events)
+        # Try primary: Gamma API
+        try:
+            events = await self.fetch_all_priority_sports()
+            if events:
+                markets = self.filter_high_volume_markets(events)
+                self._consecutive_gamma_failures = 0
+                logger.debug(f"Gamma API success: {len(markets)} markets")
+            else:
+                self._consecutive_gamma_failures += 1
+                logger.warning(f"Gamma API returned no events (failure {self._consecutive_gamma_failures})")
+        except Exception as e:
+            self._consecutive_gamma_failures += 1
+            logger.warning(f"Gamma API failed: {e} (failure {self._consecutive_gamma_failures})")
+
+        # If Gamma failed too many times, try CLOB fallback
+        if not markets and self._consecutive_gamma_failures >= self._max_gamma_failures_before_fallback:
+            logger.warning("Gamma API unreliable, attempting CLOB fallback...")
+            clob_markets = await self.fetch_markets_from_clob()
+            if clob_markets:
+                # Filter by volume (CLOB doesn't have series info)
+                min_volume = self.config.trading.min_volume_usd
+                markets = [m for m in clob_markets if m.volume >= min_volume and m.is_active]
+                logger.info(f"CLOB fallback: {len(markets)} markets after volume filter")
+
+        # If still no markets, use fallback cache
+        if not markets:
+            if self._fallback_cache and self._fallback_cache_time:
+                cache_age = (datetime.now(timezone.utc) - self._fallback_cache_time).total_seconds()
+                if cache_age < self._fallback_cache_ttl_seconds:
+                    logger.warning(f"Using fallback cache ({len(self._fallback_cache)} markets, {cache_age:.0f}s old)")
+                    markets = self._fallback_cache
+                else:
+                    logger.error(f"Fallback cache expired ({cache_age:.0f}s old), no markets available")
+            else:
+                logger.error("No markets available and no fallback cache")
 
         # Optionally filter to in-play only
-        if not include_pre_match:
+        if markets and not include_pre_match:
             markets = self.filter_in_play_markets(markets)
+
+        # Prioritize in-play markets (rn1 pattern: heavy in-play focus)
+        # Sort by: in-play score (higher = better), then by volume
+        if markets:
+            markets.sort(key=lambda m: (-self.get_in_play_score(m), -m.volume))
 
         # Limit to max concurrent markets
         max_markets = self.config.trading.max_concurrent_markets
         if len(markets) > max_markets:
-            # Sort by volume and take top N
-            markets.sort(key=lambda m: m.volume, reverse=True)
             markets = markets[:max_markets]
-            logger.info(f"Limited to top {max_markets} markets by volume")
+            logger.info(f"Limited to top {max_markets} markets (in-play prioritized)")
 
-        # Cache results
-        self._cached_markets = markets
-        self._last_refresh = datetime.now(timezone.utc)
+        # Update caches
+        if markets:
+            self._cached_markets = markets
+            self._last_refresh = datetime.now(timezone.utc)
 
-        logger.info(f"Discovered {len(markets)} target markets for arbitrage scanning")
+            # Update fallback cache (only if we got fresh data)
+            if self._consecutive_gamma_failures == 0:
+                self._fallback_cache = markets.copy()
+                self._fallback_cache_time = datetime.now(timezone.utc)
+
+        # Log in-play breakdown
+        in_play_count = sum(1 for m in markets if self.estimate_in_play(m))
+        logger.info(f"Discovered {len(markets)} markets ({in_play_count} in-play, {len(markets) - in_play_count} pre-match)")
+
         return markets
 
     def get_cached_markets(self) -> List[Market]:

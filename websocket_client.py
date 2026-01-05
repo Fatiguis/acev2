@@ -748,6 +748,34 @@ class HybridOrderbookManager:
         """Shutdown websocket connection."""
         await self._ws_client.disconnect()
 
+    async def reconnect(self) -> bool:
+        """
+        Attempt to reconnect WebSocket.
+
+        Returns:
+            True if reconnection successful.
+        """
+        try:
+            # Disconnect first if needed
+            if self._ws_client._connection:
+                await self._ws_client.disconnect()
+
+            # Small delay before reconnecting
+            await asyncio.sleep(1)
+
+            # Reconnect
+            success = await self._ws_client.connect()
+            if success:
+                logger.info("WebSocket reconnected successfully")
+                return True
+            else:
+                logger.warning("WebSocket reconnection failed")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error during WebSocket reconnection: {e}")
+            return False
+
     async def subscribe_markets(self, markets: List[Market]):
         """Subscribe to markets for WS updates."""
         if self._ws_client.is_connected:

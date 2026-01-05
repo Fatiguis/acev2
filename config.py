@@ -42,21 +42,39 @@ class TradingConfig:
 
     # Minimum market volume in USD to consider for trading
     # Lowered for in-play focus - live games often have lower volume than politics
-    min_volume_usd: float = 15_000
+    min_volume_usd: float = 10_000  # Lowered from 15k to catch more in-play opps
 
     # Minimum orderbook depth in USD at best price level
     # Lowered to catch more opportunities with smaller depths
-    min_depth_usd: float = 150
+    min_depth_usd: float = 100  # Lowered from 150 for tighter markets
 
     # Maximum position size per trade as percentage of total capital
-    # Raised to 10% for more aggressive sizing (still bounded by depth)
-    max_size_per_trade_percent: float = 10.0
+    # rn1 pattern: small frequent trades (~$27 avg)
+    # Start conservative, scale with proven performance
+    max_size_per_trade_percent: float = 5.0  # Reduced from 10%
+
+    # rn1-style sizing: absolute cap on trade size
+    # rn1 averaged $27/trade, max was ~$100-200
+    # Start with cap, scale up as capital grows
+    max_trade_size_usd: float = field(
+        default_factory=lambda: float(os.getenv("MAX_TRADE_SIZE_USD", "50"))
+    )
+
+    # Minimum trade size (gas must be covered)
+    min_trade_size_usd: float = 10.0
+
+    # Capital scaling: increase max_trade_size as capital grows
+    # Formula: max_size = base_max * (current_capital / starting_capital) ^ scaling_factor
+    # scaling_factor < 1 = conservative (recommended)
+    capital_scaling_factor: float = field(
+        default_factory=lambda: float(os.getenv("CAPITAL_SCALING_FACTOR", "0.5"))
+    )
 
     # Base arbitrage threshold (will be adjusted dynamically with gas)
     # Buy arb: sum(asks) < 1 - dynamic_threshold
     # Sell arb: sum(bids) > 1 + dynamic_threshold
-    # Lowered to 0.25% for tighter edges (like RN1)
-    arb_threshold_base: float = 0.0025  # 0.25% base edge
+    # rn1 captured edges as low as 0.3%, median 0.8%
+    arb_threshold_base: float = 0.002  # 0.2% base edge (tighter than before)
 
     # Buy arb only mode: skip sell arbs that require holding tokens
     # When True, only execute buy arbs (safer, no position requirements)
@@ -178,6 +196,19 @@ class TradingConfig:
     # WebSocket arb verification: verify WS-detected arbs via HTTP before execution
     # Prevents executing on stale WS data (adds ~100ms but increases reliability)
     ws_verify_before_execute: bool = True
+
+    # MANDATORY WebSocket mode: require WS during active hours for competitive edge
+    # If True and WS fails during active hours, bot will pause trading (not shutdown)
+    # This prevents losing to faster competitors when we only have HTTP
+    ws_required_active_hours: bool = field(
+        default_factory=lambda: os.getenv("WS_REQUIRED_ACTIVE_HOURS", "true").lower() == "true"
+    )
+
+    # Grace period (seconds) to wait for WS reconnection before pausing
+    ws_reconnect_grace_period: float = 30.0
+
+    # How often to retry WS connection when paused (seconds)
+    ws_retry_interval: float = 10.0
 
 
 @dataclass
@@ -519,3 +550,94 @@ def calculate_dynamic_threshold(
     gas_drag = total_gas_cost / trade_size_usd
 
     return config.arb_threshold_base + gas_drag
+
+
+def calculate_rn1_style_size(
+    current_capital: float,
+    starting_capital: float,
+    config: TradingConfig,
+    depth_available: float = float('inf')
+) -> float:
+    """
+    Calculate rn1-style position size with capital scaling.
+
+    rn1 pattern:
+    - Started with ~$1k, averaged $27/trade
+    - Scaled up as capital grew (but stayed conservative)
+    - Never went all-in, maintained high trade frequency
+
+    Formula:
+    base_size = min(max_trade_size_usd, capital * max_size_per_trade_percent)
+    scaled_size = base_size * (current_capital / starting_capital) ^ scaling_factor
+
+    Args:
+        current_capital: Current available capital in USD.
+        starting_capital: Initial capital for scaling reference.
+        config: Trading configuration.
+        depth_available: Available orderbook depth in USD.
+
+    Returns:
+        Optimal trade size in USD.
+    """
+    if current_capital <= 0 or starting_capital <= 0:
+        return 0.0
+
+    # Base size from percentage of capital
+    pct_size = current_capital * (config.max_size_per_trade_percent / 100.0)
+
+    # Cap at max_trade_size_usd
+    base_size = min(pct_size, config.max_trade_size_usd)
+
+    # Apply capital scaling
+    # As capital grows, we can increase size (but sub-linearly for safety)
+    capital_ratio = current_capital / starting_capital
+    if capital_ratio > 1.0:
+        # Scale up with growth, but conservatively
+        scaling_mult = capital_ratio ** config.capital_scaling_factor
+        scaled_size = base_size * scaling_mult
+    else:
+        # Don't scale down if capital decreased (maintain same risk)
+        scaled_size = base_size
+
+    # Apply depth constraint (safety multiplier already in depth_validator)
+    final_size = min(scaled_size, depth_available)
+
+    # Enforce minimum
+    if final_size < config.min_trade_size_usd:
+        return 0.0  # Skip trade if too small
+
+    return final_size
+
+
+def get_rn1_target_metrics(capital: float, days: int = 90) -> dict:
+    """
+    Get target metrics based on rn1's historical performance.
+
+    rn1 pattern (Oct 2024 - Jan 2025):
+    - $1k → $2M+ in ~90 days
+    - ~15,000 trades total
+    - Average edge: 0.8%
+    - Daily geo return: ~2.5%
+
+    Args:
+        capital: Starting capital.
+        days: Target number of days.
+
+    Returns:
+        Dict with target metrics.
+    """
+    # rn1's approximate daily geometric return
+    rn1_daily_geo_return = 0.025  # 2.5%
+
+    # Compound for target days
+    target_multiple = (1 + rn1_daily_geo_return) ** days
+
+    return {
+        "rn1_daily_geo_return_pct": rn1_daily_geo_return * 100,
+        "target_multiple": target_multiple,
+        "target_capital": capital * target_multiple,
+        "trades_per_day_target": 167,  # 15k trades / 90 days
+        "avg_trade_size_target": 27.0,  # rn1's average
+        "avg_edge_pct": 0.8,
+        "days": days
+    }

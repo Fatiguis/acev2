@@ -19,7 +19,7 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
-from config import load_config, BotConfig
+from config import load_config, BotConfig, calculate_rn1_style_size, get_rn1_target_metrics
 from logger import setup_logging
 from auth import AuthManager
 from wallet_manager import WalletManager
@@ -275,6 +275,12 @@ class ArbBot:
         self.hybrid_manager: Optional[HybridOrderbookManager] = None
         self._use_websocket = HAS_WEBSOCKET and config.trading.use_websocket
 
+        # WebSocket mandatory mode tracking
+        self._ws_required = config.trading.ws_required_active_hours
+        self._ws_disconnected_time: Optional[datetime] = None
+        self._ws_paused_for_reconnect = False
+        self._ws_reconnect_attempts = 0
+
         # Circuit breaker for rate limiting and error protection
         self._circuit_breaker_open = False
         self._circuit_breaker_failures = 0
@@ -300,6 +306,9 @@ class ArbBot:
         self._opportunities_found = 0
         self._trades_executed = 0
 
+        # rn1-style sizing tracking
+        self._current_capital = config.starting_capital_usd
+
     def _is_active_hours(self) -> bool:
         """Check if current time is within active trading hours."""
         now = datetime.now(timezone.utc)
@@ -319,10 +328,118 @@ class ArbBot:
         else:
             return self.config.trading.claim_poll_interval_inactive
 
+    def _check_ws_status(self) -> bool:
+        """
+        Check WebSocket status and handle mandatory WS mode.
+
+        Returns:
+            True if trading is allowed, False if paused for WS reconnect.
+        """
+        if not self._ws_required or not self._is_active_hours():
+            # WS not required or outside active hours
+            self._ws_paused_for_reconnect = False
+            return True
+
+        # Check if WS is connected
+        ws_connected = (
+            self.hybrid_manager is not None and
+            self.hybrid_manager.ws_client is not None and
+            self.hybrid_manager.ws_client.is_connected
+        )
+
+        if ws_connected:
+            # WS is up, reset tracking
+            if self._ws_paused_for_reconnect:
+                logger.info("WebSocket reconnected, resuming trading")
+            self._ws_disconnected_time = None
+            self._ws_paused_for_reconnect = False
+            self._ws_reconnect_attempts = 0
+            return True
+
+        # WS is disconnected during active hours with mandatory mode
+        now = datetime.now(timezone.utc)
+
+        if self._ws_disconnected_time is None:
+            self._ws_disconnected_time = now
+            logger.warning(
+                f"WebSocket disconnected during active hours. "
+                f"Grace period: {self.config.trading.ws_reconnect_grace_period}s"
+            )
+
+        # Check grace period
+        disconnect_duration = (now - self._ws_disconnected_time).total_seconds()
+        grace_period = self.config.trading.ws_reconnect_grace_period
+
+        if disconnect_duration < grace_period:
+            # Within grace period, try to reconnect but continue trading
+            return True
+
+        # Past grace period, pause trading and attempt reconnect
+        if not self._ws_paused_for_reconnect:
+            logger.warning(
+                f"WebSocket offline for {disconnect_duration:.0f}s during active hours. "
+                f"PAUSING TRADING until WS reconnects (mandatory mode enabled)"
+            )
+            self._ws_paused_for_reconnect = True
+
+        return False
+
+    async def _attempt_ws_reconnect(self) -> bool:
+        """
+        Attempt to reconnect WebSocket.
+
+        Returns:
+            True if reconnected successfully.
+        """
+        self._ws_reconnect_attempts += 1
+        logger.info(f"WebSocket reconnect attempt #{self._ws_reconnect_attempts}...")
+
+        try:
+            if self.hybrid_manager:
+                # Try to reconnect existing manager
+                success = await self.hybrid_manager.reconnect()
+                if success:
+                    logger.info("WebSocket reconnected successfully!")
+                    # Re-subscribe to markets
+                    if self._target_markets:
+                        await self.hybrid_manager.subscribe_markets(self._target_markets)
+                    return True
+            else:
+                # Initialize fresh
+                await self._init_websocket()
+                if self._use_websocket and self.hybrid_manager:
+                    return True
+
+        except Exception as e:
+            logger.warning(f"WebSocket reconnect failed: {e}")
+
+        return False
+
+    def _get_rn1_style_trade_size(self, depth_available: float) -> float:
+        """
+        Get rn1-style trade size with capital scaling.
+
+        Args:
+            depth_available: Available orderbook depth in USD.
+
+        Returns:
+            Optimal trade size in USD.
+        """
+        return calculate_rn1_style_size(
+            current_capital=self._current_capital,
+            starting_capital=self.config.starting_capital_usd,
+            config=self.config.trading,
+            depth_available=depth_available
+        )
+
+    def _update_capital_tracking(self, profit_usd: float):
+        """Update tracked capital after a trade."""
+        self._current_capital += profit_usd
+
     async def initialize(self):
         """Initialize all modules and connections."""
         logger.info("=" * 60)
-        logger.info("POLYMARKET MICROSTRUCTURE ARBITRAGE BOT v2.0")
+        logger.info("POLYMARKET MICROSTRUCTURE ARBITRAGE BOT v2.1")
         logger.info("=" * 60)
         logger.info(f"Mode: {'DRY RUN' if self.config.dry_run else 'LIVE TRADING'}")
         logger.info(f"Starting capital: ${self.config.starting_capital_usd:,.2f}")
@@ -332,6 +449,31 @@ class ArbBot:
         logger.info(f"Gas buffer: ${self.config.trading.gas_buffer_usd:.3f}/tx")
         logger.info(f"Max concurrent markets: {self.config.trading.max_concurrent_markets}")
         logger.info(f"Active hours (UTC): {self.config.trading.active_hours_start:02d}:00 - {self.config.trading.active_hours_end:02d}:00")
+
+        # rn1-style sizing info
+        logger.info("-" * 60)
+        logger.info("RN1-STYLE SIZING CONFIG")
+        logger.info(f"Max trade size: ${self.config.trading.max_trade_size_usd:.0f}")
+        logger.info(f"Max % per trade: {self.config.trading.max_size_per_trade_percent:.1f}%")
+        logger.info(f"Capital scaling factor: {self.config.trading.capital_scaling_factor}")
+        logger.info(f"Min trade size: ${self.config.trading.min_trade_size_usd:.0f}")
+
+        # Show rn1 target metrics
+        rn1_targets = get_rn1_target_metrics(self.config.starting_capital_usd, days=90)
+        logger.info("-" * 60)
+        logger.info("RN1 BENCHMARK TARGETS (90 days)")
+        logger.info(f"Target daily geo return: {rn1_targets['rn1_daily_geo_return_pct']:.1f}%")
+        logger.info(f"Target capital (90d): ${rn1_targets['target_capital']:,.0f}")
+        logger.info(f"Target trades/day: {rn1_targets['trades_per_day_target']}")
+        logger.info(f"Target avg edge: {rn1_targets['avg_edge_pct']:.1f}%")
+
+        # WebSocket mandatory mode
+        if self._ws_required:
+            logger.info("-" * 60)
+            logger.info("WEBSOCKET MANDATORY MODE: ENABLED")
+            logger.info(f"  Grace period: {self.config.trading.ws_reconnect_grace_period}s")
+            logger.info(f"  Trading will PAUSE if WS down during active hours")
+
         logger.info("=" * 60)
 
         # Initialize authentication
@@ -849,12 +991,31 @@ class ArbBot:
 
         This achieves <100ms detection latency while maintaining reliability
         through HTTP verification before execution.
+
+        Includes mandatory WS mode: pauses trading if WS disconnects during active hours.
         """
         logger.info("Starting HYBRID polling loop (WS detection + HTTP verify)")
+        last_ws_retry = datetime.now(timezone.utc)
 
         while self._running and not self._shutdown_event.is_set():
             try:
                 loop_start = datetime.now(timezone.utc)
+                now = loop_start
+
+                # Check WebSocket status (mandatory mode)
+                ws_ok = self._check_ws_status()
+
+                if not ws_ok:
+                    # WS required but disconnected - attempt reconnect periodically
+                    if (now - last_ws_retry).total_seconds() >= self.config.trading.ws_retry_interval:
+                        reconnected = await self._attempt_ws_reconnect()
+                        last_ws_retry = now
+                        if reconnected:
+                            continue  # Resume normal operation
+
+                    # Still disconnected, wait and retry
+                    await asyncio.sleep(1)
+                    continue
 
                 # Check if markets need refresh
                 if self.market_discovery.needs_refresh():
@@ -873,18 +1034,30 @@ class ArbBot:
                     if self.config.trading.ws_verify_before_execute:
                         verified_opp = await self.hybrid_manager.verify_arb_http(ws_opp)
                         if verified_opp:
+                            # Apply rn1-style sizing
+                            depth_available = min(
+                                ol.size for ol in verified_opp.orderbooks[0].asks[:1]
+                            ) if verified_opp.orderbooks and verified_opp.orderbooks[0].asks else 100
+                            rn1_size = self._get_rn1_style_trade_size(depth_available)
+                            if rn1_size > 0:
+                                verified_opp.trade_size_usd = min(verified_opp.trade_size_usd, rn1_size)
+
                             logger.info(
-                                f"[WS→HTTP] Arb verified! Edge: {verified_opp.profit_margin*100:.2f}%"
+                                f"[WS→HTTP] Arb verified! Edge: {verified_opp.profit_margin*100:.2f}%, "
+                                f"Size: ${verified_opp.trade_size_usd:.0f}"
                             )
-                            await self.process_opportunity(verified_opp)
+                            result = await self.process_opportunity(verified_opp)
+                            if result and result.success:
+                                self._update_capital_tracking(result.realized_profit_usd)
                         else:
                             logger.debug("[WS→HTTP] Arb gone (edge decayed or taken)")
                     else:
                         # Execute directly on WS signal (faster but riskier)
-                        await self.process_opportunity(ws_opp)
+                        result = await self.process_opportunity(ws_opp)
+                        if result and result.success:
+                            self._update_capital_tracking(result.realized_profit_usd)
 
                 # Also do periodic HTTP poll as backup (every 2s)
-                now = datetime.now(timezone.utc)
                 http_poll_interval = 2.0  # Reduced frequency since WS handles detection
 
                 if (now - loop_start).total_seconds() >= http_poll_interval:
@@ -893,7 +1066,9 @@ class ArbBot:
                         if not self._running:
                             break
                         self.hybrid_manager._http_arbs += 1
-                        await self.process_opportunity(opp)
+                        result = await self.process_opportunity(opp)
+                        if result and result.success:
+                            self._update_capital_tracking(result.realized_profit_usd)
 
                 # Periodic claim check
                 claim_interval = self._get_claim_interval()
