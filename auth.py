@@ -75,7 +75,7 @@ def _retry_rpc_sync(
 
     raise last_exception
 
-# Minimal ERC20 ABI for balance check
+# ERC20 ABI for balance check and approvals
 ERC20_ABI = json.loads('''
 [
     {
@@ -91,9 +91,36 @@ ERC20_ABI = json.loads('''
         "name": "decimals",
         "outputs": [{"name": "", "type": "uint8"}],
         "type": "function"
+    },
+    {
+        "constant": true,
+        "inputs": [
+            {"name": "_owner", "type": "address"},
+            {"name": "_spender", "type": "address"}
+        ],
+        "name": "allowance",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function"
+    },
+    {
+        "constant": false,
+        "inputs": [
+            {"name": "_spender", "type": "address"},
+            {"name": "_value", "type": "uint256"}
+        ],
+        "name": "approve",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function"
     }
 ]
 ''')
+
+# Unlimited approval amount (max uint256)
+UNLIMITED_APPROVAL = 2**256 - 1
+
+# Minimum allowance threshold before re-approving (in raw units)
+# For USDC (6 decimals): 100,000 USDC = 100_000 * 1e6
+MIN_ALLOWANCE_USDC = 100_000 * 10**6
 
 
 class AuthManager:
@@ -239,51 +266,194 @@ class AuthManager:
 
     def _ensure_eoa_approvals(self, client: ClobClient):
         """
-        Ensure EOA wallet has necessary token approvals for trading.
+        Ensure EOA wallet has UNLIMITED token approvals for trading.
 
         EOA wallets (signature_type=0) require:
-        1. USDC approval for the exchange
-        2. ConditionalTokens approval (for neg_risk markets)
+        1. USDC approval for the CTF Exchange (spending collateral)
+        2. ConditionalTokens approval for the CTF Exchange (trading positions)
 
-        Without these, post_order() fails silently or with obscure errors.
+        Without these, post_order() fails with "not enough balance / allowance" (400 error).
+        This is py-clob-client GitHub issue #109.
+
+        Uses UNLIMITED approval (max uint256) to avoid repeated approval txs.
 
         Args:
             client: The authenticated CLOB client.
         """
-        logger.info("EOA wallet detected - checking/setting token approvals...")
+        logger.info("EOA wallet detected - checking/setting UNLIMITED token approvals...")
+
+        # Initialize Web3 for approval transactions
+        self._init_web3()
+        if self._web3 is None or not self._web3.is_connected():
+            logger.error("Cannot set approvals - Web3 not connected")
+            return
+
+        # Get exchange address (spender for approvals)
+        try:
+            exchange_address = client.get_exchange_address()
+            exchange_address = Web3.to_checksum_address(exchange_address)
+            logger.info(f"Exchange address: {exchange_address}")
+        except Exception as e:
+            logger.error(f"Failed to get exchange address: {e}")
+            return
+
+        # Get conditional tokens address
+        try:
+            conditional_address = client.get_conditional_address()
+            conditional_address = Web3.to_checksum_address(conditional_address)
+            logger.info(f"ConditionalTokens address: {conditional_address}")
+        except Exception as e:
+            logger.error(f"Failed to get conditional tokens address: {e}")
+            conditional_address = None
+
+        wallet_address = Web3.to_checksum_address(self._wallet_address)
+        private_key = self.config.wallet.private_key
+
+        # 1. Check and set USDC approval
+        usdc_address = Web3.to_checksum_address(self.config.network.usdc_address)
+        usdc_contract = self._web3.eth.contract(address=usdc_address, abi=ERC20_ABI)
 
         try:
-            # Approve USDC spending (required for all trades)
-            logger.info("Approving USDC spending...")
-            usdc_result = client.approve_usdc()
-            if usdc_result:
-                logger.info(f"USDC approval: {usdc_result}")
-            else:
-                logger.info("USDC approval submitted")
-        except Exception as e:
-            # Some errors are expected if already approved
-            error_str = str(e).lower()
-            if "already approved" in error_str or "allowance" in error_str:
-                logger.info("USDC already approved")
-            else:
-                logger.warning(f"USDC approval warning: {e}")
+            current_allowance = usdc_contract.functions.allowance(
+                wallet_address, exchange_address
+            ).call()
 
-        try:
-            # Approve ConditionalTokens (required for neg_risk markets)
-            logger.info("Approving ConditionalTokens...")
-            ct_result = client.approve_conditional_tokens()
-            if ct_result:
-                logger.info(f"ConditionalTokens approval: {ct_result}")
+            logger.info(f"Current USDC allowance: {current_allowance / 1e6:,.2f} USDC")
+
+            if current_allowance < MIN_ALLOWANCE_USDC:
+                logger.info("USDC allowance insufficient - setting UNLIMITED approval...")
+                self._send_approval_tx(
+                    usdc_contract, exchange_address, UNLIMITED_APPROVAL,
+                    wallet_address, private_key, "USDC"
+                )
             else:
-                logger.info("ConditionalTokens approval submitted")
+                logger.info("USDC allowance sufficient")
+
         except Exception as e:
-            error_str = str(e).lower()
-            if "already approved" in error_str or "allowance" in error_str:
-                logger.info("ConditionalTokens already approved")
-            else:
-                logger.warning(f"ConditionalTokens approval warning: {e}")
+            logger.error(f"USDC approval check/set failed: {e}")
+
+        # 2. Check and set ConditionalTokens approval (ERC1155 - uses setApprovalForAll)
+        if conditional_address:
+            try:
+                # ConditionalTokens is ERC1155, needs setApprovalForAll
+                ct_abi = json.loads('''[
+                    {
+                        "constant": true,
+                        "inputs": [
+                            {"name": "account", "type": "address"},
+                            {"name": "operator", "type": "address"}
+                        ],
+                        "name": "isApprovedForAll",
+                        "outputs": [{"name": "", "type": "bool"}],
+                        "type": "function"
+                    },
+                    {
+                        "constant": false,
+                        "inputs": [
+                            {"name": "operator", "type": "address"},
+                            {"name": "approved", "type": "bool"}
+                        ],
+                        "name": "setApprovalForAll",
+                        "outputs": [],
+                        "type": "function"
+                    }
+                ]''')
+
+                ct_contract = self._web3.eth.contract(address=conditional_address, abi=ct_abi)
+
+                is_approved = ct_contract.functions.isApprovedForAll(
+                    wallet_address, exchange_address
+                ).call()
+
+                if not is_approved:
+                    logger.info("ConditionalTokens not approved - setting approval...")
+                    self._send_ct_approval_tx(
+                        ct_contract, exchange_address, wallet_address, private_key
+                    )
+                else:
+                    logger.info("ConditionalTokens already approved for exchange")
+
+            except Exception as e:
+                logger.error(f"ConditionalTokens approval check/set failed: {e}")
 
         logger.info("EOA token approvals check complete")
+
+    def _send_approval_tx(
+        self,
+        contract,
+        spender: str,
+        amount: int,
+        wallet_address: str,
+        private_key: str,
+        token_name: str
+    ):
+        """Send an ERC20 approve transaction."""
+        try:
+            # Build transaction
+            nonce = self._web3.eth.get_transaction_count(wallet_address, 'pending')
+            gas_price = self._web3.eth.gas_price
+
+            tx = contract.functions.approve(spender, amount).build_transaction({
+                'from': wallet_address,
+                'nonce': nonce,
+                'gas': 100000,
+                'gasPrice': gas_price,
+                'chainId': self.config.network.chain_id
+            })
+
+            # Sign and send
+            account = Account.from_key(private_key)
+            signed_tx = account.sign_transaction(tx)
+            tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+            logger.info(f"{token_name} approval tx sent: {tx_hash.hex()}")
+
+            # Wait for confirmation
+            receipt = self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+            if receipt.status == 1:
+                logger.info(f"{token_name} UNLIMITED approval confirmed!")
+            else:
+                logger.error(f"{token_name} approval tx failed")
+
+        except Exception as e:
+            logger.error(f"Failed to send {token_name} approval tx: {e}")
+
+    def _send_ct_approval_tx(
+        self,
+        contract,
+        operator: str,
+        wallet_address: str,
+        private_key: str
+    ):
+        """Send an ERC1155 setApprovalForAll transaction."""
+        try:
+            nonce = self._web3.eth.get_transaction_count(wallet_address, 'pending')
+            gas_price = self._web3.eth.gas_price
+
+            tx = contract.functions.setApprovalForAll(operator, True).build_transaction({
+                'from': wallet_address,
+                'nonce': nonce,
+                'gas': 100000,
+                'gasPrice': gas_price,
+                'chainId': self.config.network.chain_id
+            })
+
+            account = Account.from_key(private_key)
+            signed_tx = account.sign_transaction(tx)
+            tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+            logger.info(f"ConditionalTokens approval tx sent: {tx_hash.hex()}")
+
+            receipt = self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+            if receipt.status == 1:
+                logger.info("ConditionalTokens approval confirmed!")
+            else:
+                logger.error("ConditionalTokens approval tx failed")
+
+        except Exception as e:
+            logger.error(f"Failed to send ConditionalTokens approval tx: {e}")
 
     def _verify_api_creds(self, client: ClobClient) -> bool:
         """
@@ -567,3 +737,88 @@ class AuthManager:
             "usdc_balance": usdc_balance,
             "matic_balance": matic_balance
         }
+
+    def check_usdc_allowance(self, client: ClobClient, min_required: float = 100.0) -> Tuple[bool, float]:
+        """
+        Check current USDC allowance against exchange.
+
+        This can be called before trading to detect approval issues early,
+        rather than getting 400 "not enough balance / allowance" errors.
+
+        Args:
+            client: CLOB client to get exchange address.
+            min_required: Minimum required allowance in USD.
+
+        Returns:
+            Tuple of (has_sufficient, current_allowance_usd).
+        """
+        if self.config.dry_run:
+            return True, float('inf')
+
+        if self.config.wallet.signature_type != 0:
+            # Proxy wallets don't need manual approvals
+            return True, float('inf')
+
+        try:
+            self._init_web3()
+            if self._web3 is None or not self._web3.is_connected():
+                logger.warning("Cannot check allowance - Web3 not connected")
+                return True, 0.0  # Optimistic - let trade attempt
+
+            # Get exchange address
+            exchange_address = client.get_exchange_address()
+            exchange_address = Web3.to_checksum_address(exchange_address)
+
+            # Get USDC allowance
+            wallet_address = Web3.to_checksum_address(self._wallet_address)
+            usdc_address = Web3.to_checksum_address(self.config.network.usdc_address)
+            usdc_contract = self._web3.eth.contract(address=usdc_address, abi=ERC20_ABI)
+
+            allowance_raw = usdc_contract.functions.allowance(
+                wallet_address, exchange_address
+            ).call()
+
+            allowance_usd = allowance_raw / 1e6  # USDC has 6 decimals
+
+            if allowance_usd < min_required:
+                logger.warning(
+                    f"USDC allowance LOW: ${allowance_usd:,.2f} < required ${min_required:,.2f}. "
+                    f"Consider re-approving to avoid 400 errors."
+                )
+                return False, allowance_usd
+
+            return True, allowance_usd
+
+        except Exception as e:
+            logger.error(f"Error checking USDC allowance: {e}")
+            return True, 0.0  # Optimistic - let trade attempt
+
+    def ensure_sufficient_allowance(self, client: ClobClient, required_usd: float = 10000.0) -> bool:
+        """
+        Ensure USDC allowance is sufficient, re-approve if needed.
+
+        Args:
+            client: CLOB client to get exchange address.
+            required_usd: Required allowance in USD (will approve unlimited if below).
+
+        Returns:
+            True if allowance is now sufficient.
+        """
+        has_sufficient, current = self.check_usdc_allowance(client, required_usd)
+
+        if has_sufficient:
+            return True
+
+        logger.info(f"USDC allowance ${current:,.2f} below required ${required_usd:,.2f}, re-approving...")
+
+        # Re-run approval
+        self._ensure_eoa_approvals(client)
+
+        # Re-check
+        has_sufficient, new_allowance = self.check_usdc_allowance(client, required_usd)
+        if has_sufficient:
+            logger.info(f"USDC allowance restored: ${new_allowance:,.2f}")
+        else:
+            logger.error(f"USDC allowance still insufficient after re-approval: ${new_allowance:,.2f}")
+
+        return has_sufficient

@@ -1066,73 +1066,82 @@ class ArbBot:
                     edge_pct = ws_opp.profit_margin * 100
                     base_threshold_pct = self.config.trading.arb_threshold_base * 100
 
-                    # AGGRESSIVE WS FAST PATH (per Round 2 audit):
+                    # Calculate depth available from orderbooks
+                    depth_available = 0
+                    if ws_opp.orderbooks and ws_opp.orderbooks.books:
+                        for ob in ws_opp.orderbooks.books.values():
+                            if ob.asks:
+                                depth_available += sum(lvl.size for lvl in ob.asks[:3])
+                            if ob.bids:
+                                depth_available += sum(lvl.size for lvl in ob.bids[:3])
+                        depth_available = depth_available / 2  # Average of both sides
+
+                    # Calculate WS freshness (ms since detection)
+                    ws_freshness_ms = (datetime.now(timezone.utc) - ws_opp.detected_at).total_seconds() * 1000
+
+                    # AGGRESSIVE WS FAST PATH (per Round 3 audit):
                     # - WS latency: <100ms (fast)
-                    # - HTTP verification: 800ms+ (too slow, arb gone)
+                    # - HTTP verification: 800ms+ (too slow, arb gone by then)
                     # - rn1 pattern: Small, fast trades ($27 avg)
                     #
-                    # Fast-path conditions (execute immediately on WS):
-                    # 1. Edge >= base threshold (any signal meeting arb criteria)
-                    # 2. Size <= $50 (small trades - rn1 pattern)
+                    # Fast-path conditions (execute IMMEDIATELY on WS):
+                    # 1. Edge >= 1.2x threshold AND depth > 2x size AND freshness < 200ms
+                    # 2. Size <= $50 (small trades - rn1 pattern) - always fast
                     # 3. Strong signal (edge >= 1.5x threshold) regardless of size
                     #
-                    # Only verify via HTTP for large sizes ($200+) with weak signals
-                    strong_signal_threshold = base_threshold_pct * 1.5
-                    is_strong_signal = edge_pct >= strong_signal_threshold
-                    is_small_size = ws_opp.trade_size_usd <= 50  # Tightened for rn1 pattern ($27 avg)
-                    is_medium_size = ws_opp.trade_size_usd <= 200  # Medium trades also fast-path
+                    # NEVER verify via HTTP - it kills the edge (800ms delay)
+                    strong_edge_threshold = base_threshold_pct * 1.2  # 1.2x per audit
+                    very_strong_threshold = base_threshold_pct * 1.5  # 1.5x for any size
+                    is_very_strong = edge_pct >= very_strong_threshold
+                    is_strong_with_depth = (
+                        edge_pct >= strong_edge_threshold and
+                        depth_available > ws_opp.trade_size_usd * 2 and
+                        ws_freshness_ms < 200
+                    )
+                    is_small_size = ws_opp.trade_size_usd <= 50  # rn1 pattern ($27 avg)
+                    is_medium_size = ws_opp.trade_size_usd <= 200
                     meets_base_threshold = edge_pct >= base_threshold_pct
+                    is_fresh = ws_freshness_ms < 500  # <500ms is fresh enough
 
                     # Fast path: execute immediately on WS signal
-                    # This covers ~95% of rn1-style trades
+                    # Per audit: NEVER use HTTP verification - kills edge
                     use_fast_path = (
-                        is_strong_signal or  # Strong edge: always fast
+                        is_very_strong or  # Very strong edge: always fast
+                        is_strong_with_depth or  # 1.2x + depth + fresh: fast
                         is_small_size or  # Small size: always fast (rn1 pattern)
-                        (is_medium_size and meets_base_threshold)  # Medium + valid edge: fast
+                        (is_medium_size and meets_base_threshold and is_fresh)  # Medium + valid + fresh
                     )
 
                     if use_fast_path:
                         # Execute immediately on WS signal (fast path)
+                        path_reason = 'very_strong' if is_very_strong else \
+                                     'strong+depth' if is_strong_with_depth else \
+                                     'small' if is_small_size else 'medium+fresh'
                         logger.info(
-                            f"[WS FAST] Executing: {edge_pct:.2f}% edge, ${ws_opp.trade_size_usd:.0f} "
-                            f"({'strong' if is_strong_signal else 'small' if is_small_size else 'medium'})"
+                            f"[WS FAST] Executing: {edge_pct:.2f}% edge, ${ws_opp.trade_size_usd:.0f}, "
+                            f"depth=${depth_available:.0f}, fresh={ws_freshness_ms:.0f}ms ({path_reason})"
                         )
                         # Apply rn1-style sizing
-                        depth_available = 100  # Conservative estimate for fast path
-                        rn1_size = self._get_rn1_style_trade_size(depth_available)
+                        rn1_size = self._get_rn1_style_trade_size(max(depth_available, 50))
                         if rn1_size > 0:
                             ws_opp.trade_size_usd = min(ws_opp.trade_size_usd, rn1_size)
 
                         result = await self.process_opportunity(ws_opp)
                         if result and result.success:
                             self._update_capital_tracking(result.realized_profit_usd)
-                    elif self.config.trading.ws_verify_before_execute:
-                        # Only for large sizes ($200+) with weak signals: verify via HTTP
-                        logger.debug(
-                            f"[WS] Large/weak signal: {edge_pct:.2f}% edge, "
-                            f"${ws_opp.trade_size_usd:.0f} - verifying via HTTP..."
-                        )
-                        verified_opp = await self.hybrid_manager.verify_arb_http(ws_opp)
-                        if verified_opp:
-                            # Apply rn1-style sizing
-                            depth_available = min(
-                                ol.size for ol in verified_opp.orderbooks[0].asks[:1]
-                            ) if verified_opp.orderbooks and verified_opp.orderbooks[0].asks else 100
-                            rn1_size = self._get_rn1_style_trade_size(depth_available)
-                            if rn1_size > 0:
-                                verified_opp.trade_size_usd = min(verified_opp.trade_size_usd, rn1_size)
-
-                            logger.info(
-                                f"[WS->HTTP] Verified! Edge: {verified_opp.profit_margin*100:.2f}%, "
-                                f"Size: ${verified_opp.trade_size_usd:.0f}"
-                            )
-                            result = await self.process_opportunity(verified_opp)
-                            if result and result.success:
-                                self._update_capital_tracking(result.realized_profit_usd)
-                        else:
-                            logger.debug("[WS->HTTP] Arb gone (edge decayed)")
                     else:
-                        # ws_verify_before_execute=False: execute all directly
+                        # Large size, weak signal, stale data - skip or execute with caution
+                        # Per audit: HTTP verification loses 90%+ of arbs, so just execute
+                        # but log the risk factors
+                        logger.info(
+                            f"[WS RISK] Executing with caution: {edge_pct:.2f}% edge, "
+                            f"${ws_opp.trade_size_usd:.0f}, depth=${depth_available:.0f}, "
+                            f"fresh={ws_freshness_ms:.0f}ms"
+                        )
+                        # Reduce size for risky trades
+                        cautious_size = min(ws_opp.trade_size_usd, 30)  # Cap at $30 for risky
+                        ws_opp.trade_size_usd = cautious_size
+
                         result = await self.process_opportunity(ws_opp)
                         if result and result.success:
                             self._update_capital_tracking(result.realized_profit_usd)
@@ -1247,7 +1256,19 @@ class ArbBot:
         logger.info(f"Big arb alerts: {self._big_arb_alerts_sent} | Active hours: {self._is_active_hours()}")
         # New enhanced stats
         logger.info(f"Drawdown: {exec_stats.get('drawdown_pct', 0):.2f}% | Circuit breaker: {'ACTIVE' if exec_stats.get('circuit_breaker_active') else 'OK'}")
-        logger.info(f"IOC mode: {exec_stats.get('ioc_mode', False)} | Idempotency tracked: {exec_stats.get('idempotency_tracked', 0)}")
+        logger.info(f"FAK mode: {exec_stats.get('fak_mode', False)} | Idempotency tracked: {exec_stats.get('idempotency_tracked', 0)}")
+
+        # Periodic allowance check (for EOA wallets) - detect approval issues early
+        if not self.config.dry_run and self.config.wallet.signature_type == 0:
+            client = self.execution_engine._client
+            if client:
+                has_allowance, allowance_usd = self.auth_manager.check_usdc_allowance(
+                    client, min_required=self._current_capital * 2
+                )
+                if not has_allowance:
+                    logger.warning(f"USDC allowance LOW: ${allowance_usd:,.2f} - may cause 400 errors!")
+                else:
+                    logger.info(f"USDC allowance OK: ${allowance_usd:,.2f}")
 
         # WebSocket stats if enabled
         if self._use_websocket and self.hybrid_manager:

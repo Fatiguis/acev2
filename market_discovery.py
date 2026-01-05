@@ -452,9 +452,11 @@ class MarketDiscovery:
         """
         Estimate if a market is currently in-play using multiple signals.
 
-        Priority order:
-        1. Explicit in-play markers (tags, enableOrderBook status)
-        2. Time-based heuristics (start_date <= now < estimated_end)
+        Enhanced detection per Round 3 audit:
+        1. neg_risk markets (winner-take-all) are more likely in-play tradeable
+        2. Time-based heuristics (start_date <= now < end_date + buffer)
+        3. Active + volume + bid/ask spread present
+        4. Spread tightness (in-play sports have tight spreads due to liquidity)
 
         Uses game_durations from SportsConfig for sport-specific timing.
 
@@ -470,33 +472,52 @@ class MarketDiscovery:
         if not market.is_active or market.is_closed:
             return False
 
-        # Check time-based heuristics
+        from datetime import timedelta
+
+        # Priority 1: neg_risk markets with active trading
+        # Winner-take-all markets (neg_risk=True) are typically live sports
+        # and are the primary target for rn1-style trading
+        if market.neg_risk and market.is_active:
+            # neg_risk + active + has quotes = likely in-play
+            if market.best_bid is not None and market.best_ask is not None:
+                # Tight spread suggests active in-play market
+                spread = market.best_ask - market.best_bid
+                if spread < 0.10:  # Less than 10 cents spread
+                    return True
+
+        # Priority 2: Time-based heuristics with start/end dates
         if market.start_date:
             if market.start_date > now:
                 return False  # Event hasn't started
 
             # Get estimated duration from config or use sport detection
             estimated_duration_minutes = self._get_sport_duration(market)
-
-            from datetime import timedelta
             estimated_end = market.start_date + timedelta(minutes=estimated_duration_minutes)
 
+            # Check if within game window
             if now < estimated_end:
                 return True
 
-            # If past estimated end, check if market is still active
-            # (overtime, extra time, delays, etc.)
+            # Past estimated end - check extended window for overtime/delays
             if market.is_active and not market.is_closed:
-                # If market still active past estimated end, likely still in-play
-                # Add 60-minute buffer for overtime/delays
                 extended_end = estimated_end + timedelta(minutes=60)
                 if now < extended_end:
                     return True
 
-        # If no start_date, check if market has recent activity
-        # Active market with volume suggests it's tradeable
-        if market.is_active and market.volume > 0 and market.best_ask is not None:
-            return True
+        # Priority 3: End date check (if available)
+        if market.end_date:
+            # If end_date is in future and start_date is in past (or not set)
+            if market.end_date > now:
+                if market.start_date is None or market.start_date <= now:
+                    # Within the event window
+                    return True
+
+        # Priority 4: Active market with trading activity
+        # If no timing info, use activity signals
+        if market.is_active and market.volume > 0:
+            # Has both bid and ask = active market maker presence
+            if market.best_ask is not None and market.best_bid is not None:
+                return True
 
         return False
 
@@ -506,6 +527,11 @@ class MarketDiscovery:
 
         Higher scores = more confident the market is actively in-play.
         Used for sorting/prioritizing markets.
+
+        Enhanced scoring per Round 3 audit:
+        - neg_risk markets get significant boost (rn1 focus)
+        - Tight spreads indicate active in-play
+        - Time-into-game affects score
 
         Args:
             market: Market to score.
@@ -520,6 +546,21 @@ class MarketDiscovery:
 
         now = datetime.now(timezone.utc)
 
+        # SIGNIFICANT boost for neg_risk markets (rn1 primary target)
+        # Winner-take-all markets are key for sports arb
+        if market.neg_risk:
+            score += 0.15  # Raised from 0.05
+
+        # Boost for tight spreads (indicates active in-play trading)
+        if market.best_bid is not None and market.best_ask is not None:
+            spread = market.best_ask - market.best_bid
+            if spread < 0.03:  # Very tight (<3 cents)
+                score += 0.15
+            elif spread < 0.05:  # Tight (<5 cents)
+                score += 0.10
+            elif spread < 0.10:  # Moderate (<10 cents)
+                score += 0.05
+
         # Boost score based on time into game
         if market.start_date:
             minutes_into_game = (now - market.start_date).total_seconds() / 60
@@ -528,18 +569,16 @@ class MarketDiscovery:
             # Peak score in middle of game (most volatility)
             game_progress = minutes_into_game / duration
             if 0.2 <= game_progress <= 0.8:
-                score += 0.3  # In the meat of the game
+                score += 0.2  # In the meat of the game
             elif 0.8 < game_progress <= 1.0:
-                score += 0.2  # Late game (still good for arbs)
+                score += 0.15  # Late game (still good for arbs)
+            elif 0 < game_progress < 0.2:
+                score += 0.1  # Early game
 
         # Boost for high volume (more liquidity = better arb execution)
         if market.volume >= 50000:
             score += 0.1
         elif market.volume >= 20000:
-            score += 0.05
-
-        # Boost for neg_risk markets (easier to trade)
-        if market.neg_risk:
             score += 0.05
 
         return min(1.0, score)
