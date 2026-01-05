@@ -1,0 +1,927 @@
+"""
+Main Loop Orchestrator.
+Coordinates all modules for the Polymarket arbitrage bot.
+"""
+
+import asyncio
+import signal
+import sys
+import csv
+import os
+import math
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List, Dict, Any
+import logging
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
+from config import load_config, BotConfig
+from logger import setup_logging
+from auth import AuthManager
+from wallet_manager import WalletManager
+from market_discovery import MarketDiscovery, Market
+from orderbook import OrderbookPoller, ArbOpportunity, ArbType
+from execution import ExecutionEngine, ExecutionResult
+from positions import PositionMonitor, ProfitLocker
+from risk import RiskManager, DepthValidator, TradeRecord
+
+logger = logging.getLogger(__name__)
+
+
+class MetricsExporter:
+    """Exports session metrics to CSV for analysis."""
+
+    def __init__(self, output_dir: str = "metrics"):
+        """
+        Initialize the metrics exporter.
+
+        Args:
+            output_dir: Directory to write CSV files.
+        """
+        self.output_dir = output_dir
+        self._session_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        self._trade_records: List[Dict[str, Any]] = []
+        self._hourly_snapshots: List[Dict[str, Any]] = []
+
+        # Daily geometric return tracking
+        self._daily_returns: List[float] = []  # List of (1 + return%) multipliers
+        self._session_start = datetime.now(timezone.utc)
+        self._last_daily_reset = self._session_start.date()
+        self._daily_profit_usd = 0.0
+        self._starting_capital = 0.0
+
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+
+    def set_starting_capital(self, capital: float):
+        """Set starting capital for return calculations."""
+        self._starting_capital = capital
+
+    def record_trade(self, trade_data: Dict[str, Any]):
+        """Record a trade for later export."""
+        trade_data["timestamp"] = datetime.now(timezone.utc).isoformat()
+        trade_data["session_id"] = self._session_id
+        self._trade_records.append(trade_data)
+
+        # Track daily profit for geometric return
+        profit = trade_data.get("profit_usd", 0)
+        self._daily_profit_usd += profit
+
+        # Check for day rollover
+        today = datetime.now(timezone.utc).date()
+        if today != self._last_daily_reset:
+            self._finalize_daily_return()
+            self._last_daily_reset = today
+            self._daily_profit_usd = profit  # Start new day with this trade
+
+    def _finalize_daily_return(self):
+        """Finalize and record daily return when day changes."""
+        if self._starting_capital > 0:
+            daily_return_pct = self._daily_profit_usd / self._starting_capital
+            # Store as multiplier (1 + return)
+            self._daily_returns.append(1.0 + daily_return_pct)
+
+    def get_geometric_return(self) -> Dict[str, float]:
+        """
+        Calculate geometric mean return across days.
+
+        Returns:
+            Dict with geo_mean_daily_pct, compounded_return_pct, trading_days.
+        """
+        # Include current partial day
+        all_returns = self._daily_returns.copy()
+        if self._starting_capital > 0 and self._daily_profit_usd != 0:
+            current_day_return = 1.0 + (self._daily_profit_usd / self._starting_capital)
+            all_returns.append(current_day_return)
+
+        if not all_returns:
+            return {
+                "geo_mean_daily_pct": 0.0,
+                "compounded_return_pct": 0.0,
+                "trading_days": 0
+            }
+
+        # Geometric mean = (product of all returns)^(1/n)
+        product = 1.0
+        for r in all_returns:
+            product *= r
+
+        n = len(all_returns)
+        geo_mean = product ** (1.0 / n) if n > 0 else 1.0
+
+        # Compounded return = product - 1
+        compounded = product - 1.0
+
+        return {
+            "geo_mean_daily_pct": (geo_mean - 1.0) * 100,
+            "compounded_return_pct": compounded * 100,
+            "trading_days": n
+        }
+
+    def get_daily_avg_profit(self) -> float:
+        """Get average daily profit in USD."""
+        if not self._trade_records:
+            return 0.0
+
+        total_profit = sum(t.get("profit_usd", 0) for t in self._trade_records)
+        days = max(1, (datetime.now(timezone.utc) - self._session_start).days + 1)
+        return total_profit / days
+
+    def record_hourly_snapshot(self, stats: Dict[str, Any]):
+        """Record an hourly stats snapshot."""
+        stats["timestamp"] = datetime.now(timezone.utc).isoformat()
+        stats["session_id"] = self._session_id
+        self._hourly_snapshots.append(stats)
+
+    def export_trades_csv(self) -> str:
+        """
+        Export all trades to CSV.
+
+        Returns:
+            Path to the exported CSV file.
+        """
+        if not self._trade_records:
+            logger.info("No trades to export")
+            return ""
+
+        filepath = os.path.join(self.output_dir, f"trades_{self._session_id}.csv")
+
+        # Get all unique keys across all records
+        all_keys = set()
+        for record in self._trade_records:
+            all_keys.update(record.keys())
+        fieldnames = sorted(all_keys)
+
+        with open(filepath, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self._trade_records)
+
+        logger.info(f"Exported {len(self._trade_records)} trades to {filepath}")
+        return filepath
+
+    def export_session_summary(self, stats: Dict[str, Any]) -> str:
+        """
+        Export session summary to CSV.
+
+        Args:
+            stats: Final session statistics.
+
+        Returns:
+            Path to the exported CSV file.
+        """
+        filepath = os.path.join(self.output_dir, f"session_{self._session_id}.csv")
+
+        stats["session_id"] = self._session_id
+        stats["export_timestamp"] = datetime.now(timezone.utc).isoformat()
+
+        fieldnames = sorted(stats.keys())
+
+        with open(filepath, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow(stats)
+
+        logger.info(f"Exported session summary to {filepath}")
+        return filepath
+
+    def export_hourly_snapshots(self) -> str:
+        """
+        Export hourly snapshots to CSV.
+
+        Returns:
+            Path to the exported CSV file.
+        """
+        if not self._hourly_snapshots:
+            logger.info("No hourly snapshots to export")
+            return ""
+
+        filepath = os.path.join(self.output_dir, f"hourly_{self._session_id}.csv")
+
+        all_keys = set()
+        for record in self._hourly_snapshots:
+            all_keys.update(record.keys())
+        fieldnames = sorted(all_keys)
+
+        with open(filepath, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self._hourly_snapshots)
+
+        logger.info(f"Exported {len(self._hourly_snapshots)} hourly snapshots to {filepath}")
+        return filepath
+
+    def export_all(self, final_stats: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Export all metrics to CSV files.
+
+        Args:
+            final_stats: Final session statistics.
+
+        Returns:
+            Dict of export type to filepath.
+        """
+        return {
+            "trades": self.export_trades_csv(),
+            "session": self.export_session_summary(final_stats),
+            "hourly": self.export_hourly_snapshots()
+        }
+
+
+class ArbBot:
+    """Main arbitrage bot orchestrator."""
+
+    def __init__(self, config: BotConfig):
+        """
+        Initialize the arbitrage bot.
+
+        Args:
+            config: Bot configuration.
+        """
+        self.config = config
+        self._running = False
+        self._shutdown_event = asyncio.Event()
+
+        # Initialize modules
+        self.auth_manager = AuthManager(config)
+        self.wallet_manager = WalletManager(config)  # Multi-wallet support
+        self.market_discovery = MarketDiscovery(config)
+        self.orderbook_poller = OrderbookPoller(config)
+        self.execution_engine = ExecutionEngine(config)
+        self.position_monitor = PositionMonitor(config)
+        self.profit_locker = ProfitLocker(config)
+        self.risk_manager = RiskManager(config)
+        self.depth_validator = DepthValidator(config)
+        self.metrics_exporter = MetricsExporter()
+        self.metrics_exporter.set_starting_capital(config.starting_capital_usd)
+
+        # State
+        self._target_markets: List[Market] = []
+        self._last_market_refresh: Optional[datetime] = None
+
+        # Big arb notification tracking
+        self._big_arb_alerts_sent = 0
+
+        # Stats
+        self._start_time: Optional[datetime] = None
+        self._poll_count = 0
+        self._opportunities_found = 0
+        self._trades_executed = 0
+
+    def _is_active_hours(self) -> bool:
+        """Check if current time is within active trading hours."""
+        now = datetime.now(timezone.utc)
+        hour = now.hour
+        start = self.config.trading.active_hours_start
+        end = self.config.trading.active_hours_end
+
+        if start <= end:
+            return start <= hour < end
+        else:  # Wraps around midnight
+            return hour >= start or hour < end
+
+    def _get_claim_interval(self) -> float:
+        """Get the claim polling interval based on active hours."""
+        if self._is_active_hours():
+            return self.config.trading.claim_poll_interval_active
+        else:
+            return self.config.trading.claim_poll_interval_inactive
+
+    async def initialize(self):
+        """Initialize all modules and connections."""
+        logger.info("=" * 60)
+        logger.info("POLYMARKET MICROSTRUCTURE ARBITRAGE BOT v2.0")
+        logger.info("=" * 60)
+        logger.info(f"Mode: {'DRY RUN' if self.config.dry_run else 'LIVE TRADING'}")
+        logger.info(f"Starting capital: ${self.config.starting_capital_usd:,.2f}")
+        logger.info(f"Min volume filter: ${self.config.trading.min_volume_usd:,.0f}")
+        logger.info(f"Min depth: ${self.config.trading.min_depth_usd:,.0f}")
+        logger.info(f"Base arb threshold: {self.config.trading.arb_threshold_base * 100:.2f}%")
+        logger.info(f"Gas buffer: ${self.config.trading.gas_buffer_usd:.3f}/tx")
+        logger.info(f"Max concurrent markets: {self.config.trading.max_concurrent_markets}")
+        logger.info(f"Active hours (UTC): {self.config.trading.active_hours_start:02d}:00 - {self.config.trading.active_hours_end:02d}:00")
+        logger.info("=" * 60)
+
+        # Initialize authentication
+        if not self.config.dry_run:
+            try:
+                # Check if multi-wallet mode is available
+                wallet_count = self.config.wallet.wallet_count
+                use_multi_wallet = wallet_count > 1
+
+                if use_multi_wallet:
+                    # Multi-wallet mode: use WalletManager for rotation
+                    logger.info(f"Initializing multi-wallet mode with {wallet_count} wallets...")
+                    initialized = await self.wallet_manager.initialize()
+                    if initialized > 0:
+                        self.execution_engine.set_wallet_manager(self.wallet_manager)
+                        # Set primary client for compatibility
+                        primary = self.wallet_manager.get_primary_wallet()
+                        if primary and primary.client:
+                            self.execution_engine.set_client(primary.client)
+                        logger.info(f"Multi-wallet mode active: {initialized} wallet(s) ready")
+                    else:
+                        raise RuntimeError("No wallets initialized in multi-wallet mode")
+                else:
+                    # Single wallet mode: use AuthManager
+                    client = self.auth_manager.initialize()
+                    self.execution_engine.set_client(client)
+
+                # Set wallet info for approval transactions (primary wallet)
+                wallet_address = self.auth_manager.get_wallet_address()
+                private_key = self.config.wallet.private_key
+                funder_address = self.config.wallet.funder_address  # For proxy mode
+                if wallet_address and private_key:
+                    self.execution_engine.set_wallet(wallet_address, private_key, funder_address)
+
+                self.position_monitor.initialize()
+                logger.info("Authentication successful")
+
+                # Verify MATIC balance for gas (FATAL if insufficient for EOA wallets)
+                gas_ok, gas_msg = self.auth_manager.verify_gas_balance()
+                if gas_ok:
+                    logger.info(gas_msg)
+                else:
+                    logger.error("=" * 60)
+                    logger.error("FATAL: INSUFFICIENT MATIC FOR GAS")
+                    logger.error("=" * 60)
+                    logger.error(gas_msg)
+                    logger.error("=" * 60)
+                    raise RuntimeError(f"Insufficient MATIC for gas: {gas_msg}")
+
+                # Verify USDC balance (aggregate for multi-wallet)
+                if use_multi_wallet:
+                    total_balance = self.wallet_manager.get_total_available_balance()
+                    logger.info(f"Total USDC across all wallets: ${total_balance:,.2f}")
+                else:
+                    balance_ok, balance_msg = self.auth_manager.verify_sufficient_balance()
+                    if balance_ok:
+                        logger.info(balance_msg)
+                    else:
+                        logger.warning(balance_msg)
+
+                # Verify trading readiness (balance + allowance)
+                ready, ready_msg = await self.execution_engine.verify_trading_ready()
+                if ready:
+                    logger.info(ready_msg)
+                else:
+                    logger.warning(ready_msg)
+
+            except Exception as e:
+                logger.error(f"Authentication failed: {e}")
+                raise
+        else:
+            # Initialize read-only client for dry run
+            try:
+                self.auth_manager.initialize()
+                logger.info("Read-only client initialized for dry run")
+            except Exception as e:
+                logger.warning(f"Could not initialize read-only client: {e}")
+
+        self._start_time = datetime.now(timezone.utc)
+        logger.info("Bot initialized successfully")
+
+    async def shutdown(self):
+        """Graceful shutdown of all modules."""
+        logger.info("Shutting down...")
+        self._running = False
+        self._shutdown_event.set()
+
+        # Close async resources
+        await self.market_discovery.close()
+        await self.orderbook_poller.close()
+        await self.position_monitor.close()
+
+        # Print final stats
+        self._print_stats()
+        logger.info("Shutdown complete")
+
+    async def refresh_markets(self):
+        """Refresh the list of target markets."""
+        logger.info("Refreshing target markets...")
+        try:
+            self._target_markets = await self.market_discovery.discover_target_markets(
+                include_pre_match=True  # Include both in-play and pre-match
+            )
+            self._last_market_refresh = datetime.now(timezone.utc)
+            logger.info(f"Found {len(self._target_markets)} target markets")
+
+            # Log top markets by volume
+            if self._target_markets:
+                top_markets = sorted(self._target_markets, key=lambda m: m.volume, reverse=True)[:5]
+                logger.info("Top 5 markets by volume:")
+                for m in top_markets:
+                    logger.info(f"  - ${m.volume:,.0f}: {m.question[:60]}...")
+
+        except Exception as e:
+            logger.error(f"Failed to refresh markets: {e}")
+
+    async def poll_and_detect(self) -> List[ArbOpportunity]:
+        """
+        Poll orderbooks and detect arbitrage opportunities.
+
+        Returns:
+            List of detected opportunities.
+        """
+        if not self._target_markets:
+            return []
+
+        opportunities = await self.orderbook_poller.poll_markets_for_arbs(self._target_markets)
+        self._poll_count += 1
+        self._opportunities_found += len(opportunities)
+
+        return opportunities
+
+    async def process_opportunity(self, opportunity: ArbOpportunity) -> Optional[ExecutionResult]:
+        """
+        Process and potentially execute an arbitrage opportunity.
+
+        Uses burst parallel execution for deep arbs during burst mode.
+
+        Args:
+            opportunity: The opportunity to process.
+
+        Returns:
+            ExecutionResult if executed, None otherwise.
+        """
+        # Validate depth
+        depth_valid, depth_reason = self.depth_validator.validate_opportunity(opportunity)
+        if not depth_valid:
+            logger.debug(f"Depth validation failed: {depth_reason}")
+            return None
+
+        # Check risk limits
+        trade_allowed, risk_reason = self.risk_manager.check_trade_allowed(opportunity)
+        if not trade_allowed:
+            logger.debug(f"Risk check failed: {risk_reason}")
+            return None
+
+        # Calculate optimal position size
+        safe_size = self.depth_validator.get_safe_trade_size(opportunity)
+        if safe_size < 10:  # Minimum $10 trade
+            logger.debug(f"Trade size too small: ${safe_size:.2f}")
+            return None
+
+        # Update opportunity with safe size
+        opportunity.trade_size_usd = min(safe_size, opportunity.trade_size_usd)
+
+        # Check if market is in burst mode for parallel execution
+        is_burst = self.orderbook_poller.is_burst_market(opportunity.market.condition_id)
+
+        # Execute the trade (use burst parallel for deep arbs during burst mode)
+        logger.info(f"Executing opportunity: {opportunity}")
+        result = await self.execution_engine.execute_burst_parallel(opportunity, is_burst_mode=is_burst)
+
+        if result.success:
+            self._trades_executed += 1
+
+            # Record the trade for risk tracking
+            trade_record = TradeRecord(
+                timestamp=datetime.now(timezone.utc),
+                arb_type=opportunity.arb_type,
+                trade_size_usd=result.total_cost_usd,
+                profit_usd=result.realized_profit_usd,
+                market_id=opportunity.market.market_id,
+                is_complete=result.is_complete,
+                was_partial=result.has_partial_fill,
+                was_hedged=result.was_hedged
+            )
+            self.risk_manager.record_trade(trade_record)
+
+            # Record for CSV export
+            self.metrics_exporter.record_trade({
+                "market_id": opportunity.market.market_id,
+                "market_question": opportunity.market.question[:100],
+                "arb_type": opportunity.arb_type.value,
+                "trade_size_usd": result.total_cost_usd,
+                "profit_usd": result.realized_profit_usd,
+                "profit_margin_pct": opportunity.profit_margin * 100,
+                "is_complete": result.is_complete,
+                "was_partial": result.has_partial_fill,
+                "was_hedged": result.was_hedged,
+                "num_outcomes": len(opportunity.market.outcomes)
+            })
+
+            # Check for big arb alert
+            self._check_big_arb_alert(opportunity, result)
+
+            # Verify book normalized post-execution
+            await self._verify_post_execution_book(opportunity)
+
+        return result
+
+    def _check_big_arb_alert(self, opportunity: ArbOpportunity, result: ExecutionResult):
+        """
+        Check if arb qualifies for big arb alert notification.
+
+        Triggers on:
+        - Edge >1.2% (big_arb_alert_threshold)
+        - Profit >0.5% of daily avg (big_arb_profit_threshold_pct)
+        """
+        edge_threshold = self.config.trading.big_arb_alert_threshold
+        profit_threshold_pct = self.config.trading.big_arb_profit_threshold_pct
+
+        is_big_edge = opportunity.profit_margin >= edge_threshold
+        daily_avg = self.metrics_exporter.get_daily_avg_profit()
+        is_big_profit = daily_avg > 0 and result.realized_profit_usd >= (daily_avg * profit_threshold_pct)
+
+        if is_big_edge or is_big_profit:
+            self._send_big_arb_alert(opportunity, result, is_big_edge, is_big_profit)
+
+    def _send_big_arb_alert(
+        self,
+        opportunity: ArbOpportunity,
+        result: ExecutionResult,
+        is_big_edge: bool,
+        is_big_profit: bool
+    ):
+        """Send big arb alert via log and optional webhook."""
+        reason = []
+        if is_big_edge:
+            reason.append(f"edge {opportunity.profit_margin*100:.2f}%")
+        if is_big_profit:
+            reason.append(f"profit ${result.realized_profit_usd:.4f}")
+
+        alert_msg = (
+            f"BIG ARB ALERT | {' + '.join(reason)} | "
+            f"{opportunity.arb_type.value} | "
+            f"${result.total_cost_usd:.2f} size | "
+            f"{opportunity.market.question[:50]}..."
+        )
+
+        logger.warning("=" * 60)
+        logger.warning(alert_msg)
+        logger.warning("=" * 60)
+
+        self._big_arb_alerts_sent += 1
+
+        # Send webhook if configured
+        webhook_url = self.config.trading.big_arb_webhook_url
+        if webhook_url and HAS_REQUESTS:
+            self._send_webhook_notification(webhook_url, opportunity, result)
+
+    def _send_webhook_notification(
+        self,
+        webhook_url: str,
+        opportunity: ArbOpportunity,
+        result: ExecutionResult
+    ):
+        """Send notification to Discord/Telegram webhook."""
+        try:
+            geo_stats = self.metrics_exporter.get_geometric_return()
+
+            # Format for Discord/Telegram
+            payload = {
+                "content": (
+                    f"**BIG ARB ALERT**\n"
+                    f"Edge: {opportunity.profit_margin*100:.2f}%\n"
+                    f"Profit: ${result.realized_profit_usd:.4f}\n"
+                    f"Size: ${result.total_cost_usd:.2f}\n"
+                    f"Market: {opportunity.market.question[:80]}\n"
+                    f"Daily Geo Return: {geo_stats['geo_mean_daily_pct']:.3f}%"
+                )
+            }
+
+            # Discord uses "content", Telegram uses "text"
+            if "telegram" in webhook_url.lower():
+                payload = {"text": payload["content"]}
+
+            response = requests.post(webhook_url, json=payload, timeout=5)
+            if response.status_code in (200, 204):
+                logger.debug("Webhook notification sent")
+            else:
+                logger.debug(f"Webhook returned {response.status_code}")
+
+        except Exception as e:
+            logger.debug(f"Webhook notification failed: {e}")
+
+    async def _verify_post_execution_book(self, opportunity: ArbOpportunity):
+        """
+        Verify orderbook normalized after successful arb execution.
+
+        Refreshes the book once and logs if sum normalized (confirms edge captured).
+        Helps detect slippage or stale data issues.
+        """
+        try:
+            # Refresh orderbook for this market
+            token_ids = [o.token_id for o in opportunity.market.outcomes]
+            books = await self.orderbook_poller.fetch_orderbooks_batch(token_ids)
+
+            if not books:
+                return
+
+            # Calculate new sum
+            if opportunity.arb_type == ArbType.BUY_ARB:
+                # Sum of best asks
+                total = sum(
+                    books.get(tid, {}).get("best_ask", 0.5)
+                    for tid in token_ids
+                )
+                normalized = abs(total - 1.0) < 0.005  # Within 0.5% of 1.0
+            else:
+                # Sum of best bids
+                total = sum(
+                    books.get(tid, {}).get("best_bid", 0.5)
+                    for tid in token_ids
+                )
+                normalized = abs(total - 1.0) < 0.005
+
+            if normalized:
+                logger.debug(
+                    f"Post-exec verify: book normalized (sum={total:.4f}), edge captured"
+                )
+            else:
+                logger.info(
+                    f"Post-exec verify: book still imbalanced (sum={total:.4f}), "
+                    f"possible slippage or continued opportunity"
+                )
+
+        except Exception as e:
+            logger.debug(f"Post-exec verify failed: {e}")
+
+    async def check_and_claim_winnings(self):
+        """Check for and claim any resolved market winnings."""
+        try:
+            claims = await self.position_monitor.auto_claim_all()
+            if claims > 0:
+                logger.info(f"Auto-claimed {claims} winning positions")
+        except Exception as e:
+            logger.error(f"Error checking claims: {e}")
+
+    def _get_dynamic_poll_interval(self) -> float:
+        """
+        Get dynamic poll interval based on burst market count.
+
+        Global burst ramp: auto-drop to 0.6s if >20 burst markets during active hours.
+        This captures more opportunities during high-activity periods.
+
+        Returns:
+            Poll interval in seconds.
+        """
+        base_interval = self.config.trading.poll_interval_seconds
+
+        # Only ramp during active hours
+        if not self._is_active_hours():
+            return base_interval
+
+        # Get current burst market count
+        ob_stats = self.orderbook_poller.get_stats()
+        burst_count = ob_stats.get("burst_markets", 0)
+
+        # Global burst ramp: >20 burst markets = 0.6s poll
+        burst_ramp_threshold = 20
+        burst_ramp_interval = 0.6
+
+        if burst_count > burst_ramp_threshold:
+            if base_interval > burst_ramp_interval:
+                logger.debug(
+                    f"Global burst ramp: {burst_count} burst markets, "
+                    f"poll interval {base_interval}s -> {burst_ramp_interval}s"
+                )
+            return burst_ramp_interval
+
+        return base_interval
+
+    async def run_polling_loop(self):
+        """Main polling loop for orderbook scanning."""
+        last_claim_check = datetime.now(timezone.utc)
+        last_hourly_stats = datetime.now(timezone.utc)
+
+        while self._running and not self._shutdown_event.is_set():
+            try:
+                loop_start = datetime.now(timezone.utc)
+
+                # Check if markets need refresh
+                if self.market_discovery.needs_refresh():
+                    await self.refresh_markets()
+
+                # Poll for opportunities
+                opportunities = await self.poll_and_detect()
+
+                # Process each opportunity
+                for opp in opportunities:
+                    if not self._running:
+                        break
+                    await self.process_opportunity(opp)
+
+                # Periodic claim check (interval based on active hours)
+                now = datetime.now(timezone.utc)
+                claim_interval = self._get_claim_interval()
+                if (now - last_claim_check).total_seconds() >= claim_interval:
+                    await self.check_and_claim_winnings()
+                    last_claim_check = now
+
+                # Hourly stats logging
+                if (now - last_hourly_stats).total_seconds() >= 3600:
+                    self._log_hourly_stats()
+                    last_hourly_stats = now
+
+                # Calculate time to next poll (dynamic based on burst activity)
+                poll_interval = self._get_dynamic_poll_interval()
+                elapsed = (datetime.now(timezone.utc) - loop_start).total_seconds()
+                sleep_time = max(0, poll_interval - elapsed)
+
+                if sleep_time > 0:
+                    try:
+                        await asyncio.wait_for(
+                            self._shutdown_event.wait(),
+                            timeout=sleep_time
+                        )
+                    except asyncio.TimeoutError:
+                        pass  # Normal timeout, continue loop
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in polling loop: {e}")
+                await asyncio.sleep(1)  # Brief pause on error
+
+    def _log_hourly_stats(self):
+        """Log hourly statistics and record snapshot for CSV export."""
+        risk_stats = self.risk_manager.get_stats()
+        exec_stats = self.execution_engine.get_stats()
+        ob_stats = self.orderbook_poller.get_stats()
+        geo_stats = self.metrics_exporter.get_geometric_return()
+
+        logger.info("-" * 40)
+        logger.info("HOURLY STATS")
+        logger.info(f"Polls: {self._poll_count} | Opps: {self._opportunities_found} | Trades: {self._trades_executed}")
+        logger.info(f"Capital: ${risk_stats['current_capital_usd']:,.2f} | Return: {risk_stats['total_return_pct']:.2f}%")
+        logger.info(f"Profit: ${exec_stats['total_profit_usd']:.4f} | Partials: {exec_stats['partial_fills']}")
+        logger.info(f"Geo daily: {geo_stats['geo_mean_daily_pct']:.3f}% | Compounded: {geo_stats['compounded_return_pct']:.3f}%")
+        logger.info(f"Stale skipped: {ob_stats['stale_books_skipped']} | Slippage rejected: {ob_stats['slippage_rejected']}")
+        logger.info(f"Burst markets: {ob_stats['burst_markets']} | Poll interval: {self._get_dynamic_poll_interval():.1f}s")
+        logger.info(f"Big arb alerts: {self._big_arb_alerts_sent} | Active hours: {self._is_active_hours()}")
+        logger.info("-" * 40)
+
+        # Record hourly snapshot for CSV export
+        self.metrics_exporter.record_hourly_snapshot({
+            "poll_count": self._poll_count,
+            "opportunities_found": self._opportunities_found,
+            "trades_executed": self._trades_executed,
+            "current_capital_usd": risk_stats['current_capital_usd'],
+            "total_return_pct": risk_stats['total_return_pct'],
+            "total_profit_usd": exec_stats['total_profit_usd'],
+            "partial_fills": exec_stats['partial_fills'],
+            "stale_skipped": ob_stats['stale_books_skipped'],
+            "slippage_rejected": ob_stats['slippage_rejected'],
+            "burst_markets": ob_stats['burst_markets'],
+            "poll_interval_seconds": self._get_dynamic_poll_interval(),
+            "is_active_hours": self._is_active_hours(),
+            "win_rate_pct": risk_stats['win_rate_pct'],
+            "max_drawdown_pct": risk_stats['max_drawdown_pct'],
+            "geo_mean_daily_pct": geo_stats['geo_mean_daily_pct'],
+            "compounded_return_pct": geo_stats['compounded_return_pct'],
+            "big_arb_alerts": self._big_arb_alerts_sent
+        })
+
+    async def run(self):
+        """Main entry point to run the bot."""
+        self._running = True
+
+        try:
+            await self.initialize()
+            await self.refresh_markets()
+
+            logger.info("Starting polling loop...")
+            logger.info(f"Poll interval: {self.config.trading.poll_interval_seconds}s")
+
+            await self.run_polling_loop()
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+        except Exception as e:
+            logger.error(f"Fatal error: {e}")
+            raise
+        finally:
+            await self.shutdown()
+
+    def _print_stats(self):
+        """Print final statistics."""
+        if not self._start_time:
+            return
+
+        runtime = (datetime.now(timezone.utc) - self._start_time).total_seconds()
+        hours = runtime / 3600
+
+        logger.info("=" * 60)
+        logger.info("SESSION STATISTICS")
+        logger.info("=" * 60)
+        logger.info(f"Runtime: {runtime/60:.1f} minutes ({hours:.2f} hours)")
+        logger.info(f"Total polls: {self._poll_count}")
+        logger.info(f"Polls per hour: {self._poll_count/hours:.1f}" if hours > 0 else "N/A")
+        logger.info(f"Opportunities found: {self._opportunities_found}")
+        logger.info(f"Trades executed: {self._trades_executed}")
+
+        # Orderbook stats
+        ob_stats = self.orderbook_poller.get_stats()
+        logger.info(f"Arbs detected: {ob_stats['arbs_found']}")
+        logger.info(f"Big arb alerts (>2%): {ob_stats['big_arb_alerts']}")
+        logger.info(f"Stale books skipped: {ob_stats['stale_books_skipped']}")
+        logger.info(f"Slippage rejected: {ob_stats['slippage_rejected']}")
+        logger.info(f"Batch fetches: {ob_stats['batch_fetches']}")
+        logger.info(f"Batch fetch errors: {ob_stats['batch_fetch_errors']}")
+
+        # Execution stats
+        exec_stats = self.execution_engine.get_stats()
+        logger.info(f"Total volume: ${exec_stats['total_volume_usd']:,.2f}")
+        logger.info(f"Total profit: ${exec_stats['total_profit_usd']:.4f}")
+        if exec_stats['execution_count'] > 0:
+            logger.info(f"Avg profit per trade: ${exec_stats['avg_profit_per_trade']:.4f}")
+        logger.info(f"Partial fills: {exec_stats['partial_fills']}")
+        logger.info(f"Hedges executed: {exec_stats['hedges_executed']}")
+        logger.info(f"Approvals executed: {exec_stats['approvals_executed']}")
+
+        # Risk stats
+        risk_stats = self.risk_manager.get_stats()
+        logger.info(f"Initial capital: ${risk_stats['initial_capital_usd']:,.2f}")
+        logger.info(f"Final capital: ${risk_stats['current_capital_usd']:,.2f}")
+        logger.info(f"Peak capital: ${risk_stats['peak_capital_usd']:,.2f}")
+        logger.info(f"Total return: {risk_stats['total_return_pct']:.2f}%")
+        logger.info(f"Win rate: {risk_stats['win_rate_pct']:.1f}%")
+        logger.info(f"Max drawdown: {risk_stats['max_drawdown_pct']:.2f}%")
+        logger.info(f"Geometric mean return: {risk_stats['geometric_mean_return_pct']:.4f}%")
+        logger.info(f"Projected 30-day multiple: {risk_stats['projected_30d_multiple']:.2f}x")
+
+        # Claiming stats
+        claim_stats = self.position_monitor.get_stats()
+        logger.info(f"Positions claimed: {claim_stats['claims_count']}")
+        logger.info(f"Total claimed: ${claim_stats['total_claimed_usd']:.2f}")
+
+        # Geometric return stats
+        geo_stats = self.metrics_exporter.get_geometric_return()
+        logger.info(f"Daily geo mean return: {geo_stats['geo_mean_daily_pct']:.4f}%")
+        logger.info(f"Compounded return: {geo_stats['compounded_return_pct']:.4f}%")
+        logger.info(f"Trading days: {geo_stats['trading_days']}")
+        logger.info(f"Big arb alerts sent: {self._big_arb_alerts_sent}")
+
+        logger.info("=" * 60)
+
+        # Export metrics to CSV
+        logger.info("Exporting metrics to CSV...")
+        final_stats = {
+            "runtime_seconds": runtime,
+            "runtime_hours": hours,
+            "total_polls": self._poll_count,
+            "polls_per_hour": self._poll_count / hours if hours > 0 else 0,
+            "opportunities_found": self._opportunities_found,
+            "trades_executed": self._trades_executed,
+            "arbs_detected": ob_stats['arbs_found'],
+            "big_arb_alerts": ob_stats['big_arb_alerts'],
+            "stale_books_skipped": ob_stats['stale_books_skipped'],
+            "slippage_rejected": ob_stats['slippage_rejected'],
+            "batch_fetches": ob_stats['batch_fetches'],
+            "batch_fetch_errors": ob_stats['batch_fetch_errors'],
+            "total_volume_usd": exec_stats['total_volume_usd'],
+            "total_profit_usd": exec_stats['total_profit_usd'],
+            "avg_profit_per_trade": exec_stats['avg_profit_per_trade'],
+            "partial_fills": exec_stats['partial_fills'],
+            "hedges_executed": exec_stats['hedges_executed'],
+            "approvals_executed": exec_stats['approvals_executed'],
+            "initial_capital_usd": risk_stats['initial_capital_usd'],
+            "final_capital_usd": risk_stats['current_capital_usd'],
+            "peak_capital_usd": risk_stats['peak_capital_usd'],
+            "total_return_pct": risk_stats['total_return_pct'],
+            "win_rate_pct": risk_stats['win_rate_pct'],
+            "max_drawdown_pct": risk_stats['max_drawdown_pct'],
+            "geometric_mean_return_pct": risk_stats['geometric_mean_return_pct'],
+            "projected_30d_multiple": risk_stats['projected_30d_multiple'],
+            "claims_count": claim_stats['claims_count'],
+            "total_claimed_usd": claim_stats['total_claimed_usd'],
+            "mode": "dry_run" if self.config.dry_run else "live"
+        }
+        exported = self.metrics_exporter.export_all(final_stats)
+        if exported.get("session"):
+            logger.info(f"Metrics exported to: {self.metrics_exporter.output_dir}/")
+
+
+def handle_signal(sig, frame):
+    """Handle shutdown signals."""
+    logger.info(f"Received signal {sig}, initiating shutdown...")
+    # Will be caught by the main loop
+
+
+async def main():
+    """Main entry point."""
+    # Load configuration
+    config = load_config()
+
+    # Setup logging
+    setup_logging(config.logging)
+
+    # Create and run bot
+    bot = ArbBot(config)
+
+    # Setup signal handlers
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    await bot.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

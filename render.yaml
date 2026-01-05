@@ -1,0 +1,33 @@
+services:
+  - type: worker
+    name: ace-arb-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: DRY_RUN
+        sync: false
+      - key: STARTING_CAPITAL
+        sync: false
+      - key: PRIVATE_KEY
+        sync: false
+      - key: FUNDER_ADDRESS
+        sync: false
+      - key: SIGNATURE_TYPE
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: API_SECRET
+        sync: false
+      - key: API_PASSPHRASE
+        sync: false
+      - key: ADDITIONAL_API_CREDS
+        sync: false
+      - key: BIG_ARB_WEBHOOK_URL
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+    autoDeploy: false
+    region: oregon

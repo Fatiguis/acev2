@@ -1,0 +1,541 @@
+"""
+Risk Management Module.
+Handles position sizing, exposure limits, and safety checks.
+"""
+
+import logging
+import math
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Optional, Any
+from collections import deque
+
+from config import BotConfig, calculate_dynamic_threshold
+from orderbook import ArbOpportunity, ArbType
+from positions import Position
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RiskMetrics:
+    """Current risk metrics snapshot."""
+    total_exposure_usd: float = 0.0
+    max_single_position_usd: float = 0.0
+    position_count: int = 0
+    unrealized_pnl_usd: float = 0.0
+    unrealized_drawdown_pct: float = 0.0  # Unrealized loss as % of capital
+    daily_pnl_usd: float = 0.0
+    daily_trades: int = 0
+    consecutive_losses: int = 0
+    win_rate: float = 0.0
+    sharpe_estimate: float = 0.0
+    max_drawdown_pct: float = 0.0
+    capital_at_risk_pct: float = 0.0
+    geometric_mean_return: float = 0.0  # For compounding analysis
+    total_return_pct: float = 0.0
+    force_hedge_triggered: bool = False  # True if unrealized drawdown >5%
+
+
+@dataclass
+class TradeRecord:
+    """Record of a completed trade for risk tracking."""
+    timestamp: datetime
+    arb_type: ArbType
+    trade_size_usd: float
+    profit_usd: float
+    market_id: str
+    is_complete: bool
+    was_partial: bool = False
+    was_hedged: bool = False
+
+    @property
+    def return_pct(self) -> float:
+        """Calculate return percentage."""
+        if self.trade_size_usd > 0:
+            return self.profit_usd / self.trade_size_usd
+        return 0.0
+
+    @property
+    def log_return(self) -> float:
+        """Calculate log return for geometric mean calculation."""
+        r = self.return_pct
+        if r > -1:  # Avoid log of non-positive
+            return math.log(1 + r)
+        return -float('inf')
+
+
+class RiskManager:
+    """Manages risk controls and position sizing."""
+
+    # Unrealized drawdown threshold to trigger force hedge (5%)
+    FORCE_HEDGE_THRESHOLD_PCT = 5.0
+
+    def __init__(self, config: BotConfig):
+        """
+        Initialize the risk manager.
+
+        Args:
+            config: Bot configuration.
+        """
+        self.config = config
+        self._initial_capital = config.starting_capital_usd
+        self._current_capital = config.starting_capital_usd
+        self._peak_capital = config.starting_capital_usd
+        self._trade_history: deque = deque(maxlen=1000)  # Keep last 1000 trades
+        self._daily_trades: List[TradeRecord] = []
+        self._daily_pnl = 0.0
+        self._last_reset_date: Optional[datetime] = None
+        self._consecutive_losses = 0
+        self._consecutive_partials = 0
+        self._is_halted = False
+        self._halt_reason: Optional[str] = None
+        self._log_returns_sum = 0.0  # Sum of log returns for geometric mean
+        self._unrealized_pnl = 0.0  # Current unrealized PnL from open positions
+        self._force_hedge_triggered = False
+
+    def update_capital(self, new_capital: float):
+        """Update current capital."""
+        self._current_capital = new_capital
+        if new_capital > self._peak_capital:
+            self._peak_capital = new_capital
+
+    def record_trade(self, trade: TradeRecord):
+        """Record a completed trade."""
+        self._trade_history.append(trade)
+        self._daily_trades.append(trade)
+        self._daily_pnl += trade.profit_usd
+
+        # Track consecutive losses
+        if trade.profit_usd < 0:
+            self._consecutive_losses += 1
+        else:
+            self._consecutive_losses = 0
+
+        # Track consecutive partials
+        if trade.was_partial:
+            self._consecutive_partials += 1
+        else:
+            self._consecutive_partials = 0
+
+        # Update capital
+        self._current_capital += trade.profit_usd
+
+        # Track log returns for geometric mean calculation
+        if trade.log_return > -float('inf'):
+            self._log_returns_sum += trade.log_return
+
+        # Update peak capital
+        if self._current_capital > self._peak_capital:
+            self._peak_capital = self._current_capital
+
+    def _reset_daily_stats(self):
+        """Reset daily statistics at midnight UTC."""
+        now = datetime.now(timezone.utc)
+        if self._last_reset_date is None or self._last_reset_date.date() != now.date():
+            self._daily_trades = []
+            self._daily_pnl = 0.0
+            self._last_reset_date = now
+            logger.info("Daily stats reset")
+
+    def check_trade_allowed(self, opportunity: ArbOpportunity) -> tuple[bool, str]:
+        """
+        Check if a trade is allowed based on risk parameters.
+
+        Uses dynamic threshold that accounts for gas costs.
+
+        Args:
+            opportunity: The arbitrage opportunity to check.
+
+        Returns:
+            Tuple of (allowed, reason).
+        """
+        self._reset_daily_stats()
+
+        # Check if trading is halted
+        if self._is_halted:
+            return False, f"Trading halted: {self._halt_reason}"
+
+        # Calculate dynamic threshold based on trade size and outcomes
+        num_outcomes = len(opportunity.market.outcomes)
+        dynamic_threshold = calculate_dynamic_threshold(
+            opportunity.trade_size_usd,
+            num_outcomes,
+            self.config.trading
+        )
+
+        # Check minimum profit margin against dynamic threshold
+        if opportunity.profit_margin < dynamic_threshold:
+            return False, (
+                f"Margin {opportunity.profit_margin*100:.3f}% below dynamic threshold "
+                f"{dynamic_threshold*100:.3f}% (gas-adjusted for ${opportunity.trade_size_usd:.2f})"
+            )
+
+        # Check trade size limits
+        max_trade_size = self._current_capital * (self.config.trading.max_size_per_trade_percent / 100)
+        if opportunity.trade_size_usd > max_trade_size:
+            return False, f"Trade size ${opportunity.trade_size_usd:.2f} exceeds max ${max_trade_size:.2f}"
+
+        # Check consecutive losses circuit breaker (halt after 5 consecutive losses)
+        if self._consecutive_losses >= 5:
+            self._is_halted = True
+            self._halt_reason = "5 consecutive losses - manual review required"
+            return False, self._halt_reason
+
+        # Check consecutive partials circuit breaker
+        if self._consecutive_partials >= self.config.trading.max_consecutive_partials:
+            self._is_halted = True
+            self._halt_reason = (
+                f"{self._consecutive_partials} consecutive partial fills - "
+                f"pause for {self.config.trading.partial_pause_duration}s"
+            )
+            return False, self._halt_reason
+
+        # Check daily loss limit (halt if down 3% in a day - more conservative)
+        daily_loss_limit = self._current_capital * 0.03
+        if self._daily_pnl < -daily_loss_limit:
+            self._is_halted = True
+            self._halt_reason = f"Daily loss limit (3%) exceeded: ${self._daily_pnl:.2f}"
+            return False, self._halt_reason
+
+        # Check max drawdown (halt if down 10% from peak)
+        drawdown = (self._peak_capital - self._current_capital) / self._peak_capital if self._peak_capital > 0 else 0
+        if drawdown > 0.10:
+            self._is_halted = True
+            self._halt_reason = f"Max drawdown exceeded: {drawdown*100:.1f}%"
+            return False, self._halt_reason
+
+        # Check minimum capital
+        if self._current_capital < 100:  # Minimum $100 to trade
+            return False, f"Insufficient capital: ${self._current_capital:.2f}"
+
+        return True, "Trade allowed"
+
+    def calculate_position_size(
+        self,
+        opportunity: ArbOpportunity,
+        orderbooks_depth: Dict[str, float]
+    ) -> float:
+        """
+        Calculate optimal position size for an opportunity.
+
+        Uses gas-aware sizing: only trade sizes where expected profit > gas cost.
+
+        Args:
+            opportunity: The arbitrage opportunity.
+            orderbooks_depth: Available depth at best prices by token_id.
+
+        Returns:
+            Recommended position size in USD.
+        """
+        # Start with the minimum available depth across all outcomes
+        min_depth = min(orderbooks_depth.values()) if orderbooks_depth else 0
+
+        # Apply safety multiplier
+        safe_size = min_depth * self.config.trading.depth_safety_multiplier
+
+        # Cap at max percentage of capital
+        max_size = self._current_capital * (self.config.trading.max_size_per_trade_percent / 100)
+        position_size = min(safe_size, max_size)
+
+        # Reduce size based on consecutive losses (risk scaling)
+        if self._consecutive_losses > 0:
+            scale_factor = 1.0 / (1 + self._consecutive_losses * 0.2)
+            position_size *= scale_factor
+            logger.debug(f"Scaled position by {scale_factor:.2f} due to {self._consecutive_losses} consecutive losses")
+
+        # Reduce size based on consecutive partials
+        if self._consecutive_partials > 0:
+            scale_factor = 1.0 / (1 + self._consecutive_partials * 0.3)
+            position_size *= scale_factor
+            logger.debug(f"Scaled position by {scale_factor:.2f} due to {self._consecutive_partials} consecutive partials")
+
+        # Gas-aware minimum sizing
+        # Ensure expected profit > total gas cost
+        num_outcomes = len(opportunity.market.outcomes)
+        total_gas = self.config.trading.gas_buffer_usd * num_outcomes
+        min_profitable_size = total_gas / opportunity.profit_margin if opportunity.profit_margin > 0 else float('inf')
+
+        if position_size < min_profitable_size:
+            logger.debug(
+                f"Position ${position_size:.2f} below gas-profitable minimum ${min_profitable_size:.2f}"
+            )
+            return 0
+
+        # Minimum viable trade size ($10)
+        if position_size < 10:
+            return 0
+
+        return position_size
+
+    def calculate_geometric_mean_return(self) -> float:
+        """
+        Calculate geometric mean return for compounding analysis.
+
+        Returns:
+            Geometric mean return as a decimal.
+        """
+        n = len(self._trade_history)
+        if n == 0:
+            return 0.0
+
+        # Geometric mean = exp(mean of log returns)
+        mean_log_return = self._log_returns_sum / n
+        return math.exp(mean_log_return) - 1
+
+    def calculate_total_return(self) -> float:
+        """
+        Calculate total return since start.
+
+        Returns:
+            Total return as percentage.
+        """
+        if self._initial_capital <= 0:
+            return 0.0
+        return ((self._current_capital - self._initial_capital) / self._initial_capital) * 100
+
+    def estimate_compound_growth(self, trades_per_day: int = 20, days: int = 30) -> float:
+        """
+        Estimate compound growth based on current geometric mean.
+
+        Args:
+            trades_per_day: Expected trades per day.
+            days: Number of days to project.
+
+        Returns:
+            Projected capital multiple.
+        """
+        g = self.calculate_geometric_mean_return()
+        if g <= 0:
+            return 1.0
+
+        total_trades = trades_per_day * days
+        return math.pow(1 + g, total_trades)
+
+    def validate_depth(
+        self,
+        opportunity: ArbOpportunity,
+        min_depth: float
+    ) -> bool:
+        """
+        Validate that orderbook depth is sufficient.
+
+        Args:
+            opportunity: The opportunity to validate.
+            min_depth: Minimum required depth in USD.
+
+        Returns:
+            True if depth is sufficient.
+        """
+        for ob in opportunity.orderbooks.all_orderbooks:
+            if opportunity.arb_type == ArbType.BUY_ARB:
+                depth_usd = ob.best_ask_size * ob.best_ask_price if ob.best_ask else 0
+            else:
+                depth_usd = ob.best_bid_size * ob.best_bid_price if ob.best_bid else 0
+
+            if depth_usd < min_depth:
+                logger.debug(f"Insufficient depth for {ob.outcome_name}: ${depth_usd:.2f} < ${min_depth:.2f}")
+                return False
+
+        return True
+
+    def get_metrics(self) -> RiskMetrics:
+        """Get current risk metrics."""
+        self._reset_daily_stats()
+
+        metrics = RiskMetrics()
+        metrics.daily_pnl_usd = self._daily_pnl
+        metrics.daily_trades = len(self._daily_trades)
+        metrics.consecutive_losses = self._consecutive_losses
+
+        # Calculate win rate
+        if self._trade_history:
+            wins = sum(1 for t in self._trade_history if t.profit_usd > 0)
+            metrics.win_rate = wins / len(self._trade_history)
+
+        # Calculate drawdown
+        if self._peak_capital > 0:
+            metrics.max_drawdown_pct = (self._peak_capital - self._current_capital) / self._peak_capital * 100
+
+        # Capital at risk
+        metrics.capital_at_risk_pct = (
+            sum(t.trade_size_usd for t in self._daily_trades) / self._current_capital * 100
+            if self._current_capital > 0 else 0
+        )
+
+        # Geometric mean return for compounding analysis
+        metrics.geometric_mean_return = self.calculate_geometric_mean_return()
+        metrics.total_return_pct = self.calculate_total_return()
+
+        return metrics
+
+    def update_unrealized_pnl(self, positions: List[Position]) -> None:
+        """
+        Update unrealized PnL from open positions.
+
+        Args:
+            positions: List of current open positions.
+        """
+        self._unrealized_pnl = sum(p.unrealized_pnl_usd for p in positions)
+
+    def check_force_hedge_needed(self, positions: List[Position]) -> tuple[bool, List[Position]]:
+        """
+        Check if unrealized drawdown exceeds threshold and force hedge is needed.
+
+        Triggers when unrealized loss > 5% of current capital.
+
+        Args:
+            positions: List of current open positions.
+
+        Returns:
+            Tuple of (force_hedge_needed, positions_to_hedge).
+        """
+        self.update_unrealized_pnl(positions)
+
+        # Calculate unrealized drawdown as % of capital
+        if self._current_capital <= 0:
+            return False, []
+
+        unrealized_drawdown_pct = abs(min(0, self._unrealized_pnl)) / self._current_capital * 100
+
+        if unrealized_drawdown_pct >= self.FORCE_HEDGE_THRESHOLD_PCT:
+            self._force_hedge_triggered = True
+            logger.warning(
+                f"FORCE HEDGE TRIGGERED: Unrealized drawdown {unrealized_drawdown_pct:.2f}% "
+                f"exceeds threshold {self.FORCE_HEDGE_THRESHOLD_PCT}%. "
+                f"Unrealized PnL: ${self._unrealized_pnl:.2f}"
+            )
+
+            # Return all positions with negative unrealized PnL
+            positions_to_hedge = [p for p in positions if p.unrealized_pnl_usd < 0]
+            return True, positions_to_hedge
+
+        self._force_hedge_triggered = False
+        return False, []
+
+    def get_unrealized_drawdown_pct(self) -> float:
+        """Get current unrealized drawdown as percentage of capital."""
+        if self._current_capital <= 0:
+            return 0.0
+        return abs(min(0, self._unrealized_pnl)) / self._current_capital * 100
+
+    def resume_trading(self):
+        """Resume trading after a halt (manual action)."""
+        self._is_halted = False
+        self._halt_reason = None
+        self._consecutive_losses = 0
+        self._force_hedge_triggered = False
+        logger.info("Trading resumed manually")
+
+    def is_halted(self) -> tuple[bool, Optional[str]]:
+        """Check if trading is halted."""
+        return self._is_halted, self._halt_reason
+
+    def is_force_hedge_active(self) -> bool:
+        """Check if force hedge was triggered."""
+        return self._force_hedge_triggered
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get risk management statistics."""
+        metrics = self.get_metrics()
+        return {
+            "initial_capital_usd": self._initial_capital,
+            "current_capital_usd": self._current_capital,
+            "peak_capital_usd": self._peak_capital,
+            "daily_pnl_usd": metrics.daily_pnl_usd,
+            "daily_trades": metrics.daily_trades,
+            "total_trades": len(self._trade_history),
+            "consecutive_losses": metrics.consecutive_losses,
+            "consecutive_partials": self._consecutive_partials,
+            "win_rate_pct": metrics.win_rate * 100,
+            "max_drawdown_pct": metrics.max_drawdown_pct,
+            "unrealized_pnl_usd": self._unrealized_pnl,
+            "unrealized_drawdown_pct": self.get_unrealized_drawdown_pct(),
+            "force_hedge_triggered": self._force_hedge_triggered,
+            "geometric_mean_return_pct": metrics.geometric_mean_return * 100,
+            "total_return_pct": metrics.total_return_pct,
+            "projected_30d_multiple": self.estimate_compound_growth(20, 30),
+            "is_halted": self._is_halted,
+            "halt_reason": self._halt_reason
+        }
+
+
+class DepthValidator:
+    """Validates orderbook depth to prevent partial fills and rugs."""
+
+    def __init__(self, config: BotConfig):
+        """
+        Initialize the depth validator.
+
+        Args:
+            config: Bot configuration.
+        """
+        self.config = config
+
+    def validate_opportunity(self, opportunity: ArbOpportunity) -> tuple[bool, str]:
+        """
+        Validate that an opportunity has sufficient depth.
+
+        Args:
+            opportunity: The opportunity to validate.
+
+        Returns:
+            Tuple of (valid, reason).
+        """
+        min_depth = self.config.trading.min_depth_usd
+        orderbooks = opportunity.orderbooks
+
+        # Check each outcome has sufficient depth
+        for ob in orderbooks.all_orderbooks:
+            if opportunity.arb_type == ArbType.BUY_ARB:
+                if not ob.best_ask:
+                    return False, f"No ask for {ob.outcome_name}"
+
+                depth_usd = ob.best_ask_size * ob.best_ask_price
+                if depth_usd < min_depth:
+                    return False, f"Insufficient ask depth for {ob.outcome_name}: ${depth_usd:.2f}"
+
+            else:  # SELL_ARB
+                if not ob.best_bid:
+                    return False, f"No bid for {ob.outcome_name}"
+
+                depth_usd = ob.best_bid_size * ob.best_bid_price
+                if depth_usd < min_depth:
+                    return False, f"Insufficient bid depth for {ob.outcome_name}: ${depth_usd:.2f}"
+
+        # Check spread is reasonable (not a stale/manipulated book)
+        for ob in orderbooks.all_orderbooks:
+            if ob.best_bid and ob.best_ask:
+                spread = ob.best_ask_price - ob.best_bid_price
+                if spread > 0.20:  # 20% spread is suspicious
+                    return False, f"Suspicious spread for {ob.outcome_name}: {spread*100:.1f}%"
+
+        return True, "Depth validated"
+
+    def get_safe_trade_size(self, opportunity: ArbOpportunity) -> float:
+        """
+        Calculate the safe trade size based on available depth.
+
+        Args:
+            opportunity: The opportunity.
+
+        Returns:
+            Safe trade size in USD.
+        """
+        min_depth = float('inf')
+
+        for ob in opportunity.orderbooks.all_orderbooks:
+            if opportunity.arb_type == ArbType.BUY_ARB:
+                if ob.best_ask:
+                    depth = ob.best_ask_size * ob.best_ask_price
+                    min_depth = min(min_depth, depth)
+            else:
+                if ob.best_bid:
+                    depth = ob.best_bid_size * ob.best_bid_price
+                    min_depth = min(min_depth, depth)
+
+        if min_depth == float('inf'):
+            return 0
+
+        # Apply safety multiplier
+        return min_depth * self.config.trading.depth_safety_multiplier

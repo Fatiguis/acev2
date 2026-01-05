@@ -1,0 +1,504 @@
+"""
+Setup & Authentication Module.
+Handles wallet initialization, CLOB client setup, and API credential management.
+"""
+
+import logging
+import json
+import time
+from typing import Optional, Tuple, Callable, TypeVar
+from eth_account import Account
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds
+from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
+
+from config import BotConfig
+
+logger = logging.getLogger(__name__)
+
+# Minimum MATIC balance required for gas (in MATIC)
+MIN_MATIC_FOR_GAS = 0.01  # ~$0.005-0.02 worth, enough for several txs
+
+T = TypeVar('T')
+
+
+def _exponential_backoff(attempt: int, base: float = 1.0, max_backoff: float = 30.0) -> float:
+    """Calculate exponential backoff delay."""
+    return min(base * (2 ** attempt), max_backoff)
+
+
+def _retry_rpc_sync(
+    func: Callable[[], T],
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    operation_name: str = "RPC call"
+) -> T:
+    """
+    Retry a synchronous RPC call with exponential backoff.
+
+    Args:
+        func: Sync function to retry.
+        max_retries: Maximum number of retries.
+        base_delay: Base delay in seconds.
+        max_delay: Maximum delay in seconds.
+        operation_name: Name for logging.
+
+    Returns:
+        Result of the function.
+
+    Raises:
+        Exception: If all retries fail.
+    """
+    last_exception = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            return func()
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries:
+                delay = _exponential_backoff(attempt, base_delay, max_delay)
+                logger.warning(
+                    f"{operation_name} failed (attempt {attempt + 1}/{max_retries + 1}): {e}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                time.sleep(delay)
+            else:
+                logger.error(f"{operation_name} failed after {max_retries + 1} attempts: {e}")
+
+    raise last_exception
+
+# Minimal ERC20 ABI for balance check
+ERC20_ABI = json.loads('''
+[
+    {
+        "constant": true,
+        "inputs": [{"name": "_owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "balance", "type": "uint256"}],
+        "type": "function"
+    },
+    {
+        "constant": true,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "type": "function"
+    }
+]
+''')
+
+
+class AuthManager:
+    """Manages authentication and client initialization for Polymarket CLOB."""
+
+    def __init__(self, config: BotConfig):
+        """
+        Initialize the authentication manager.
+
+        Args:
+            config: Bot configuration containing wallet and network settings.
+        """
+        self.config = config
+        self._client: Optional[ClobClient] = None
+        self._api_creds: Optional[ApiCreds] = None
+        self._wallet_address: Optional[str] = None
+        self._web3: Optional[Web3] = None
+        self._usdc_contract = None
+
+    def initialize(self) -> ClobClient:
+        """
+        Initialize and return an authenticated CLOB client.
+
+        Returns:
+            Authenticated ClobClient instance ready for trading.
+
+        Raises:
+            ValueError: If required configuration is missing.
+            ConnectionError: If unable to connect to CLOB API.
+        """
+        if self.config.dry_run:
+            logger.info("Initializing in DRY RUN mode - no authentication required")
+            return self._init_read_only_client()
+
+        return self._init_authenticated_client()
+
+    def _init_read_only_client(self) -> ClobClient:
+        """Initialize a read-only client for dry run mode."""
+        client = ClobClient(self.config.network.clob_endpoint)
+
+        # Verify connection
+        try:
+            ok = client.get_ok()
+            if ok:
+                logger.info("Read-only CLOB client initialized successfully")
+            else:
+                raise ConnectionError("CLOB API returned not OK status")
+        except Exception as e:
+            logger.error(f"Failed to connect to CLOB API: {e}")
+            raise ConnectionError(f"Unable to connect to CLOB API: {e}")
+
+        self._client = client
+        return client
+
+    def _init_authenticated_client(self) -> ClobClient:
+        """Initialize a fully authenticated client for live trading."""
+        private_key = self.config.wallet.private_key
+        if not private_key:
+            raise ValueError("Private key is required for authenticated client")
+
+        # Derive wallet address from private key
+        account = Account.from_key(private_key)
+        self._wallet_address = account.address
+
+        signature_type = self.config.wallet.signature_type
+
+        # Determine funder address based on signature type
+        # For EOA (type 0): funder should be the wallet address from private key
+        # For POLY_PROXY (type 1): funder is the proxy address, signer is the private key owner
+        if signature_type == 0:
+            # EOA mode - funder must be the wallet derived from private key
+            funder = self._wallet_address
+            if self.config.wallet.funder_address and self.config.wallet.funder_address != self._wallet_address:
+                logger.warning(
+                    f"EOA mode (SIGNATURE_TYPE=0): Ignoring FUNDER_ADDRESS={self.config.wallet.funder_address}. "
+                    f"Using wallet address {self._wallet_address} instead."
+                )
+        else:
+            # Proxy mode (1 or 2) - use specified funder address
+            funder = self.config.wallet.funder_address
+            if not funder:
+                raise ValueError(
+                    f"SIGNATURE_TYPE={signature_type} requires FUNDER_ADDRESS to be set. "
+                    "Set FUNDER_ADDRESS to your Polymarket proxy wallet address."
+                )
+
+        logger.info(f"Initializing authenticated client for wallet: {self._wallet_address}")
+        logger.info(f"Funder address: {funder}")
+        logger.info(f"Signature type: {signature_type}")
+
+        # Initialize client with authentication
+        client = ClobClient(
+            host=self.config.network.clob_endpoint,
+            key=private_key,
+            chain_id=self.config.network.chain_id,
+            signature_type=self.config.wallet.signature_type,
+            funder=funder
+        )
+
+        # Verify connection first
+        try:
+            ok = client.get_ok()
+            if not ok:
+                raise ConnectionError("CLOB API returned not OK status")
+        except Exception as e:
+            logger.error(f"Failed to connect to CLOB API: {e}")
+            raise ConnectionError(f"Unable to connect to CLOB API: {e}")
+
+        # Create or derive API credentials (L2 authentication)
+        try:
+            self._api_creds = client.create_or_derive_api_creds()
+            client.set_api_creds(self._api_creds)
+            logger.info("API credentials derived successfully")
+
+            # Log credential details (redacted) for debugging
+            if self._api_creds:
+                logger.debug(f"API Key: {self._api_creds.api_key[:8]}...{self._api_creds.api_key[-4:]}")
+                logger.debug(f"API Secret: {self._api_creds.api_secret[:4]}...{self._api_creds.api_secret[-4:]}")
+                logger.debug(f"API Passphrase: {self._api_creds.api_passphrase[:4]}...")
+
+        except Exception as e:
+            logger.error(f"Failed to derive API credentials: {e}")
+            logger.error(f"Wallet: {self._wallet_address}")
+            logger.error(f"Funder: {funder}")
+            logger.error(f"Signature type: {self.config.wallet.signature_type}")
+            raise ValueError(f"Unable to derive API credentials: {e}")
+
+        # Verify credentials work by testing a simple authenticated call
+        try:
+            self._verify_api_creds(client)
+        except Exception as e:
+            logger.warning(f"Credential verification warning: {e}")
+
+        self._client = client
+        logger.info("Authenticated CLOB client initialized successfully")
+
+        return client
+
+    def _verify_api_creds(self, client: ClobClient) -> bool:
+        """
+        Verify API credentials work by testing an authenticated endpoint.
+
+        Args:
+            client: The ClobClient to verify.
+
+        Returns:
+            True if credentials are valid.
+
+        Raises:
+            Exception: If credentials verification fails.
+        """
+        try:
+            # Try to get API keys - this validates our credentials
+            api_keys = client.get_api_keys()
+            if api_keys:
+                logger.info(f"Credentials verified: {len(api_keys)} API key(s) found")
+                return True
+            else:
+                logger.warning("No API keys returned - credentials may not be properly set up")
+                return False
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "invalid signature" in error_msg or "unauthorized" in error_msg:
+                logger.error(f"Credential verification failed - invalid signature: {e}")
+                logger.error("Check that:")
+                logger.error("  1. PRIVATE_KEY is the correct key for trading")
+                logger.error("  2. SIGNATURE_TYPE matches your wallet type (0=EOA, 1=POLY_PROXY)")
+                logger.error("  3. For EOA (SIGNATURE_TYPE=0): FUNDER_ADDRESS should be empty or match wallet")
+                logger.error("  4. For POLY_PROXY (SIGNATURE_TYPE=1): FUNDER_ADDRESS = your Polymarket proxy address")
+                raise
+            else:
+                # Other errors (network, etc.) - log but don't fail
+                logger.debug(f"Credential verification skipped: {e}")
+                return True
+
+    def get_client(self) -> ClobClient:
+        """
+        Get the initialized CLOB client.
+
+        Returns:
+            The initialized ClobClient instance.
+
+        Raises:
+            RuntimeError: If client has not been initialized.
+        """
+        if self._client is None:
+            raise RuntimeError("Client not initialized. Call initialize() first.")
+        return self._client
+
+    def get_wallet_address(self) -> Optional[str]:
+        """
+        Get the wallet address.
+
+        Returns:
+            The wallet address or None if not initialized.
+        """
+        return self._wallet_address
+
+    def get_api_creds(self) -> Optional[ApiCreds]:
+        """
+        Get the API credentials.
+
+        Returns:
+            The API credentials or None if in dry run mode.
+        """
+        return self._api_creds
+
+    def verify_connection(self) -> Tuple[bool, str]:
+        """
+        Verify the connection to the CLOB API.
+
+        Returns:
+            Tuple of (success, message).
+        """
+        try:
+            client = self.get_client()
+            server_time = client.get_server_time()
+            return True, f"Connected. Server time: {server_time}"
+        except Exception as e:
+            return False, f"Connection failed: {e}"
+
+    def _init_web3(self):
+        """Initialize Web3 connection for balance checks."""
+        if self._web3 is None:
+            self._web3 = Web3(Web3.HTTPProvider(self.config.network.polygon_rpc))
+            self._web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+
+            if self._web3.is_connected():
+                # Initialize USDC contract
+                self._usdc_contract = self._web3.eth.contract(
+                    address=Web3.to_checksum_address(self.config.network.usdc_address),
+                    abi=ERC20_ABI
+                )
+                logger.debug("Web3 initialized for balance checks")
+            else:
+                logger.warning("Failed to connect to Polygon RPC for balance checks")
+
+    def get_usdc_balance(self, max_retries: int = 3) -> Optional[float]:
+        """
+        Get USDC balance from the blockchain with retry logic.
+
+        Args:
+            max_retries: Maximum number of RPC retries.
+
+        Returns:
+            USDC balance in USD or None if unable to fetch.
+        """
+        if self.config.dry_run:
+            # Return simulated balance for dry run
+            return self.config.starting_capital_usd
+
+        if not self._wallet_address:
+            logger.warning("Wallet address not initialized")
+            return None
+
+        try:
+            self._init_web3()
+
+            if self._usdc_contract is None:
+                return None
+
+            # Use funder address if set (for proxy wallets)
+            check_address = self.config.wallet.funder_address or self._wallet_address
+            check_address = Web3.to_checksum_address(check_address)
+
+            # Get balance with retry (USDC has 6 decimals)
+            raw_balance = _retry_rpc_sync(
+                lambda: self._usdc_contract.functions.balanceOf(check_address).call(),
+                max_retries=max_retries,
+                operation_name="get_usdc_balance"
+            )
+            balance = raw_balance / 1e6  # Convert from 6 decimals
+
+            logger.info(f"USDC Balance: ${balance:,.2f}")
+            return balance
+
+        except Exception as e:
+            logger.error(f"Failed to fetch USDC balance after retries: {e}")
+            return None
+
+    def verify_sufficient_balance(self, min_balance: Optional[float] = None) -> Tuple[bool, str]:
+        """
+        Verify the wallet has sufficient USDC balance for trading.
+
+        Args:
+            min_balance: Minimum required balance (defaults to starting_capital_usd).
+
+        Returns:
+            Tuple of (sufficient, message).
+        """
+        if self.config.dry_run:
+            return True, f"Dry run mode - simulated balance ${self.config.starting_capital_usd:,.2f}"
+
+        if min_balance is None:
+            min_balance = self.config.starting_capital_usd
+
+        balance = self.get_usdc_balance()
+
+        if balance is None:
+            return False, "Unable to fetch USDC balance"
+
+        if balance < min_balance:
+            return False, f"Insufficient balance: ${balance:,.2f} < required ${min_balance:,.2f}"
+
+        return True, f"Balance sufficient: ${balance:,.2f}"
+
+    def get_matic_balance(self, address: Optional[str] = None, max_retries: int = 3) -> Optional[float]:
+        """
+        Get native MATIC balance for gas from the blockchain.
+
+        Args:
+            address: Address to check (defaults to wallet_address).
+            max_retries: Maximum number of RPC retries.
+
+        Returns:
+            MATIC balance or None if unable to fetch.
+        """
+        if self.config.dry_run:
+            return 1.0  # Simulated balance
+
+        check_address = address or self._wallet_address
+        if not check_address:
+            logger.warning("Wallet address not initialized for MATIC check")
+            return None
+
+        try:
+            self._init_web3()
+
+            if self._web3 is None or not self._web3.is_connected():
+                return None
+
+            check_address = Web3.to_checksum_address(check_address)
+
+            # Get native balance with retry
+            raw_balance = _retry_rpc_sync(
+                lambda: self._web3.eth.get_balance(check_address),
+                max_retries=max_retries,
+                operation_name="get_matic_balance"
+            )
+            balance = raw_balance / 1e18  # Convert from wei to MATIC
+
+            logger.debug(f"MATIC Balance for {check_address[:10]}...: {balance:.6f}")
+            return balance
+
+        except Exception as e:
+            logger.error(f"Failed to fetch MATIC balance after retries: {e}")
+            return None
+
+    def verify_gas_balance(self) -> Tuple[bool, str]:
+        """
+        Verify the signer wallet has enough MATIC for gas.
+
+        For proxy wallets (SIGNATURE_TYPE=1), on-chain txs are relayed by Polymarket.
+        But for EOA wallets, direct gas is needed.
+
+        Returns:
+            Tuple of (has_gas, message).
+        """
+        if self.config.dry_run:
+            return True, "Dry run mode - gas check skipped"
+
+        # For proxy wallets, Polymarket handles gas via relayer
+        if self.config.wallet.signature_type == 1:
+            logger.info("Proxy wallet mode - gas paid by Polymarket relayer")
+            return True, "Proxy wallet - gas handled by relayer"
+
+        # For EOA, check MATIC on signer wallet
+        matic_balance = self.get_matic_balance()
+
+        if matic_balance is None:
+            return False, "Unable to check MATIC balance"
+
+        if matic_balance < MIN_MATIC_FOR_GAS:
+            msg = (
+                f"INSUFFICIENT MATIC FOR GAS!\n"
+                f"  Current: {matic_balance:.6f} MATIC\n"
+                f"  Required: {MIN_MATIC_FOR_GAS:.4f} MATIC\n"
+                f"  Wallet: {self._wallet_address}\n"
+                f"  \n"
+                f"  Fund your wallet with MATIC:\n"
+                f"    - Bridge from Ethereum: https://wallet.polygon.technology/bridge\n"
+                f"    - Buy on exchange and withdraw to Polygon\n"
+                f"    - Use Polygon faucet (for small amounts)"
+            )
+            return False, msg
+
+        return True, f"MATIC balance OK: {matic_balance:.6f} MATIC"
+
+    def get_balance(self) -> Optional[dict]:
+        """
+        Get the account balance information.
+
+        Returns:
+            Balance information dict or None if unable to fetch.
+        """
+        if self.config.dry_run:
+            return {
+                "status": "dry_run",
+                "wallet": "simulated",
+                "usdc_balance": self.config.starting_capital_usd,
+                "matic_balance": 1.0
+            }
+
+        usdc_balance = self.get_usdc_balance()
+        matic_balance = self.get_matic_balance()
+
+        return {
+            "status": "authenticated",
+            "wallet": self._wallet_address,
+            "funder": self.config.wallet.funder_address or self._wallet_address,
+            "usdc_balance": usdc_balance,
+            "matic_balance": matic_balance
+        }
