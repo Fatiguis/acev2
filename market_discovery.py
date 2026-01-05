@@ -533,53 +533,6 @@ class MarketDiscovery:
         logger.info(f"Identified {len(in_play)} in-play markets")
         return in_play
 
-    async def fetch_additional_category_markets(self) -> List[Market]:
-        """
-        Fetch markets from additional categories (politics, crypto, pop-culture).
-
-        This provides diversification beyond sports, especially useful when
-        sports volume is low. rn1 reportedly gets ~10% of volume from politics.
-
-        Returns:
-            List of markets from additional categories.
-        """
-        additional_markets = []
-        categories = self.config.sports.additional_categories
-
-        for category in categories:
-            try:
-                # Fetch events with tag
-                url = f"{self.gamma_endpoint}/events"
-                params = {
-                    "active": "true",
-                    "closed": "false",
-                    "tag": category,
-                    "limit": "50",
-                }
-
-                data = await self._fetch_json(url, params)
-                if not data:
-                    continue
-
-                # Parse events and markets
-                for event_data in data:
-                    event = self._parse_event(event_data)
-                    if event:
-                        for market in event.markets:
-                            if market.volume >= self.config.trading.min_volume_usd:
-                                market.event_id = event.event_id
-                                market.event_title = event.title
-                                additional_markets.append(market)
-
-                logger.debug(f"Fetched {len([m for m in additional_markets])} markets from {category}")
-
-            except Exception as e:
-                logger.debug(f"Error fetching {category} markets: {e}")
-                continue
-
-        logger.info(f"Fetched {len(additional_markets)} markets from additional categories")
-        return additional_markets
-
     def _parse_event(self, event_data: Dict) -> Optional[Event]:
         """
         Parse event data including its markets.
@@ -630,14 +583,6 @@ class MarketDiscovery:
 
         # Filter by volume
         markets = self.filter_high_volume_markets(events)
-
-        # Also fetch additional category markets (politics, crypto, etc.)
-        try:
-            additional = await self.fetch_additional_category_markets()
-            markets.extend(additional)
-            logger.info(f"Added {len(additional)} markets from politics/crypto/pop-culture")
-        except Exception as e:
-            logger.warning(f"Could not fetch additional category markets: {e}")
 
         # Optionally filter to in-play only
         if not include_pre_match:
