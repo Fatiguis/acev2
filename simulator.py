@@ -68,10 +68,11 @@ RN1_PROFILE = {
         "std": 30
     },
 
-    # Execution characteristics
-    "partial_fill_rate": 0.08,   # 8% partial fills
-    "slippage_skip_rate": 0.05,  # 5% skipped due to slippage
-    "stale_skip_rate": 0.02,     # 2% stale books
+    # Execution characteristics - UPDATED with realistic rates
+    # Original 8% was optimistic; real sports arbs see 20-30% partials
+    "partial_fill_rate": 0.22,   # 22% partial fills (realistic for sports HFT)
+    "slippage_skip_rate": 0.12,  # 12% skipped due to slippage (higher during bursts)
+    "stale_skip_rate": 0.05,     # 5% stale books (WS helps reduce this)
 
     # Burst trading patterns (Poisson-based clustering)
     # RN1 trades in bursts during live games (5-15 trades/game)

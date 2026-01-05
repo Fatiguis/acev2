@@ -482,34 +482,50 @@ class PolymarketWebSocket:
         }
         """
         token_id = message.get("asset_id")
-        if not token_id:
+        if not token_id or not isinstance(token_id, str):
             return
 
-        # Calculate latency
+        # Calculate latency with robust type coercion
         server_timestamp = message.get("timestamp", 0)
-        if server_timestamp:
-            latency_ms = receive_time_ms - server_timestamp
-            self._latency_stats.record(latency_ms)
+        try:
+            # Handle string timestamps from some WS implementations
+            if isinstance(server_timestamp, str):
+                server_timestamp = int(server_timestamp)
+            elif isinstance(server_timestamp, float):
+                server_timestamp = int(server_timestamp)
 
-        # Parse orderbook levels
+            if server_timestamp > 0:
+                latency_ms = receive_time_ms - float(server_timestamp)
+                # Sanity check: latency should be positive and <10s
+                if 0 < latency_ms < 10000:
+                    self._latency_stats.record(latency_ms)
+        except (ValueError, TypeError, OverflowError) as e:
+            logger.debug(f"Timestamp coercion error: {e}, raw={server_timestamp}")
+
+        # Parse orderbook levels with robust type handling
         bids = []
         for bid in message.get("bids", []):
             try:
-                price = float(bid.get("price", 0))
-                size = float(bid.get("size", 0))
+                # Handle both string and numeric price/size
+                raw_price = bid.get("price", 0)
+                raw_size = bid.get("size", 0)
+                price = float(raw_price) if raw_price else 0.0
+                size = float(raw_size) if raw_size else 0.0
                 if price > 0 and size > 0:
                     bids.append(OrderbookLevel(price=price, size=size))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 continue
 
         asks = []
         for ask in message.get("asks", []):
             try:
-                price = float(ask.get("price", 0))
-                size = float(ask.get("size", 0))
+                raw_price = ask.get("price", 0)
+                raw_size = ask.get("size", 0)
+                price = float(raw_price) if raw_price else 0.0
+                size = float(raw_size) if raw_size else 0.0
                 if price > 0 and size > 0:
                     asks.append(OrderbookLevel(price=price, size=size))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 continue
 
         # Sort properly
