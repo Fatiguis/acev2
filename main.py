@@ -30,7 +30,7 @@ from positions import PositionMonitor, ProfitLocker
 from risk import RiskManager, DepthValidator, TradeRecord
 from edge_model import EdgeExpectancyModel, MarketHeat
 from supervisor import get_supervisor, heartbeat as supervisor_heartbeat
-from clob_client_patch import patch_clob_client
+# Note: Monkey-patching deprecated per audit - rate limiting handled at application level
 
 # Optional WebSocket support
 try:
@@ -1494,9 +1494,9 @@ async def main():
     # Setup logging
     setup_logging(config.logging)
 
-    # Patch py-clob-client HTTP helpers with global rate limiter
-    # This catches rare 429s from internal client calls (post_order, get_order, etc.)
-    patch_clob_client()
+    # Note: Monkey-patching removed per audit (fragile, can break on library updates)
+    # Rate limiting now handled at application level via rate_limiter module
+    logger.info("Rate limiting handled at application level (monkey-patch disabled)")
 
     logger.info("Starting Polymarket Arbitrage Bot with supervisor...")
 

@@ -169,6 +169,13 @@ class RiskManager:
         if not exposure_ok:
             return False, exposure_msg
 
+        # Check maker ratio (per audit: rn1 preferred maker for rebates + lower rate pressure)
+        # Only enforce after sufficient fills to have meaningful data
+        maker_ok, maker_msg = self.check_maker_ratio_ok()
+        if not maker_ok:
+            # Don't hard block, but log warning - can still trade but prefer post-only
+            logger.debug(f"Maker ratio low: {maker_msg}")
+
         # Calculate dynamic threshold based on trade size and outcomes
         num_outcomes = len(opportunity.market.outcomes)
         dynamic_threshold = calculate_dynamic_threshold(

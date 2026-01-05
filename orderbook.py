@@ -768,12 +768,13 @@ class OrderbookPoller:
         Get volume-weighted average price across multiple levels.
 
         Per audit: Sum depth across top 3-5 levels for more realistic edge detection.
+        Caps depth per level to target_size_usd to avoid over-estimating on deep levels.
 
         Args:
             orderbook: The orderbook to analyze.
             side: "ask" or "bid".
             num_levels: Number of levels to consider.
-            target_size_usd: Target trade size for weighting.
+            target_size_usd: Target trade size - caps depth per level to this.
 
         Returns:
             Tuple of (weighted_avg_price, total_depth_usd).
@@ -785,12 +786,23 @@ class OrderbookPoller:
         total_size = 0.0
         weighted_sum = 0.0
         total_depth_usd = 0.0
+        remaining_target = target_size_usd
 
         for i, level in enumerate(levels[:num_levels]):
             level_usd = level.size * level.price
-            total_depth_usd += level_usd
-            weighted_sum += level.price * level.size
-            total_size += level.size
+
+            # Cap each level's contribution to remaining target size (per audit)
+            # This prevents over-estimating depth on deep levels we won't fully fill
+            usable_usd = min(level_usd, remaining_target)
+            usable_size = usable_usd / level.price if level.price > 0 else 0
+
+            total_depth_usd += usable_usd
+            weighted_sum += level.price * usable_size
+            total_size += usable_size
+            remaining_target -= usable_usd
+
+            if remaining_target <= 0:
+                break
 
         if total_size == 0:
             return (1.0 if side == "ask" else 0.0), 0.0
