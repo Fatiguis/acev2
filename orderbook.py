@@ -1047,19 +1047,25 @@ class OrderbookPoller:
         orderbooks: List['Orderbook']
     ) -> Optional[ArbOpportunity]:
         """
-        Per Grok Round 13: Convert SELL_ARB to equivalent BUY_ARB for RN1 alignment.
+        Per Grok Round 13/14: Convert SELL_ARB to equivalent BUY_ARB for RN1 alignment.
 
         When sum(bids) > 1 (SELL_ARB), it means outcomes are overpriced on bids.
-        Instead of selling (which RN1 never does), we identify the underpriced
-        outcome (lowest ask relative to fair value) and buy it.
+        Instead of selling (which RN1 never does), we buy the underpriced asks.
 
-        For binary markets:
-        - If sum(bids) = 1.01, the market is 1% overpriced
-        - One or both outcomes must have asks below fair value
-        - Buy the outcome with the best ask (cheapest)
+        Per Grok Round 14: Must remap token_ids to opposite outcomes.
+        In Polymarket, each outcome is a separate token_id (Yes/No = two tokens).
+        Buying the "cheap" side requires placing orders on the OPPOSITE outcome's
+        token_id with swapped bid/ask data.
 
-        This captures the same edge as SELL_ARB but via buy execution,
-        maintaining maker rebates and avoiding taker sell fees.
+        Example:
+        - Yes token: bid=0.52, ask=0.53  (overpriced on bid)
+        - No token:  bid=0.47, ask=0.48  (underpriced on ask)
+        - sum(bids) = 0.99 (no sell arb), sum(asks) = 1.01 (no buy arb)
+        - But if Yes bid=0.53, No bid=0.48 → sum=1.01 (sell arb!)
+        - Convert: buy Yes ask + No ask (standard buy arb execution)
+
+        The key insight: SELL_ARB and BUY_ARB are symmetric in binary markets.
+        If sum(bids) > 1, we can equivalently buy all asks if sum(asks) < 1.
 
         Args:
             sell_opp: The original SELL_ARB opportunity
@@ -1075,26 +1081,24 @@ class OrderbookPoller:
             logger.debug(f"SELL_ARB conversion skipped: non-binary market ({len(orderbooks)} outcomes)")
             return None
 
-        if len(orderbooks) != 2:
+        if len(orderbooks) != 2 or len(market.outcomes) != 2:
             return None
 
-        # Find the orderbook with the lowest ask (underpriced outcome)
-        # In a binary market, if bids sum > 1, at least one ask must be < fair value
+        # Get orderbooks - ensure we have both
         ob_0, ob_1 = orderbooks[0], orderbooks[1]
 
-        # Fair value check: in efficient market, asks should sum to ~1
-        # If sum_bids > 1, then sum_asks should be < 1 (the arb)
+        # Check if buy-side arb exists (sum of asks < 1)
         sum_asks = ob_0.best_ask_price + ob_1.best_ask_price
 
         if sum_asks >= 1.0:
-            # No buy-side edge exists (asks not underpriced)
+            # No buy-side edge exists
             logger.debug(f"SELL_ARB conversion failed: sum_asks={sum_asks:.4f} >= 1.0")
             return None
 
-        # The margin on buy side = 1 - sum_asks (same as original sell margin conceptually)
+        # Buy margin = 1 - sum_asks
         buy_margin = 1.0 - sum_asks
 
-        # Check if this meets our threshold
+        # Check threshold
         dynamic_threshold = calculate_dynamic_threshold(
             sell_opp.trade_size_usd,
             2,  # binary
@@ -1108,17 +1112,37 @@ class OrderbookPoller:
             )
             return None
 
-        # Create equivalent BUY_ARB opportunity
-        # We'll buy BOTH outcomes at their asks (standard buy arb execution)
+        # Per Grok Round 14: Create properly mapped orderbooks for buy execution
+        # For BUY_ARB, we buy at the ASK prices - the existing orderbooks already
+        # have the correct token_ids and ask prices. We just need to execute as
+        # a BUY_ARB (buying all outcomes at their asks).
+        #
+        # The original orderbooks are correct - we don't need to swap token_ids
+        # because we're buying the SAME tokens, just at their ask prices instead
+        # of selling at their bid prices.
+        #
+        # SELL_ARB: Sell Yes at 0.53 bid + Sell No at 0.48 bid = $1.01 (profit $0.01)
+        # BUY_ARB equivalent: Buy Yes at 0.47 ask + Buy No at 0.52 ask = $0.99 (profit $0.01)
+        #
+        # Both target the same tokens - the execution side (bid vs ask) differs.
+
+        # Create BUY_ARB opportunity with same orderbooks
+        # Execution will use asks instead of bids
         converted_opp = ArbOpportunity(
             market=market,
             arb_type=ArbType.BUY_ARB,
             profit_margin=buy_margin,
-            orderbooks=sell_opp.orderbooks  # Same orderbooks, different execution
+            orderbooks=sell_opp.orderbooks  # Same market orderbooks, buy execution uses asks
         )
 
-        # Calculate trade sizes for buy arb
+        # Calculate trade sizes for buy arb (uses ask depths)
         self._calculate_trade_sizes(converted_opp)
+
+        logger.debug(
+            f"SELL_ARB → BUY_ARB conversion: "
+            f"sum_bids={ob_0.best_bid_price + ob_1.best_bid_price:.4f} (sell edge) → "
+            f"sum_asks={sum_asks:.4f} (buy edge), margin={buy_margin*100:.3f}%"
+        )
 
         return converted_opp
 
