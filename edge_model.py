@@ -332,16 +332,27 @@ class EdgeExpectancyModel:
         latency_ms: float,
         heat: MarketHeat,
         use_websocket: bool = True,
-        is_maker: bool = False
+        is_maker: bool = True  # Per Grok Round 23: Default True - rn1 pattern
     ) -> EdgeEstimate:
         """
         Calculate expected profit for a given opportunity and size.
+
+        Per Grok Round 23: Added maker rebate EV boost calculation.
+        rn1's edge came primarily from MAKER rebates (post-only orders).
+        Even with 0% fees currently, post-only gets execution priority,
+        which translates to higher fill probability in hot markets.
 
         Full formula:
         E[profit] = edge × P(fill) × (1 - P(frontrun)) × size
                     - taker_fee × size × P(fill)
                     + maker_rebate × size × P(fill)  [if maker]
+                    + maker_priority_boost × P(fill)  [if maker]
                     - gas_cost
+
+        Maker Priority Boost Math:
+        - Post-only orders sit at top of queue (price improvement)
+        - In hot markets (BLAZING), maker fills 20-30% more often
+        - This translates to ~0.1-0.2% extra EV per trade
 
         Args:
             raw_edge_pct: Raw arbitrage edge.
@@ -349,10 +360,10 @@ class EdgeExpectancyModel:
             latency_ms: Latency in milliseconds.
             heat: Market heat level.
             use_websocket: True if using websocket.
-            is_maker: True if placing post-only orders.
+            is_maker: True if placing post-only orders (DEFAULT: True per rn1).
 
         Returns:
-            EdgeEstimate with expected profit.
+            EdgeEstimate with expected profit including maker EV boost.
         """
         estimate = self.calculate_expected_edge(
             raw_edge_pct, latency_ms, heat, use_websocket
@@ -365,15 +376,28 @@ class EdgeExpectancyModel:
         if is_maker:
             # Maker gets rebate
             fee_impact = -self.config.maker_rebate_pct * size_usd * estimate.fill_probability
+
+            # Per Grok Round 23: Maker priority boost (post-only queue advantage)
+            # Post-only sits at top of order book, fills before takers at same price
+            # In hot markets, this boost is more significant
+            maker_priority_boost_map = {
+                MarketHeat.COLD: 0.0005,    # 0.05% boost (low competition)
+                MarketHeat.WARM: 0.001,     # 0.10% boost
+                MarketHeat.HOT: 0.0015,     # 0.15% boost (queue matters more)
+                MarketHeat.BLAZING: 0.002,  # 0.20% boost (critical in live games)
+            }
+            priority_boost_pct = maker_priority_boost_map.get(heat, 0.001)
+            maker_ev_boost = priority_boost_pct * size_usd * estimate.fill_probability
         else:
-            # Taker pays fee
+            # Taker pays fee (no priority boost)
             fee_impact = self.config.taker_fee_pct * size_usd * estimate.fill_probability
+            maker_ev_boost = 0.0
 
         # Gas cost (fixed per transaction attempt)
         gas_cost = self.config.gas_cost_usd
 
-        # Final expected profit
-        expected_profit = base_profit - fee_impact - gas_cost
+        # Final expected profit (including maker EV boost)
+        expected_profit = base_profit - fee_impact + maker_ev_boost - gas_cost
 
         estimate.expected_profit_usd = expected_profit
 
@@ -577,6 +601,87 @@ class EdgeExpectancyModel:
             "months_to_target": days_to_target / 30 if days_to_target < float('inf') else float('inf'),
             "annualized_return_pct": daily_return_pct * 365,
         }
+
+    def calculate_3way_arb_probability(
+        self,
+        home_price: float,
+        draw_price: float,
+        away_price: float,
+        latency_ms: float,
+        heat: MarketHeat = MarketHeat.WARM
+    ) -> Dict[str, float]:
+        """
+        Per Grok Round 23: Calculate 3-way soccer arb probability and expected profit.
+
+        Soccer 3-way consists of: Home Win / Draw / Away Win
+        These are 3 mutually exclusive outcomes - exactly one must win.
+
+        rn1's core strategy: Buy 2 of 3 outcomes if sum < 1.0
+        Example: Home 0.40 + Away 0.55 = 0.95 → 5% edge if either wins
+
+        Args:
+            home_price: Ask price for Home Win outcome.
+            draw_price: Ask price for Draw outcome.
+            away_price: Ask price for Away Win outcome.
+            latency_ms: Our execution latency.
+            heat: Market heat level.
+
+        Returns:
+            Dict with arb analysis for each 2-of-3 combination.
+        """
+        prices = {
+            "home": home_price,
+            "draw": draw_price,
+            "away": away_price
+        }
+
+        # Check all 3 combinations of 2 outcomes
+        combinations = [
+            ("home", "draw"),    # Exclude Away
+            ("home", "away"),    # Exclude Draw
+            ("draw", "away"),    # Exclude Home
+        ]
+
+        results = {
+            "has_arb": False,
+            "best_combo": None,
+            "best_margin": 0.0,
+            "combinations": {}
+        }
+
+        fill_prob = self.calculate_fill_probability(latency_ms / 1000.0, heat)
+
+        for combo in combinations:
+            combo_cost = prices[combo[0]] + prices[combo[1]]
+            margin = 1.0 - combo_cost  # Profit if either outcome wins
+
+            # Arb exists if cost < 1.0 (one of the two MUST win since other is excluded)
+            is_arb = margin > 0.002  # Minimum 0.2% edge
+
+            combo_name = f"{combo[0]}+{combo[1]}"
+            results["combinations"][combo_name] = {
+                "cost": combo_cost,
+                "margin_pct": margin * 100,
+                "is_arb": is_arb,
+                "expected_profit_pct": margin * fill_prob * 100,  # Adjusted for fill prob
+            }
+
+            if is_arb and margin > results["best_margin"]:
+                results["has_arb"] = True
+                results["best_combo"] = combo_name
+                results["best_margin"] = margin
+
+        # Calculate overall arb stats
+        if results["has_arb"]:
+            results["fill_probability"] = fill_prob
+            results["expected_edge_pct"] = results["best_margin"] * fill_prob * 100
+            logger.debug(
+                f"3-way arb detected: {results['best_combo']} with "
+                f"{results['best_margin']*100:.2f}% margin, "
+                f"{results['expected_edge_pct']:.2f}% expected (fill_prob={fill_prob:.1%})"
+            )
+
+        return results
 
     def record_fill_attempt(self, latency_ms: float, edge_pct: float, filled: bool, heat: MarketHeat = MarketHeat.WARM):
         """Record a fill attempt for model calibration."""

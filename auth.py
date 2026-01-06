@@ -18,13 +18,15 @@ from config import BotConfig
 logger = logging.getLogger(__name__)
 
 # Minimum MATIC balance required for gas (in MATIC)
-# Per Grok Round 16: Raised to 1.0 MATIC for rn1-style burst trading
-# Math: 100+ tx/day * 0.01 MATIC spike avg = 1.0+ MATIC/day buffer needed
-# Polygon gas spikes during high network activity can drain wallet fast
-MIN_MATIC_FOR_GAS = 1.0
+# Per Grok Round 23 CRITICAL: Raised to 2.0 MATIC for rn1-style burst trading
+# Math: rn1's burst pattern (10-25 tx in 3min during live games) hits gas spikes
+# Polygon gas can spike 10x during congestion - 2.0 MATIC provides safety buffer
+# 1.0 was causing mid-arb tx failures during high-volume sports events
+MIN_MATIC_FOR_GAS = 2.0
 
 # Warning threshold - alert when approaching minimum (triggers webhook)
-MATIC_WARNING_THRESHOLD = 2.0
+# Per Grok Round 23: Raised to 3.0 to give time for manual top-up
+MATIC_WARNING_THRESHOLD = 3.0
 
 T = TypeVar('T')
 
@@ -456,37 +458,74 @@ class AuthManager:
         private_key: str,
         token_name: str
     ):
-        """Send an ERC20 approve transaction."""
-        try:
-            # Build transaction
-            nonce = self._web3.eth.get_transaction_count(wallet_address, 'pending')
-            gas_price = self._web3.eth.gas_price
+        """
+        Send an ERC20 approve transaction with exponential backoff retry.
 
-            tx = contract.functions.approve(spender, amount).build_transaction({
-                'from': wallet_address,
-                'nonce': nonce,
-                'gas': 100000,
-                'gasPrice': gas_price,
-                'chainId': self.config.network.chain_id
-            })
+        Per Grok Round 21: Polygon gas spikes are common. Single-attempt approvals
+        can block trading indefinitely. Loop with exponential backoff + alert on
+        persistent failure.
+        """
+        MAX_RETRIES = 10  # Per Grok Round 21: Aggressive retry for production
+        ALERT_THRESHOLD = 5  # Alert webhook after 5 failures
 
-            # Sign and send
-            account = Account.from_key(private_key)
-            signed_tx = account.sign_transaction(tx)
-            tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Build transaction with dynamic gas price (bump on retries)
+                nonce = self._web3.eth.get_transaction_count(wallet_address, 'pending')
+                base_gas_price = self._web3.eth.gas_price
 
-            logger.info(f"{token_name} approval tx sent: {tx_hash.hex()}")
+                # Per Grok Round 21: Bump gas price on retries (10% per attempt)
+                gas_multiplier = 1.0 + (attempt * 0.1)
+                gas_price = int(base_gas_price * gas_multiplier)
 
-            # Wait for confirmation
-            receipt = self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                tx = contract.functions.approve(spender, amount).build_transaction({
+                    'from': wallet_address,
+                    'nonce': nonce,
+                    'gas': 100000,
+                    'gasPrice': gas_price,
+                    'chainId': self.config.network.chain_id
+                })
 
-            if receipt.status == 1:
-                logger.info(f"{token_name} CAPPED approval confirmed (${CAPPED_APPROVAL_USDC/1e6:,.0f} limit)")
-            else:
-                logger.error(f"{token_name} approval tx failed")
+                # Sign and send
+                account = Account.from_key(private_key)
+                signed_tx = account.sign_transaction(tx)
+                tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
-        except Exception as e:
-            logger.error(f"Failed to send {token_name} approval tx: {e}")
+                logger.info(f"{token_name} approval tx sent: {tx_hash.hex()} (attempt {attempt + 1})")
+
+                # Wait for confirmation
+                receipt = self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+                if receipt.status == 1:
+                    logger.info(f"{token_name} CAPPED approval confirmed (${CAPPED_APPROVAL_USDC/1e6:,.0f} limit)")
+                    return True  # Success
+                else:
+                    logger.error(f"{token_name} approval tx failed (reverted)")
+
+            except Exception as e:
+                logger.warning(f"{token_name} approval attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
+
+                # Per Grok Round 21: Alert webhook after ALERT_THRESHOLD failures
+                if attempt + 1 == ALERT_THRESHOLD:
+                    logger.error(
+                        f"APPROVAL ALERT: {token_name} approval failed {ALERT_THRESHOLD} times! "
+                        f"Trading may be blocked. Check Polygon gas prices and wallet MATIC balance."
+                    )
+                    # TODO: Add webhook notification here when webhook system is implemented
+
+                if attempt < MAX_RETRIES - 1:
+                    # Exponential backoff: 2^attempt seconds (2, 4, 8, 16, 32, ...)
+                    delay = min(2 ** attempt, 60)  # Cap at 60s
+                    logger.info(f"Retrying {token_name} approval in {delay}s...")
+                    import time
+                    time.sleep(delay)
+
+        # All retries exhausted
+        logger.error(
+            f"CRITICAL: {token_name} approval failed after {MAX_RETRIES} attempts! "
+            f"Trading will be blocked until manually resolved."
+        )
+        return False
 
     def _send_ct_approval_tx(
         self,
@@ -495,34 +534,64 @@ class AuthManager:
         wallet_address: str,
         private_key: str
     ):
-        """Send an ERC1155 setApprovalForAll transaction."""
-        try:
-            nonce = self._web3.eth.get_transaction_count(wallet_address, 'pending')
-            gas_price = self._web3.eth.gas_price
+        """
+        Send an ERC1155 setApprovalForAll transaction with exponential backoff retry.
 
-            tx = contract.functions.setApprovalForAll(operator, True).build_transaction({
-                'from': wallet_address,
-                'nonce': nonce,
-                'gas': 100000,
-                'gasPrice': gas_price,
-                'chainId': self.config.network.chain_id
-            })
+        Per Grok Round 21: Same retry logic as USDC approval.
+        """
+        MAX_RETRIES = 10
+        ALERT_THRESHOLD = 5
 
-            account = Account.from_key(private_key)
-            signed_tx = account.sign_transaction(tx)
-            tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        for attempt in range(MAX_RETRIES):
+            try:
+                nonce = self._web3.eth.get_transaction_count(wallet_address, 'pending')
+                base_gas_price = self._web3.eth.gas_price
 
-            logger.info(f"ConditionalTokens approval tx sent: {tx_hash.hex()}")
+                # Bump gas price on retries
+                gas_multiplier = 1.0 + (attempt * 0.1)
+                gas_price = int(base_gas_price * gas_multiplier)
 
-            receipt = self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                tx = contract.functions.setApprovalForAll(operator, True).build_transaction({
+                    'from': wallet_address,
+                    'nonce': nonce,
+                    'gas': 100000,
+                    'gasPrice': gas_price,
+                    'chainId': self.config.network.chain_id
+                })
 
-            if receipt.status == 1:
-                logger.info("ConditionalTokens approval confirmed!")
-            else:
-                logger.error("ConditionalTokens approval tx failed")
+                account = Account.from_key(private_key)
+                signed_tx = account.sign_transaction(tx)
+                tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
-        except Exception as e:
-            logger.error(f"Failed to send ConditionalTokens approval tx: {e}")
+                logger.info(f"ConditionalTokens approval tx sent: {tx_hash.hex()} (attempt {attempt + 1})")
+
+                receipt = self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+                if receipt.status == 1:
+                    logger.info("ConditionalTokens approval confirmed!")
+                    return True
+                else:
+                    logger.error("ConditionalTokens approval tx failed (reverted)")
+
+            except Exception as e:
+                logger.warning(f"ConditionalTokens approval attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
+
+                if attempt + 1 == ALERT_THRESHOLD:
+                    logger.error(
+                        f"APPROVAL ALERT: ConditionalTokens approval failed {ALERT_THRESHOLD} times! "
+                        f"Trading may be blocked."
+                    )
+
+                if attempt < MAX_RETRIES - 1:
+                    delay = min(2 ** attempt, 60)
+                    logger.info(f"Retrying ConditionalTokens approval in {delay}s...")
+                    import time
+                    time.sleep(delay)
+
+        logger.error(
+            f"CRITICAL: ConditionalTokens approval failed after {MAX_RETRIES} attempts!"
+        )
+        return False
 
     def _verify_api_creds(self, client: ClobClient) -> bool:
         """
@@ -869,17 +938,38 @@ class AuthManager:
             logger.error(f"BLOCKED: Error checking USDC allowance after retries: {e}")
             raise RuntimeError(f"Cannot verify USDC allowance - blocking trading: {e}")
 
-    def ensure_sufficient_allowance(self, client: ClobClient, required_usd: float = 10000.0) -> bool:
+    def ensure_sufficient_allowance(
+        self,
+        client: ClobClient,
+        required_usd: float = 10000.0,
+        current_capital: Optional[float] = None
+    ) -> bool:
         """
         Ensure USDC allowance is sufficient, re-approve if needed.
 
+        Per Grok Round 23: Allowance requirement scales with current capital.
+        rn1's unlimited approvals scaled naturally; we use 2x capital buffer
+        to avoid mid-trade approval failures during burst execution.
+
         Args:
             client: CLOB client to get exchange address.
-            required_usd: Required allowance in USD (will approve unlimited if below).
+            required_usd: Minimum required allowance in USD.
+            current_capital: Current trading capital (used to scale requirement).
 
         Returns:
             True if allowance is now sufficient.
         """
+        # Per Grok Round 23: Scale allowance requirement with capital
+        # Use 2x capital buffer to handle burst trading (rn1's live game pattern)
+        # Example: $50k capital → require $100k allowance
+        if current_capital is not None and current_capital > 0:
+            capital_scaled_requirement = current_capital * 2.0
+            required_usd = max(required_usd, capital_scaled_requirement)
+            logger.debug(
+                f"Allowance requirement scaled to ${required_usd:,.2f} "
+                f"(2x capital ${current_capital:,.2f})"
+            )
+
         has_sufficient, current = self.check_usdc_allowance(client, required_usd)
 
         if has_sufficient:

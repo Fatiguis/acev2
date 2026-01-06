@@ -119,14 +119,27 @@ class RiskManager:
         self._init_edge_model()
 
         # Per Grok Round 8: Optional trash_mode for volume farming
-        # When enabled, allows buying near-certain losers (<$0.03) for volume farming
+        # When enabled, allows buying near-certain losers (<$0.02) for volume farming
         # This is HIGHLY SPECULATIVE - only for airdrop farming speculation
         # Default: OFF (disabled)
+        #
+        # Per Grok Round 21 CRITICAL: Trash farming is rn1's KEY META
+        # rn1 buys draw @1¢ late in 3-0 games → 100:1 volume:cost ratio
+        # This maximizes airdrop eligibility (rumored 300M-1.5B allocation)
         self._trash_mode_enabled = os.getenv("TRASH_MODE", "false").lower() == "true"
-        self._trash_mode_max_price = 0.03  # Only buy at <$0.03 (3 cents)
-        self._trash_mode_max_size_usd = 5.0  # Per Grok Round 9: Max $5 per trash trade (ultra-conservative)
+        self._trash_mode_max_price = 0.02  # Per Grok Round 21: Only buy at ≤$0.02 (2 cents)
+        self._trash_mode_max_size_usd = float(os.getenv("TRASH_MAX_SIZE_USD", "100"))  # Per Grok Round 21: $50-100 per trade
+        self._trash_mode_min_size_usd = 50.0  # Minimum $50 to make volume worthwhile
         self._trash_mode_trades = 0  # Track trash volume trades
         self._trash_mode_volume_usd = 0.0  # Track trash volume in USD
+        self._trash_mode_min_liquidity_usd = 5000.0  # Per Grok Round 21: Need >$5k liquidity
+        self._trash_mode_max_time_to_resolution_min = 10  # Per Grok Round 21: <10min to resolution
+
+        # Per Grok Round 21: Enhanced volume farming metrics
+        self._trash_mode_cost_usd = 0.0  # Total cost (expected loss) from trash trades
+        self._trash_mode_wins = 0  # Unexpected wins (for tracking extreme value)
+        self._trash_mode_avg_price = 0.0  # Running avg price for volume:cost ratio
+        self._trash_mode_last_webhook_trade = 0  # Last trade count when webhook sent
 
         # Per Grok Round 9: Airdrop allocation speculation
         # Rumored allocation: $0.01-0.05 per $1k volume (highly speculative)
@@ -299,9 +312,22 @@ class RiskManager:
 
         return True, "Trade allowed"
 
-    def _calculate_kelly_fraction(self, edge_pct: float, fill_probability: float = 0.7) -> float:
+    def _calculate_kelly_fraction(
+        self,
+        edge_pct: float,
+        fill_probability: float = 0.7,
+        fees_pct: float = 0.0
+    ) -> float:
         """
-        Per Grok Round 20 CRITICAL: Calculate Kelly fraction for position sizing.
+        Per Grok Round 20/23: Calculate variance-aware Kelly fraction for position sizing.
+
+        Per Grok Round 23: Full rn1-accurate Kelly formula:
+        f* = max(0, (edge - fees) / variance)
+
+        rn1's smooth compounding from $1k to $2M came from variance-aware sizing:
+        - Early trades: Ultra-conservative (0.5% max)
+        - After 100+ trades: Full Kelly with historical variance
+        - Fractional Kelly (0.5x): Conservative, reduces volatility
 
         Kelly criterion = edge / variance = (p*b - q) / b
         Where:
@@ -310,8 +336,9 @@ class RiskManager:
         - b = win/loss ratio
 
         For arb trading with expected edge:
-        - Simplified Kelly = edge / variance_of_returns
+        - Simplified Kelly = (edge - fees) / variance_of_returns
         - Capped at 2-5% max to be conservative (fractional Kelly)
+        - Uses config.trading.kelly_fraction for fractional multiplier
 
         Per Final Audit: Require 100+ trades before full Kelly to avoid
         over-aggressive sizing with unreliable variance estimates.
@@ -319,10 +346,17 @@ class RiskManager:
         Args:
             edge_pct: Expected edge as decimal (e.g., 0.01 for 1%).
             fill_probability: Probability order will fill (0-1).
+            fees_pct: Expected fees as decimal (taker fee - maker rebate).
 
         Returns:
             Kelly fraction (0 to kelly_max_fraction).
         """
+        # Per Grok Round 23: Check if Kelly sizing is enabled in config
+        use_kelly = getattr(self.config.trading, 'use_kelly_sizing', True)
+        if not use_kelly:
+            # Legacy fixed-percentage mode
+            return min(edge_pct * 0.5, self._kelly_max_fraction)
+
         # Per Final Audit: Need minimum trades for reliable variance
         # Early trades use ultra-conservative 0.5% max
         if self._total_trades_for_kelly < self._kelly_min_trades:
@@ -339,28 +373,44 @@ class RiskManager:
             # Use conservative default: 1% max until we have data
             return min(edge_pct * 0.5, 0.01)
 
+        # Per Grok Round 23: rn1-accurate Kelly formula
+        # f* = max(0, (edge - fees) / variance)
         # Calculate variance of recent returns
         returns = list(self._recent_returns)
         mean_return = sum(returns) / len(returns)
         variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
 
+        # Per Grok Round 23: Include partial fill variance in calculation
+        # Partial fills add variance (50% win rate vs 95% for full fills)
+        # Adjust variance upward if we've had many partials
+        partial_count = sum(1 for t in self._trade_history[-100:] if getattr(t, 'was_partial', False))
+        if partial_count > 0:
+            partial_ratio = partial_count / min(len(self._trade_history), 100)
+            # Partials have higher variance - adjust
+            variance_boost = 1 + (partial_ratio * 0.5)  # Up to 50% extra variance
+            variance *= variance_boost
+
         # Add small epsilon to avoid division by zero
         variance = max(variance, 1e-6)
 
-        # Kelly fraction = expected_edge / variance
+        # Per Grok Round 23: Full rn1-accurate Kelly formula
+        # f* = max(0, (edge - fees) / variance)
         # Adjust edge by fill probability (unfilled orders = 0 return)
-        adjusted_edge = edge_pct * fill_probability
-        kelly = adjusted_edge / variance
+        adjusted_edge = (edge_pct - fees_pct) * fill_probability
+        kelly = max(0, adjusted_edge / variance)
 
-        # Apply fractional Kelly (50% Kelly is more conservative)
-        kelly = kelly * 0.5
+        # Per Grok Round 23: Apply configurable fractional Kelly
+        # Default 0.5 = half-Kelly (conservative), rn1 likely used 0.25-0.5
+        kelly_fraction = getattr(self.config.trading, 'kelly_fraction', 0.5)
+        kelly = kelly * kelly_fraction
 
         # Clamp to bounds
         kelly = max(self._kelly_min_fraction, min(kelly, self._kelly_max_fraction))
 
         logger.debug(
-            f"Kelly sizing: edge={edge_pct*100:.2f}%, fill_prob={fill_probability:.0%}, "
-            f"variance={variance:.6f}, kelly={kelly*100:.2f}%"
+            f"Kelly sizing: edge={edge_pct*100:.2f}%, fees={fees_pct*100:.2f}%, "
+            f"fill_prob={fill_probability:.0%}, variance={variance:.6f}, "
+            f"kelly_frac={kelly_fraction:.0%}, kelly={kelly*100:.2f}%"
         )
 
         return kelly
@@ -430,6 +480,19 @@ class RiskManager:
         absolute_max = self.config.trading.absolute_max_trade_size_usd
         position_size = min(position_size, absolute_max)
 
+        # Per Grok Round 22: rn1-accurate early-stage hard cap
+        # Until capital > $10k, use $30 max per trade (ultra-conservative ramp)
+        # This prevents oversized early trades from depleting small accounts
+        RN1_EARLY_STAGE_CAPITAL_THRESHOLD = 10000.0  # $10k
+        RN1_EARLY_STAGE_MAX_TRADE = 30.0  # $30 max
+        if self._current_capital < RN1_EARLY_STAGE_CAPITAL_THRESHOLD:
+            if position_size > RN1_EARLY_STAGE_MAX_TRADE:
+                logger.debug(
+                    f"Early-stage cap: ${position_size:.2f} → ${RN1_EARLY_STAGE_MAX_TRADE:.2f} "
+                    f"(capital ${self._current_capital:.2f} < ${RN1_EARLY_STAGE_CAPITAL_THRESHOLD:.0f})"
+                )
+                position_size = RN1_EARLY_STAGE_MAX_TRADE
+
         # Per Grok Round 7: Apply edge model expectancy adjustment
         # Reduce size in hot markets where fill probability is lower
         if self._edge_model is not None:
@@ -482,10 +545,15 @@ class RiskManager:
         latency_ms: float
     ) -> float:
         """
-        Per Grok Round 7: Apply edge model expectancy adjustment to sizing.
+        Per Grok Round 7/23: Apply edge model expectancy adjustment to sizing.
 
         Reduces size in hot markets where fill probability is lower.
         Uses the edge model's optimal sizing calculation.
+
+        Per Grok Round 23: Added explicit heat-based multipliers:
+        - HOT markets (>$500k vol): 50% size reduction
+        - BLAZING markets (live sports): 70% size reduction
+        - rn1 reduced hot market sizes to avoid competition + partials
 
         Args:
             base_size: Initial position size.
@@ -511,6 +579,18 @@ class RiskManager:
                 recent_price_volatility=0.0  # Could be enhanced with actual volatility
             )
 
+            # Per Grok Round 23: Explicit heat-based size reduction
+            # rn1 reduced sizes in hot markets where competition is fierce
+            # Math: Hot markets have e^(-7t) decay rate vs e^(-1t) for cold
+            # At 80ms latency: Hot fill prob = 57% vs Cold = 92%
+            heat_multipliers = {
+                MarketHeat.COLD: 1.0,      # Full size - low competition
+                MarketHeat.WARM: 0.8,      # 80% size
+                MarketHeat.HOT: 0.5,       # 50% size - many competitors
+                MarketHeat.BLAZING: 0.3,   # 30% size - live sports chaos
+            }
+            heat_multiplier = heat_multipliers.get(heat, 0.5)
+
             # Get optimal size from edge model
             estimate = self._edge_model.calculate_optimal_size(
                 raw_edge_pct=edge_pct,
@@ -524,13 +604,17 @@ class RiskManager:
 
             optimal_size = estimate.optimal_size_usd
 
+            # Apply heat multiplier to optimal size
+            heat_adjusted_size = optimal_size * heat_multiplier
+
             # If edge model suggests smaller size, use it
-            if optimal_size < base_size and optimal_size > 0:
+            if heat_adjusted_size < base_size and heat_adjusted_size > 0:
                 logger.debug(
-                    f"Expectancy sizing: ${base_size:.2f} -> ${optimal_size:.2f} "
-                    f"(heat={heat.value}, fill_prob={estimate.fill_probability:.1%})"
+                    f"Expectancy sizing: ${base_size:.2f} -> ${heat_adjusted_size:.2f} "
+                    f"(heat={heat.value}, fill_prob={estimate.fill_probability:.1%}, "
+                    f"heat_mult={heat_multiplier:.0%})"
                 )
-                return optimal_size
+                return heat_adjusted_size
 
             # If edge model suggests zero (expected profit negative), return 0
             if optimal_size == 0 and estimate.fill_probability < 0.05:
@@ -539,7 +623,8 @@ class RiskManager:
                 )
                 return 0
 
-            return base_size
+            # Apply heat multiplier even if optimal_size >= base_size
+            return base_size * heat_multiplier
 
         except Exception as e:
             logger.debug(f"Edge model sizing failed: {e}, using base size")
@@ -856,17 +941,24 @@ class RiskManager:
         """
         return self._trash_mode_enabled
 
-    def is_trash_trade_candidate(self, price: float, is_near_resolution: bool = False) -> bool:
+    def is_trash_trade_candidate(
+        self,
+        price: float,
+        available_depth_usd: float = 0.0,
+        minutes_to_resolution: Optional[float] = None
+    ) -> bool:
         """
-        Per Grok Round 8: Check if a price qualifies for trash volume trading.
+        Per Grok Round 21 CRITICAL: Enhanced trash trade candidate check.
 
-        Trash trades are:
-        - Priced at <$0.03 (near-certain losers)
-        - Near resolution (within 24h) - price won't recover
+        Trash trades are rn1's KEY META for airdrop farming:
+        - Price ≤$0.02 (near-certain losers, 100:1 volume:cost ratio)
+        - Time-to-resolution <10min (price won't recover)
+        - Liquidity >$5k (enough depth to fill orders)
 
         Args:
             price: The ask price for the outcome.
-            is_near_resolution: True if market is <24h from resolution.
+            available_depth_usd: Available liquidity at this price.
+            minutes_to_resolution: Minutes until market resolves (None = unknown).
 
         Returns:
             True if this qualifies as a trash trade candidate.
@@ -874,60 +966,116 @@ class RiskManager:
         if not self._trash_mode_enabled:
             return False
 
+        # Price check: Must be ≤$0.02 for 100:1 volume ratio
         if price > self._trash_mode_max_price:
             return False
 
-        # Prefer markets near resolution (price won't recover)
-        # But allow any <$0.03 if trash mode is on
+        # Per Grok Round 21: Liquidity check - need >$5k depth
+        if available_depth_usd < self._trash_mode_min_liquidity_usd:
+            return False
+
+        # Per Grok Round 21: Time-to-resolution check - <10min preferred
+        # If we don't know time, still allow (conservative default)
+        if minutes_to_resolution is not None:
+            if minutes_to_resolution > self._trash_mode_max_time_to_resolution_min:
+                return False
+
         return True
 
-    def get_trash_trade_size(self, price: float, available_depth_usd: float) -> float:
+    def get_trash_trade_size(
+        self,
+        price: float,
+        available_depth_usd: float,
+        minutes_to_resolution: Optional[float] = None
+    ) -> float:
         """
-        Per Grok Round 8: Calculate size for a trash volume trade.
+        Per Grok Round 21: Calculate size for a trash volume trade.
 
-        Trash trades are capped at a small fixed amount to minimize losses
-        while maximizing volume for airdrop farming.
+        rn1 pattern: Buy $50-100 chunks at ≤$0.02 for massive volume:cost ratio.
+        At $0.01, buying $100 = $10,000 volume (100:1 ratio).
 
         Args:
             price: The ask price for the outcome.
             available_depth_usd: Available depth at this price.
+            minutes_to_resolution: Minutes until market resolves.
 
         Returns:
             Trade size in USD (0 if not a valid trash trade).
         """
-        if not self.is_trash_trade_candidate(price):
+        if not self.is_trash_trade_candidate(price, available_depth_usd, minutes_to_resolution):
             return 0.0
 
-        # Cap at trash mode max size
+        # Per Grok Round 21: Size between $50-100 for meaningful volume
+        # Cap at available depth and max size
         size = min(self._trash_mode_max_size_usd, available_depth_usd)
 
-        # Minimum viable size ($1)
-        if size < 1.0:
+        # Minimum viable size ($50) to make volume farming worthwhile
+        if size < self._trash_mode_min_size_usd:
             return 0.0
+
+        # Calculate volume generated (shares * $1 notional)
+        volume_generated = size / price if price > 0 else 0
+        logger.debug(
+            f"Trash trade candidate: ${size:.2f} cost → ${volume_generated:.2f} volume "
+            f"(ratio: {volume_generated/size if size > 0 else 0:.0f}:1)"
+        )
 
         return size
 
-    def record_trash_trade(self, size_usd: float, price: float):
+    def record_trash_trade(self, size_usd: float, price: float) -> bool:
         """
-        Per Grok Round 8: Record a trash volume trade.
+        Per Grok Round 8/21: Record a trash volume trade with enhanced metrics.
 
         Args:
             size_usd: Trade size in USD.
             price: Price paid per share.
+
+        Returns:
+            True if webhook should be sent (hit interval threshold).
         """
         self._trash_mode_trades += 1
         self._trash_mode_volume_usd += size_usd
+
+        # Per Grok Round 21: Track cost (expected loss = size * price since outcome ~0% probability)
+        # At $0.01, cost ≈ 1% of volume → 100:1 volume:cost ratio
+        cost = size_usd * price  # Shares * price = total cost to buy shares
+        self._trash_mode_cost_usd += cost
+
+        # Update running average price
+        if self._trash_mode_trades > 0:
+            self._trash_mode_avg_price = self._trash_mode_cost_usd / self._trash_mode_volume_usd
+
+        # Calculate volume:cost ratio (key metric for rn1 strategy)
+        volume_cost_ratio = self._trash_mode_volume_usd / max(self._trash_mode_cost_usd, 0.01)
+
         logger.info(
             f"TRASH TRADE #{self._trash_mode_trades}: ${size_usd:.2f} @ ${price:.4f} "
-            f"(total trash volume: ${self._trash_mode_volume_usd:.2f})"
+            f"(total: ${self._trash_mode_volume_usd:.2f}, cost: ${self._trash_mode_cost_usd:.2f}, "
+            f"ratio: {volume_cost_ratio:.1f}:1)"
+        )
+
+        # Return True if webhook interval hit
+        return self._trash_mode_trades % 10 == 0  # Every 10 trades
+
+    def record_trash_win(self, win_amount_usd: float):
+        """
+        Per Grok Round 21: Record an unexpected trash trade win.
+
+        Rare but happens - if the 100:1 longshot actually wins, record it.
+        This tracks the extreme value component of trash farming.
+        """
+        self._trash_mode_wins += 1
+        logger.warning(
+            f"TRASH WIN! Unexpected ${win_amount_usd:.2f} profit from trash trade. "
+            f"Total trash wins: {self._trash_mode_wins}"
         )
 
     def get_trash_mode_stats(self) -> Dict[str, Any]:
         """
-        Per Grok Round 8/9: Get trash mode statistics including airdrop projection.
+        Per Grok Round 8/9/21: Get trash mode statistics including airdrop projection.
 
         Returns:
-            Dict with trash mode stats.
+            Dict with trash mode stats including volume:cost ratio.
         """
         # Per Grok Round 9: Calculate projected airdrop equity
         # Formula: trash_volume * (allocation_per_1k / 1000)
@@ -936,10 +1084,21 @@ class RiskManager:
             self._trash_mode_volume_usd * self._airdrop_allocation_per_1k_volume / 1000
         )
 
+        # Per Grok Round 21: Volume:cost ratio (rn1's key metric)
+        # At $0.01 price: $100 buys 10,000 shares = $10k volume for $100 cost = 100:1 ratio
+        volume_cost_ratio = (
+            self._trash_mode_volume_usd / max(self._trash_mode_cost_usd, 0.01)
+            if self._trash_mode_cost_usd > 0 else 0.0
+        )
+
         return {
             "trash_mode_enabled": self._trash_mode_enabled,
             "trash_mode_trades": self._trash_mode_trades,
             "trash_mode_volume_usd": self._trash_mode_volume_usd,
+            "trash_mode_cost_usd": self._trash_mode_cost_usd,
+            "trash_mode_avg_price": self._trash_mode_avg_price,
+            "trash_mode_wins": self._trash_mode_wins,
+            "volume_cost_ratio": volume_cost_ratio,
             "trash_mode_max_price": self._trash_mode_max_price,
             "trash_mode_max_size_usd": self._trash_mode_max_size_usd,
             # Per Grok Round 9: Speculative airdrop projection
@@ -947,6 +1106,26 @@ class RiskManager:
             "projected_airdrop_equity_usd": projected_airdrop_equity,
             "airdrop_allocation_per_1k_volume": self._airdrop_allocation_per_1k_volume,
         }
+
+    def should_send_volume_webhook(self, interval: int = 10) -> bool:
+        """
+        Per Grok Round 21: Check if volume farming webhook should be sent.
+
+        Args:
+            interval: Send webhook every N trash trades (default 10).
+
+        Returns:
+            True if webhook should be sent (hit interval threshold).
+        """
+        if self._trash_mode_trades == 0:
+            return False
+        if self._trash_mode_trades == self._trash_mode_last_webhook_trade:
+            return False
+        # Send every N trades (configurable)
+        if self._trash_mode_trades % interval == 0:
+            self._trash_mode_last_webhook_trade = self._trash_mode_trades
+            return True
+        return False
 
     def check_position_age_risk(self, positions: List[Position]) -> List[Position]:
         """

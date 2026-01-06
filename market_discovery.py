@@ -781,10 +781,14 @@ class MarketDiscovery:
         """
         Check if market is in-play using API status fields.
 
+        Per Grok Round 23: Enhanced with keyword detection in question text.
+        rn1 targeted LIVE sports - question text often indicates game status.
+
         Looks for explicit in-play indicators from the API:
         - enableOrderBook: True (active trading)
         - game_start_time: Past but game not ended
         - Tags containing 'in-play', 'live', etc.
+        - Question text keywords: 'live', 'today', 'vs', 'match', etc.
 
         Args:
             market_data: Raw market data from API.
@@ -798,6 +802,38 @@ class MarketDiscovery:
             tag_labels = [t.get("label", "").lower() if isinstance(t, dict) else str(t).lower() for t in tags]
             if any(label in ["in-play", "live", "in play", "in_play"] for label in tag_labels):
                 return True
+
+        # Per Grok Round 23: Check question text for in-play keywords
+        # rn1 targeted live games - questions often have "vs", "today", "live", etc.
+        question = market_data.get("question", "").lower()
+        description = market_data.get("description", "").lower()
+        combined_text = f"{question} {description}"
+
+        in_play_keywords = [
+            "live", "today", " vs ", " v ", "match", "game",
+            "half", "halftime", "quarter", "period", "inning",
+            "set", "frame", "round", "overtime", "extra time",
+            "score", "winning", "leading", "trailing"
+        ]
+        if any(kw in combined_text for kw in in_play_keywords):
+            # Keyword match - check if orderbook is active
+            if market_data.get("enableOrderBook") is True:
+                if not market_data.get("closed", False):
+                    return True
+
+        # Per Grok Round 23: Check for soccer 3-way pattern (Home/Draw/Away)
+        # Soccer 3-way is rn1's primary target - always high priority
+        outcomes_raw = market_data.get("outcomes", "[]")
+        try:
+            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+            if isinstance(outcomes, list) and len(outcomes) == 3:
+                outcome_str = " ".join(str(o).lower() for o in outcomes)
+                if "draw" in outcome_str or "tie" in outcome_str:
+                    # 3-way with Draw = soccer-style market
+                    if market_data.get("enableOrderBook") is True:
+                        return True
+        except (json.JSONDecodeError, TypeError):
+            pass
 
         # Check if orderbook is enabled (live trading = likely in-play)
         if market_data.get("enableOrderBook") is True:

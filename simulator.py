@@ -38,11 +38,11 @@ RN1_PROFILE = {
 
     # Sport distribution (observed)
     "sport_weights": {
-        "soccer": 0.45,      # 45% of trades
-        "basketball": 0.20,
-        "football": 0.15,
-        "politics": 0.10,
-        "other": 0.10
+        # Soccer 3-way: Home Win / Draw / Away Win (3 mutually exclusive outcomes)
+        "soccer": 0.50,      # 50% of trades - primary focus
+        "basketball": 0.25,  # NBA, college
+        "football": 0.15,    # NFL
+        "tennis": 0.10       # ATP/WTA matches
     },
 
     # Trade timing patterns (hour of day UTC weights)
@@ -83,11 +83,10 @@ RN1_PROFILE = {
         "enabled": True,
         "lambda_per_game": 10,  # Average trades per burst (Poisson lambda)
         "games_per_hour": {  # Average games running per hour by sport
-            "soccer": 2.5,  # Multiple leagues, overlapping matches
-            "basketball": 1.5,
-            "football": 0.5,
-            "politics": 0.2,  # Debates, announcements
-            "other": 0.3
+            "soccer": 2.5,      # Multiple leagues, overlapping matches - 3-way markets
+            "basketball": 1.5,  # NBA/college games
+            "football": 0.5,    # NFL games
+            "tennis": 0.8       # ATP/WTA matches run concurrently
         },
         "burst_duration_minutes": 90,  # Average game duration
         "inter_trade_seconds": {  # Time between trades in a burst
@@ -746,6 +745,11 @@ class RN1Simulator:
         """
         Simulate a single trade outcome based on RN1 patterns.
 
+        Per Grok Round 23: Dynamic win rate based on fill type.
+        - Full fills: 95% win rate (fully hedged arbs)
+        - Partial fills: 50% win rate (exposure risk, some hedged)
+        - rn1's observed 68% was BEFORE hedging; after hedging ~95%
+
         Returns:
             Tuple of (success, profit/loss, outcome_reason)
         """
@@ -762,15 +766,29 @@ class RN1Simulator:
         # Check for partial fill
         if random.random() < self.profile["partial_fill_rate"]:
             self._partial_fills += 1
-            # Partial fills typically break even after hedging
-            return True, 0.0, "partial_fill"
+            # Per Grok Round 23: Partial fills have LOWER win rate (50% vs 95%)
+            # Some get hedged successfully, some leave exposure
+            # rn1's observed 68% included these partials dragging down the avg
+            partial_win_rate = 0.50  # 50% for partials (unhedged exposure risk)
 
-        # Successful execution - check if arb was captured
-        if random.random() < self.profile["win_rate"]:
+            if random.random() < partial_win_rate:
+                # Partial that got hedged successfully - small profit
+                profit = trade_size * margin * 0.3  # 30% of full margin
+                return True, profit, "partial_win"
+            else:
+                # Partial with exposure - market moved against us
+                loss = -trade_size * margin * 0.5  # Lose half the margin
+                return True, loss, "partial_loss"
+
+        # Successful FULL execution - 95% win rate (fully hedged arbs)
+        # Per Grok Round 23: Full fills are nearly guaranteed profit
+        full_fill_win_rate = self.profile["win_rate"]  # 95%
+
+        if random.random() < full_fill_win_rate:
             profit = trade_size * margin
             return True, profit, "win"
         else:
-            # Losing trade (market moved against us)
+            # Losing trade (market moved against us during execution)
             # Assume we lose the margin we were trying to capture
             loss = -trade_size * margin * 0.5  # Assume partial loss
             return True, loss, "loss"

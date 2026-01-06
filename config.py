@@ -41,10 +41,12 @@ class TradingConfig:
     """Trading parameters and thresholds."""
 
     # Minimum market volume in USD to consider for trading
-    # Per Grok audit: Lowered to 5k for in-play focus - live sports games often have
-    # lower individual market volume than politics but higher arb frequency.
-    # rn1 captured many small in-play markets with tight spreads.
-    min_volume_usd: float = 5_000  # Lowered from 10k to catch more in-play opps
+    # Per Grok Round 23 CRITICAL: rn1's $27 avg trade size means they captured
+    # MANY small markets that higher thresholds miss. Dune shows rn1 traded
+    # markets as low as $100-500 volume during live games.
+    # Focus: Soccer 3-way (Home Win / Draw / Away Win), NBA, NFL, Tennis
+    # $5k was missing 80% of rn1's opportunity set - lowered to $500
+    min_volume_usd: float = 500  # Per Grok Round 23: rn1 traded tiny live markets
 
     # Minimum orderbook depth in USD at best price level
     # Lowered to catch more opportunities with smaller depths
@@ -208,6 +210,21 @@ class TradingConfig:
     # Partial pause duration in seconds
     partial_pause_duration: float = 600  # 10 minutes
 
+    # Per Grok Round 23: Kelly mode toggle for variance-aware position sizing
+    # When True: f* = max(0, (edge - fees) / variance) - smooth compounding like rn1
+    # When False: Fixed percentage sizing (legacy mode)
+    # rn1's smooth curve from $1k to $2M came from variance-aware Kelly
+    use_kelly_sizing: bool = field(
+        default_factory=lambda: os.getenv("USE_KELLY_SIZING", "true").lower() == "true"
+    )
+
+    # Kelly sizing safety multiplier (fractional Kelly)
+    # 0.5 = half-Kelly (conservative), 1.0 = full Kelly (aggressive)
+    # rn1 likely used 0.25-0.5 (ultra-conservative) given smooth compounding
+    kelly_fraction: float = field(
+        default_factory=lambda: float(os.getenv("KELLY_FRACTION", "0.5"))
+    )
+
     # Active trading hours (UTC) for optimized polling
     active_hours_start: int = 8   # 08:00 UTC
     active_hours_end: int = 23    # 23:00 UTC
@@ -228,6 +245,18 @@ class TradingConfig:
     # Supports Discord/Telegram webhook URLs
     big_arb_webhook_url: str = field(
         default_factory=lambda: os.getenv("BIG_ARB_WEBHOOK_URL", "")
+    )
+
+    # Per Grok Round 21: Webhook URL for volume farming stats (airdrop tracking)
+    # Reports: total volume, trash trades, projected airdrop equity, volume:cost ratio
+    # Sends periodic updates every N trash trades (default: every 10 trades)
+    volume_farming_webhook_url: str = field(
+        default_factory=lambda: os.getenv("VOLUME_FARMING_WEBHOOK_URL", "")
+    )
+
+    # How often to send volume farming webhook (every N trash trades)
+    volume_farming_webhook_interval: int = field(
+        default_factory=lambda: int(os.getenv("VOLUME_FARMING_WEBHOOK_INTERVAL", "10"))
     )
 
     # Burst parallel execution: minimum depth ratio (vs min_depth) to split across wallets
@@ -608,17 +637,25 @@ def load_config() -> BotConfig:
 def calculate_dynamic_threshold(
     trade_size_usd: float,
     num_outcomes: int,
-    config: TradingConfig
+    config: TradingConfig,
+    latency_ms: float = 80.0,
+    is_ws_connected: bool = True
 ) -> float:
     """
-    Calculate dynamic arbitrage threshold based on trade size and gas costs.
+    Per Grok Round 22: Calculate dynamic arbitrage threshold based on trade size,
+    gas costs, and latency.
 
-    Formula: threshold = base_threshold + (gas_buffer * num_outcomes) / trade_size
+    Formula: threshold = base + gas_drag + latency_penalty
+
+    With good WS (<100ms), chase tighter 0.3-0.5% edges like rn1.
+    With HTTP only (>500ms), require larger edge to compensate for stale data.
 
     Args:
         trade_size_usd: Planned trade size in USD.
         num_outcomes: Number of outcomes in the market.
         config: Trading configuration.
+        latency_ms: Current latency in milliseconds (WS ~50-80ms, HTTP ~500-800ms).
+        is_ws_connected: True if WebSocket is connected.
 
     Returns:
         Dynamic threshold as decimal (e.g., 0.012 for 1.2%).
@@ -631,8 +668,27 @@ def calculate_dynamic_threshold(
 
     # Dynamic threshold = base + gas drag
     gas_drag = total_gas_cost / trade_size_usd
+    base_threshold = config.arb_threshold_base + gas_drag
 
-    return config.arb_threshold_base + gas_drag
+    # Per Grok Round 22: Latency-based threshold adjustment
+    # rn1 pattern: With fast WS, chase 0.3-0.5% edges
+    # With slow HTTP, require 1.5%+ edge to compensate for stale data
+    #
+    # Formula: latency_penalty = λ * latency_ms / 1000
+    # Where λ = 0.01 (1% penalty per second of latency)
+    LATENCY_PENALTY_COEFFICIENT = 0.01  # 1% per second
+
+    if is_ws_connected and latency_ms < 200:
+        # Good WS connection - can chase tighter edges
+        # Reduce threshold slightly for fast execution
+        latency_bonus = max(0, 0.002 - (latency_ms / 50000))  # Up to 0.2% bonus
+        threshold = max(0.003, base_threshold - latency_bonus)  # Floor at 0.3%
+    else:
+        # HTTP fallback or high latency - add penalty
+        latency_penalty = LATENCY_PENALTY_COEFFICIENT * (latency_ms / 1000)
+        threshold = base_threshold + latency_penalty
+
+    return threshold
 
 
 def calculate_rn1_style_size(

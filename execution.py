@@ -50,12 +50,13 @@ import time
 class IdempotencyTracker:
     """Track recent arb IDs to prevent duplicates on restart/reconnect."""
 
-    def __init__(self, ttl_seconds: int = 300):
-        # TTL increased to 300s (5 min) from 60s per audit
-        # Fast reconnects or WS->HTTP fallback can re-detect same arb within minutes
+    def __init__(self, ttl_seconds: int = 1800):
+        # Per Grok Round 21: TTL increased to 1800s (30 min) from 300s
+        # Supervisor restarts or WS reconnects can re-detect slow-decaying arbs
+        # Sports events can have arbs persist for 10+ minutes in low-liquidity windows
         self.ttl_seconds = ttl_seconds
         self._recent_arbs: OrderedDict[str, float] = OrderedDict()  # arb_id -> timestamp
-        self._max_entries = 1000  # Prevent unbounded growth
+        self._max_entries = 10000  # Per Grok Round 21: Increased from 1000 for 100+ arbs/day
 
     def _generate_arb_id(self, market_id: str, profit_margin: float, trade_size: float) -> str:
         """Generate unique arb ID from market + margin + size."""
@@ -1896,7 +1897,19 @@ class ExecutionEngine:
         wallet_state: Optional[Any] = None
     ) -> List[OrderResult]:
         """
-        Execute a buy arbitrage (buy all outcomes).
+        Execute a buy arbitrage (buy all outcomes) with atomic-or-failsafe pattern.
+
+        Per Grok Round 21 CRITICAL: Polymarket has NO atomic multi-leg bundles.
+        Sequential/parallel placement of individual orders = race window where
+        1-2 legs fill before arb disappears → naked directional exposure.
+
+        Strategy (atomic-or-failsafe):
+        1. Place ALL legs as post-only limits simultaneously (maker priority)
+        2. Wait 300ms strict timeout for fills
+        3. Check fill status - if ANY leg unfilled, cancel ALL + hedge filled legs
+        4. Only accept complete fills across all legs
+
+        This is how rn1 avoids exposure: tiny sizes + immediate hedge on partials.
 
         Args:
             opportunity: The arb opportunity.
@@ -1906,6 +1919,9 @@ class ExecutionEngine:
         orders = []
         orderbooks = opportunity.orderbooks
 
+        # Per Grok Round 21: Strict atomic timeout - 300ms max for arb window
+        ATOMIC_TIMEOUT_MS = 300
+
         # Get execution client (use provided or get from wallet manager)
         exec_client = client
         exec_wallet = wallet_state
@@ -1914,67 +1930,305 @@ class ExecutionEngine:
                 min_balance=opportunity.trade_size_usd
             )
 
-        # Determine order placement method (post-only or FOK)
-        use_post_only = self.config.trading.use_post_only
+        # Per Grok Round 21: Pre-execution depth check at EXACT prices
+        # Verify depth still exists before placing orders
+        for outcome in opportunity.market.outcomes:
+            size_usd = opportunity.outcome_sizes.get(outcome.token_id, 0)
+            if size_usd > 0:
+                ob = orderbooks.get_orderbook(outcome.token_id)
+                if not ob or not ob.best_ask:
+                    logger.warning(f"Pre-exec depth check: No ask for {outcome.name}")
+                    return orders  # Abort - missing depth
 
-        # Create tasks for all buy orders
-        tasks = []
+                available_depth = ob.best_ask_size * ob.best_ask_price
+                if available_depth < size_usd * 0.8:  # Need at least 80% depth
+                    logger.warning(
+                        f"Pre-exec depth check: Insufficient depth for {outcome.name} "
+                        f"(need ${size_usd:.2f}, have ${available_depth:.2f})"
+                    )
+                    return orders  # Abort - insufficient depth
+
+        # Phase 1: Place ALL legs as post-only limits simultaneously
+        # Per Grok Round 21: Use _place_atomic_leg for strict post-only (no FAK fallback)
+        placement_tasks = []
+        leg_info = []  # Track order info for cancel/hedge
+
         for outcome in opportunity.market.outcomes:
             size_usd = opportunity.outcome_sizes.get(outcome.token_id, 0)
             if size_usd > 0:
                 ob = orderbooks.get_orderbook(outcome.token_id)
                 price = ob.best_ask_price if ob and ob.best_ask else 0
 
-                if use_post_only:
-                    tasks.append(
-                        self._place_post_only_order(
-                            token_id=outcome.token_id,
-                            outcome_name=outcome.name,
-                            side=BUY,
-                            size_usd=size_usd,
-                            limit_price=price,
-                            edge_pct=opportunity.profit_margin,
-                            client=exec_client,
-                            wallet_state=exec_wallet
-                        )
-                    )
-                else:
-                    tasks.append(
-                        self._place_market_order(
-                            token_id=outcome.token_id,
-                            outcome_name=outcome.name,
-                            side=BUY,
-                            size_usd=size_usd,
-                            limit_price=price,
-                            client=exec_client,
-                            wallet_state=exec_wallet
-                        )
-                    )
+                leg_info.append({
+                    "token_id": outcome.token_id,
+                    "outcome_name": outcome.name,
+                    "size_usd": size_usd,
+                    "price": price
+                })
 
-        # Execute all orders concurrently
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+                placement_tasks.append(
+                    self._place_atomic_leg(
+                        token_id=outcome.token_id,
+                        outcome_name=outcome.name,
+                        side=BUY,
+                        size_usd=size_usd,
+                        limit_price=price,
+                        edge_pct=opportunity.profit_margin,
+                        client=exec_client
+                    )
+                )
 
-        for result in results:
+        # Execute all placements simultaneously
+        placement_start = time.time()
+        placement_results = await asyncio.gather(*placement_tasks, return_exceptions=True)
+
+        # Collect order IDs and initial results
+        order_ids = []
+        for i, result in enumerate(placement_results):
             if isinstance(result, OrderResult):
                 orders.append(result)
+                if result.order_id:
+                    order_ids.append((result.order_id, leg_info[i]))
             elif isinstance(result, Exception):
-                logger.error(f"Order failed: {result}")
+                logger.error(f"Atomic leg placement failed: {result}")
                 orders.append(OrderResult(
-                    token_id="unknown",
-                    outcome_name="unknown",
+                    token_id=leg_info[i]["token_id"] if i < len(leg_info) else "unknown",
+                    outcome_name=leg_info[i]["outcome_name"] if i < len(leg_info) else "unknown",
                     side="BUY",
-                    requested_size_usd=0,
+                    requested_size_usd=leg_info[i]["size_usd"] if i < len(leg_info) else 0,
                     status=OrderStatus.FAILED,
                     error=str(result)
                 ))
 
+        # Phase 2: Wait strict timeout then check fills
+        elapsed_ms = (time.time() - placement_start) * 1000
+        remaining_wait = max(0, (ATOMIC_TIMEOUT_MS - elapsed_ms) / 1000)
+        if remaining_wait > 0:
+            await asyncio.sleep(remaining_wait)
+
+        # Phase 3: Check fill status for ALL legs
+        filled_legs = []
+        unfilled_legs = []
+
+        for order in orders:
+            if order.order_id and exec_client:
+                try:
+                    order_status = await run_sync_in_thread(exec_client.get_order, order.order_id)
+                    if order_status:
+                        filled_size = float(order_status.get("sizeFilled", 0))
+                        total_size = float(order_status.get("size", 0))
+
+                        if filled_size > 0:
+                            order.executed_size_usd = filled_size * order.price
+                            if filled_size >= total_size * 0.95:  # 95%+ = filled
+                                order.status = OrderStatus.FILLED
+                                filled_legs.append(order)
+                            else:
+                                order.status = OrderStatus.PARTIAL
+                                unfilled_legs.append(order)
+                        else:
+                            unfilled_legs.append(order)
+                except Exception as e:
+                    logger.debug(f"Error checking order {order.order_id}: {e}")
+                    unfilled_legs.append(order)
+            else:
+                if order.status == OrderStatus.FILLED:
+                    filled_legs.append(order)
+                else:
+                    unfilled_legs.append(order)
+
+        # Phase 4: Atomic decision - ALL filled or CANCEL + HEDGE
+        all_legs_filled = len(unfilled_legs) == 0 and len(filled_legs) == len(leg_info)
+
+        if not all_legs_filled:
+            # Per Grok Round 21: NOT atomic - cancel unfilled + hedge filled immediately
+            logger.warning(
+                f"ATOMIC FAILSAFE: {len(filled_legs)}/{len(leg_info)} legs filled, "
+                f"cancelling {len(unfilled_legs)} unfilled + hedging filled"
+            )
+
+            # Cancel all unfilled orders immediately
+            cancel_tasks = []
+            for order in orders:
+                if order.order_id and order.status not in (OrderStatus.FILLED, OrderStatus.CANCELLED):
+                    cancel_tasks.append(self._cancel_order_safe(exec_client, order.order_id))
+
+            if cancel_tasks:
+                await asyncio.gather(*cancel_tasks, return_exceptions=True)
+
+            # Immediately hedge any filled legs (sell what we bought)
+            if filled_legs:
+                hedge_tasks = []
+                for filled_order in filled_legs:
+                    if filled_order.executed_size_usd > 0:
+                        hedge_tasks.append(
+                            self._place_atomic_hedge(
+                                token_id=filled_order.token_id,
+                                outcome_name=f"hedge_{filled_order.outcome_name}",
+                                size_usd=filled_order.executed_size_usd,
+                                limit_price=filled_order.price,
+                                client=exec_client
+                            )
+                        )
+
+                if hedge_tasks:
+                    hedge_results = await asyncio.gather(*hedge_tasks, return_exceptions=True)
+                    hedged_usd = sum(
+                        r.executed_size_usd for r in hedge_results
+                        if isinstance(r, OrderResult) and r.status == OrderStatus.FILLED
+                    )
+                    logger.info(f"Atomic hedge completed: ${hedged_usd:.2f} hedged of ${sum(o.executed_size_usd for o in filled_legs):.2f}")
+
+            # Mark result as incomplete
+            for order in orders:
+                if order.status not in (OrderStatus.FILLED, OrderStatus.CANCELLED):
+                    order.status = OrderStatus.CANCELLED
+        else:
+            # All legs filled - success!
+            self._maker_fills += len(filled_legs)
+            self._maker_volume_usd += sum(o.executed_size_usd for o in filled_legs)
+            logger.info(f"ATOMIC SUCCESS: All {len(leg_info)} legs filled")
+
         # Record execution in wallet manager
         if exec_wallet and self._wallet_manager:
-            total_executed = sum(o.executed_size_usd for o in orders)
-            success = any(o.status == OrderStatus.FILLED for o in orders)
+            total_executed = sum(o.executed_size_usd for o in orders if o.status == OrderStatus.FILLED)
+            success = all_legs_filled
             self._wallet_manager.record_execution(exec_wallet, total_executed, success)
 
         return orders
+
+    async def _place_atomic_leg(
+        self,
+        token_id: str,
+        outcome_name: str,
+        side: str,
+        size_usd: float,
+        limit_price: float,
+        edge_pct: float = 0.0,
+        client: Optional[ClobClient] = None
+    ) -> OrderResult:
+        """
+        Place a single leg of an atomic arb - pure post-only, no FAK fallback.
+
+        Per Grok Round 21: Atomic legs MUST be post-only. FAK fallback defeats
+        atomicity because we'd accept partial fills on individual legs.
+
+        Returns OrderResult with order_id for status checking.
+        """
+        execution_client = client or self.client
+        base_improvement = self.config.trading.post_only_price_improvement
+
+        result = OrderResult(
+            token_id=token_id,
+            outcome_name=outcome_name,
+            side="BUY" if side == BUY else "SELL",
+            requested_size_usd=size_usd,
+            price=limit_price
+        )
+
+        # Dynamic price improvement for maker fills
+        price_improvement = base_improvement + (edge_pct * 0.5)
+        price_improvement = min(price_improvement, 0.03)
+
+        if side == BUY:
+            post_price = min(limit_price + price_improvement, 0.99)
+        else:
+            post_price = max(limit_price - price_improvement, 0.01)
+
+        try:
+            size_shares = size_usd / post_price if post_price > 0 else 0
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=post_price,
+                size=size_shares,
+                side=side,
+            )
+
+            signed_order = await run_sync_in_thread(execution_client.create_order, order_args)
+            response = await run_sync_in_thread(execution_client.post_order, signed_order, OrderType.GTC)
+
+            if response and response.get("success"):
+                result.order_id = response.get("orderID")
+                result.status = OrderStatus.SUBMITTED
+                result.price = post_price
+            else:
+                error_msg = response.get("errorMsg", "Unknown error") if response else "No response"
+                result.status = OrderStatus.FAILED
+                result.error = error_msg
+
+        except Exception as e:
+            result.status = OrderStatus.FAILED
+            result.error = str(e)
+
+        return result
+
+    async def _place_atomic_hedge(
+        self,
+        token_id: str,
+        outcome_name: str,
+        size_usd: float,
+        limit_price: float,
+        client: Optional[ClobClient] = None
+    ) -> OrderResult:
+        """
+        Place immediate hedge for atomic failsafe - aggressive FOK to close exposure.
+
+        Per Grok Round 21: When atomic arb fails, we MUST hedge immediately.
+        Use FOK (all-or-nothing) to guarantee full hedge or nothing.
+        """
+        execution_client = client or self.client
+
+        result = OrderResult(
+            token_id=token_id,
+            outcome_name=outcome_name,
+            side="SELL",  # Hedging = selling what we bought
+            requested_size_usd=size_usd,
+            price=limit_price
+        )
+
+        # Aggressive price for immediate fill - accept up to 2% worse
+        hedge_price = max(limit_price * 0.98, 0.01)
+
+        try:
+            size_shares = size_usd / hedge_price if hedge_price > 0 else 0
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=hedge_price,
+                size=size_shares,
+                side=SELL,
+            )
+
+            signed_order = await run_sync_in_thread(execution_client.create_order, order_args)
+            response = await run_sync_in_thread(execution_client.post_order, signed_order, OrderType.FOK)
+
+            if response and response.get("success"):
+                result.order_id = response.get("orderID")
+                result.status = OrderStatus.FILLED
+                result.executed_size_usd = size_usd
+                result.price = hedge_price
+                logger.debug(f"Atomic hedge FILLED: SELL {outcome_name} ${size_usd:.2f}")
+            else:
+                error_msg = response.get("errorMsg", "Unknown error") if response else "No response"
+                result.status = OrderStatus.FAILED
+                result.error = error_msg
+                logger.warning(f"Atomic hedge FAILED: {error_msg}")
+
+        except Exception as e:
+            result.status = OrderStatus.FAILED
+            result.error = str(e)
+            logger.error(f"Atomic hedge exception: {e}")
+
+        return result
+
+    async def _cancel_order_safe(self, client: ClobClient, order_id: str) -> bool:
+        """Cancel an order safely, ignoring errors if already filled/cancelled."""
+        try:
+            await run_sync_in_thread(client.cancel, order_id)
+            return True
+        except Exception:
+            return False  # Already filled or cancelled
 
     async def _execute_sell_arb(
         self,
@@ -2453,26 +2707,31 @@ class ExecutionEngine:
                         )
                         return result
 
+                    # Per Grok Round 22: STRICT POST-ONLY - retry with improved price instead of FAK
+                    # rn1 NEVER pays taker fees - price improvement retry captures more maker fills
                     remaining_usd = size_usd - filled_usd
                     logger.debug(
-                        f"Post-only partial ({fill_ratio*100:.0f}%), FAK remaining ${remaining_usd:.2f}"
+                        f"Post-only partial ({fill_ratio*100:.0f}%), retrying with improved price "
+                        f"${remaining_usd:.2f}"
                     )
 
-                    # FAK only the remaining unfilled portion
-                    fak_result = await self._place_market_order(
+                    # Retry with price improvement (1 tick = $0.001)
+                    improved_price = post_price + 0.001 if side == BUY else post_price - 0.001
+                    improved_price = max(0.01, min(0.99, improved_price))
+
+                    retry_result = await self._place_post_only_retry(
                         token_id=token_id,
                         outcome_name=outcome_name,
                         side=side,
                         size_usd=remaining_usd,
-                        limit_price=limit_price,
-                        retry_on_no_match=False,
+                        limit_price=improved_price,
                         client=client,
                         wallet_state=wallet_state,
-                        use_ioc=True
+                        max_retries=2  # Up to 2 price improvement retries
                     )
 
                     # Combine results
-                    result.executed_size_usd = filled_usd + fak_result.executed_size_usd
+                    result.executed_size_usd = filled_usd + retry_result.executed_size_usd
                     result.status = OrderStatus.FILLED if result.executed_size_usd >= size_usd * 0.9 else OrderStatus.PARTIAL
                     return result
 
@@ -2494,64 +2753,157 @@ class ExecutionEngine:
                         )
                         return result
 
-                    logger.debug(f"Post-only zero fill after {timeout}s, FAK fallback")
+                    # Per Grok Round 22: STRICT POST-ONLY - retry with improved price, NOT FAK
+                    # rn1 never paid taker fees - accept non-fill over crossing spread
+                    logger.debug(
+                        f"Post-only zero fill after {timeout}s, retrying with improved price (no FAK)"
+                    )
 
-                    return await self._place_market_order(
+                    # Retry with price improvement
+                    improved_price = post_price + 0.001 if side == BUY else post_price - 0.001
+                    improved_price = max(0.01, min(0.99, improved_price))
+
+                    return await self._place_post_only_retry(
                         token_id=token_id,
                         outcome_name=outcome_name,
                         side=side,
                         size_usd=size_usd,
-                        limit_price=limit_price,
-                        retry_on_no_match=True,
+                        limit_price=improved_price,
                         client=client,
                         wallet_state=wallet_state,
-                        use_ioc=True
+                        max_retries=2
                     )
             else:
                 error_msg = response.get("errorMsg", "Unknown error") if response else "No response"
 
-                # Per Grok Round 9: For trash trades, don't fall back to FAK on submission failure
+                # Per Grok Round 9: For trash trades, don't fall back on submission failure
                 if is_trash_trade:
-                    logger.debug(f"TRASH TRADE submission failed: {error_msg} - no FAK fallback")
+                    logger.debug(f"TRASH TRADE submission failed: {error_msg} - no retry")
                     result.status = OrderStatus.FAILED
                     result.error = error_msg
                     return result
 
-                logger.debug(f"Post-only submission failed: {error_msg}, FAK fallback")
-
-                return await self._place_market_order(
-                    token_id=token_id,
-                    outcome_name=outcome_name,
-                    side=side,
-                    size_usd=size_usd,
-                    limit_price=limit_price,
-                    retry_on_no_match=True,
-                    client=client,
-                    wallet_state=wallet_state,
-                    use_ioc=True
-                )
-
-        except Exception as e:
-            # Per Grok Round 9: For trash trades, don't fall back to FAK on exception
-            if is_trash_trade:
-                logger.debug(f"TRASH TRADE exception: {e} - no FAK fallback")
+                # Per Grok Round 22: STRICT POST-ONLY - no FAK fallback on submission failure
+                logger.debug(f"Post-only submission failed: {error_msg}, accepting non-fill (no FAK)")
                 result.status = OrderStatus.FAILED
-                result.error = str(e)
+                result.error = error_msg
                 return result
 
-            logger.debug(f"Post-only exception: {e}, FAK fallback")
+        except Exception as e:
+            # Per Grok Round 9/22: No FAK fallback on exception - accept non-fill
+            logger.debug(f"Post-only exception: {e}, accepting non-fill (no FAK)")
+            result.status = OrderStatus.FAILED
+            result.error = str(e)
+            return result
 
-            return await self._place_market_order(
-                token_id=token_id,
-                outcome_name=outcome_name,
-                side=side,
-                size_usd=size_usd,
-                limit_price=limit_price,
-                retry_on_no_match=True,
-                client=client,
-                wallet_state=wallet_state,
-                use_ioc=True
-            )
+    async def _place_post_only_retry(
+        self,
+        token_id: str,
+        outcome_name: str,
+        side: str,
+        size_usd: float,
+        limit_price: float,
+        client: Optional[ClobClient] = None,
+        wallet_state: Optional[Any] = None,
+        max_retries: int = 2
+    ) -> OrderResult:
+        """
+        Per Grok Round 22: Price-improvement retry for post-only orders.
+
+        rn1 NEVER paid taker fees. Instead of FAK fallback, retry with improved price
+        to capture more maker fills while maintaining maker rebate.
+
+        Args:
+            token_id: Token ID to trade.
+            outcome_name: Name of outcome for logging.
+            side: BUY or SELL.
+            size_usd: Remaining size in USD.
+            limit_price: Starting price (already improved from original).
+            client: Optional CLOB client.
+            wallet_state: Optional wallet state.
+            max_retries: Maximum price improvement retries.
+
+        Returns:
+            OrderResult with execution details.
+        """
+        execution_client = client or self.client
+        timeout = 0.3  # 300ms per retry (faster)
+
+        result = OrderResult(
+            token_id=token_id,
+            outcome_name=outcome_name,
+            side="BUY" if side == BUY else "SELL",
+            requested_size_usd=size_usd,
+            price=limit_price
+        )
+
+        current_price = limit_price
+        total_filled_usd = 0.0
+
+        for retry in range(max_retries):
+            try:
+                size_shares = (size_usd - total_filled_usd) / current_price if current_price > 0 else 0
+                if size_shares <= 0:
+                    break
+
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=current_price,
+                    size=size_shares,
+                    side=side,
+                )
+
+                signed_order = await run_sync_in_thread(execution_client.create_order, order_args)
+                response = await run_sync_in_thread(execution_client.post_order, signed_order, OrderType.GTC)
+
+                if response and response.get("success"):
+                    order_id = response.get("orderID")
+
+                    # Short wait for fill
+                    fill_status = await self._wait_for_fill_with_partial(
+                        execution_client, order_id, timeout, size_shares
+                    )
+
+                    filled_shares = fill_status.get("filled_shares", 0)
+                    filled_usd = filled_shares * current_price
+
+                    # Cancel remaining
+                    try:
+                        await run_sync_in_thread(execution_client.cancel, order_id)
+                    except Exception:
+                        pass
+
+                    if filled_usd > 0:
+                        total_filled_usd += filled_usd
+                        self._maker_fills += 1
+                        self._maker_volume_usd += filled_usd
+                        self._track_maker_rebate(filled_usd)
+
+                        if total_filled_usd >= size_usd * 0.9:
+                            # Good enough fill
+                            result.status = OrderStatus.FILLED
+                            result.executed_size_usd = total_filled_usd
+                            logger.debug(
+                                f"Post-only retry {retry+1}: FILLED ${total_filled_usd:.2f} (MAKER)"
+                            )
+                            return result
+
+                # Improve price for next retry
+                current_price = current_price + 0.001 if side == BUY else current_price - 0.001
+                current_price = max(0.01, min(0.99, current_price))
+
+            except Exception as e:
+                logger.debug(f"Post-only retry {retry+1} error: {e}")
+                break
+
+        # Return whatever we got
+        result.executed_size_usd = total_filled_usd
+        result.status = OrderStatus.PARTIAL if total_filled_usd > 0 else OrderStatus.CANCELLED
+        logger.debug(
+            f"Post-only retry complete: ${total_filled_usd:.2f}/{size_usd:.2f} "
+            f"after {max_retries} retries (MAKER only, no FAK)"
+        )
+        return result
 
     def _track_maker_rebate(self, volume_usd: float):
         """

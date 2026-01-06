@@ -851,6 +851,26 @@ class ArbBot:
         # Update opportunity with safe size
         opportunity.trade_size_usd = min(safe_size, opportunity.trade_size_usd)
 
+        # Per Grok Round 21: WS disconnect → reduce size by 80% + alert webhook
+        # HTTP fallback has ~800ms latency vs ~50ms WS = fill prob drops from ~70% to ~10%
+        # Reduced size limits exposure from stale data trades
+        ws_connected = (
+            self.hybrid_manager is not None and
+            self.hybrid_manager.ws_client is not None and
+            self.hybrid_manager.ws_client.is_connected
+        )
+        if not ws_connected and self._use_websocket:
+            original_size = opportunity.trade_size_usd
+            opportunity.trade_size_usd *= 0.2  # 80% reduction
+            logger.warning(
+                f"WS OFFLINE SIZE REDUCTION: ${original_size:.2f} → ${opportunity.trade_size_usd:.2f} "
+                f"(HTTP fallback = lower fill prob)"
+            )
+            # Re-check minimum size after reduction
+            if opportunity.trade_size_usd < 10:
+                logger.debug(f"Trade size too small after WS reduction: ${opportunity.trade_size_usd:.2f}")
+                return None
+
         # Check if market is in burst mode for parallel execution
         is_burst = self.orderbook_poller.is_burst_market(opportunity.market.condition_id)
 
@@ -894,6 +914,9 @@ class ArbBot:
 
             # Check for big arb alert
             self._check_big_arb_alert(opportunity, result)
+
+            # Per Grok Round 21: Check volume farming webhook
+            self._check_volume_farming_webhook()
 
             # Verify book normalized post-execution
             await self._verify_post_execution_book(opportunity)
@@ -1015,6 +1038,64 @@ class ArbBot:
 
         except Exception as e:
             logger.debug(f"Low gas webhook failed: {e}")
+
+    def _send_volume_farming_webhook(self, webhook_url: str):
+        """
+        Per Grok Round 21: Send volume farming stats webhook.
+
+        Reports total trash volume, cost, volume:cost ratio, and projected airdrop equity.
+        Sent every N trash trades (configurable via VOLUME_FARMING_WEBHOOK_INTERVAL).
+        """
+        try:
+            stats = self.risk_manager.get_trash_mode_stats()
+
+            volume = stats.get('trash_mode_volume_usd', 0)
+            cost = stats.get('trash_mode_cost_usd', 0)
+            trades = stats.get('trash_mode_trades', 0)
+            ratio = stats.get('volume_cost_ratio', 0)
+            projected = stats.get('projected_airdrop_equity_usd', 0)
+            wins = stats.get('trash_mode_wins', 0)
+            avg_price = stats.get('trash_mode_avg_price', 0)
+
+            # Format for Discord/Telegram
+            payload = {
+                "content": (
+                    f"**VOLUME FARMING UPDATE**\n"
+                    f"Trades: {trades}\n"
+                    f"Volume: ${volume:,.2f}\n"
+                    f"Cost: ${cost:,.2f}\n"
+                    f"Ratio: {ratio:.1f}:1\n"
+                    f"Avg Price: ${avg_price:.4f}\n"
+                    f"Wins: {wins}\n"
+                    f"Projected Airdrop: ${projected:.4f}"
+                )
+            }
+
+            if "telegram" in webhook_url.lower():
+                payload = {"text": payload["content"]}
+
+            response = requests.post(webhook_url, json=payload, timeout=5)
+            if response.status_code in (200, 204):
+                logger.info(f"Volume farming webhook sent (trades: {trades})")
+            else:
+                logger.debug(f"Volume farming webhook returned {response.status_code}")
+
+        except Exception as e:
+            logger.debug(f"Volume farming webhook failed: {e}")
+
+    def _check_volume_farming_webhook(self):
+        """
+        Per Grok Round 21: Check if volume farming webhook should be sent.
+
+        Called after each arb execution to check if threshold hit.
+        """
+        webhook_url = self.config.trading.volume_farming_webhook_url
+        if not webhook_url or not HAS_REQUESTS:
+            return
+
+        interval = self.config.trading.volume_farming_webhook_interval
+        if self.risk_manager.should_send_volume_webhook(interval):
+            self._send_volume_farming_webhook(webhook_url)
 
     async def _verify_post_execution_book(self, opportunity: ArbOpportunity):
         """

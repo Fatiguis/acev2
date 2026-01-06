@@ -38,7 +38,19 @@ class ColoredFormatter(logging.Formatter):
     }
     RESET = '\033[0m'
 
+    # Per Grok Round 23: Rate limit patterns to filter (demote 429s to DEBUG)
+    # GitHub: py-clob floods logs with 429s - masks real issues like approval failures
+    RATE_LIMIT_PATTERNS = ['429', 'rate limit', 'too many requests', 'throttl']
+
     def format(self, record: logging.LogRecord) -> str:
+        # Per Grok Round 23: Demote rate limit messages to DEBUG level
+        # Prevents log flooding during high-volume trading
+        msg_lower = str(record.msg).lower() if record.msg else ""
+        if any(pattern in msg_lower for pattern in self.RATE_LIMIT_PATTERNS):
+            if record.levelno > logging.DEBUG:
+                record.levelno = logging.DEBUG
+                record.levelname = 'DEBUG'
+
         # Add color to levelname
         color = self.COLORS.get(record.levelname, self.RESET)
         record.levelname = f"{color}{record.levelname}{self.RESET}"
@@ -148,13 +160,31 @@ def _cleanup_queue_listener():
 
 def cleanup_logging():
     """
-    Per Grok Round 18: Explicit cleanup for supervisor shutdown.
+    Per Grok Round 18/23: Explicit cleanup for supervisor shutdown with flush.
 
     Call this in supervisor cleanup_coro to ensure log flush before exit.
     atexit is unreliable in forked/multithreaded apps and may not fire
     on supervisor kill, orphaning listener thread and losing forensic data.
+
+    Per Grok Round 23: Added explicit queue flush to prevent data loss.
+    GitHub: Threads need explicit stop - rn1's 13K trades need audit-proof logs.
     """
-    _cleanup_queue_listener()
+    global _queue_listener
+
+    # Per Grok Round 23: Flush queue before stopping listener
+    # Ensures all pending log messages are written (forensic data for audits)
+    if _queue_listener is not None:
+        try:
+            # Signal queue to flush by enqueueing sentinel
+            # QueueListener.stop() calls queue.put_nowait(self._sentinel)
+            _queue_listener.stop()
+            _queue_listener = None
+            logging.getLogger().info("Log queue flushed and listener stopped")
+        except Exception as e:
+            # Last-resort stderr logging if logger broken
+            import sys
+            print(f"[CLEANUP] Log flush error: {e}", file=sys.stderr)
+
     logging.shutdown()
 
 

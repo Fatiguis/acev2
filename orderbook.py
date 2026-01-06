@@ -825,21 +825,15 @@ class OrderbookPoller:
         dynamic_threshold: float
     ) -> Optional[Tuple[List[Orderbook], float]]:
         """
-        Per Grok Round 20 CRITICAL: Detect subset arb in multi-outcome markets.
+        Per Grok Round 22: Linear O(n) multi-outcome arb detection.
 
-        For markets with 3+ outcomes (e.g., election with multiple candidates),
-        simple sum(asks) < 1 is insufficient. We need to find subsets where:
-        - Buying the subset of outcomes guarantees a $1 payout
-        - Sum of asks for subset < $1 - threshold
+        rn1 pattern: Winner-take-all check - for each outcome, calculate cost
+        to buy ALL OTHER outcomes. If any single exclusion yields arb, execute.
 
-        In prediction markets, buying ALL outcomes guarantees $1.
-        But in some structures (neg-risk), buying a SUBSET can also guarantee $1
-        if the subset covers all mutually exclusive outcomes.
-
-        For efficiency, we use a greedy approach:
-        1. Sort outcomes by ask price (cheapest first)
-        2. Accumulate outcomes until sum >= 1-threshold
-        3. If any prefix has sum < 1-threshold, that's our arb
+        This is O(n) instead of O(2^n) and matches rn1's soccer focus:
+        - 3-outcome markets (win/draw/win): check 3 exclusions
+        - 4-outcome markets: check 4 exclusions
+        - Skip >4 outcomes (exotic markets not worth compute)
 
         Args:
             orderbooks: List of orderbooks for all outcomes.
@@ -850,50 +844,117 @@ class OrderbookPoller:
             Tuple of (selected_orderbooks, profit_margin) if arb found, None otherwise.
         """
         n = len(orderbooks)
+
+        # Binary markets handled by simple sum check
         if n <= 2:
-            # Binary markets handled by simple sum check
             return None
 
-        # For ternary+ markets, check subset combinations
-        # Polymarket's neg-risk markets: any single outcome winning pays $1
-        # So buying all outcomes is overkill - we need MINIMUM cost to cover
+        # Per Grok Round 21/22: SKIP markets with >4 outcomes
+        MAX_OUTCOMES_FOR_SUBSET = 4
+        if n > MAX_OUTCOMES_FOR_SUBSET:
+            logger.debug(
+                f"Skipping multi-outcome arb for {n} outcomes (max: {MAX_OUTCOMES_FOR_SUBSET})"
+            )
+            return None
 
-        # Sort by ask price ascending (greedy: buy cheapest first)
-        sorted_obs = sorted(orderbooks, key=lambda ob: ob.best_ask_price)
+        # Per Grok Round 22: LINEAR O(n) winner-take-all pattern
+        # For neg-risk markets, owning (n-1) outcomes guarantees $1 payout
+        # Check: for each outcome i, cost to buy all outcomes EXCEPT i
+        #
+        # Formula: cost_excluding_i = total_cost - ask_price_i
+        # If cost_excluding_i < $1, we have an arb
 
-        # Strategy 1: Check if sum of N-1 cheapest outcomes < 1-threshold
-        # This is the most common profitable pattern
-        # If outcome A is expensive, buying all others (B,C,D...) cheaper
-        for exclude_count in range(1, min(n, 4)):  # Try excluding 1-3 outcomes
-            for exclude_combo in combinations(range(n), exclude_count):
-                exclude_set = set(exclude_combo)
-                selected = [ob for i, ob in enumerate(sorted_obs) if i not in exclude_set]
+        # Check if neg-risk (required for subset arb)
+        is_neg_risk = hasattr(market, 'neg_risk') and market.neg_risk
+        if not is_neg_risk:
+            # Standard market - must buy ALL outcomes, no subset arb possible
+            # Fall through to full market check below
+            sum_all_asks = sum(ob.best_ask_price for ob in orderbooks)
+            if sum_all_asks < (1.0 - dynamic_threshold):
+                return (orderbooks, 1.0 - sum_all_asks)
+            return None
 
-                if not selected:
-                    continue
+        # Calculate total cost (sum of all asks)
+        total_cost = sum(ob.best_ask_price for ob in orderbooks)
 
-                sum_selected_asks = sum(ob.best_ask_price for ob in selected)
+        # O(n) loop: check each single-exclusion
+        best_margin = 0.0
+        best_selection = None
 
-                # Check if this subset has arbitrage opportunity
-                # Note: This assumes market structure where any subset of outcomes
-                # can payout $1 (which is true for neg-risk/election style)
-                # For standard markets where you MUST own all outcomes, skip this
-                if hasattr(market, 'neg_risk') and not market.neg_risk:
-                    # Standard market - must buy ALL outcomes, no subset arb
-                    continue
+        for excluded_idx in range(n):
+            # Cost excluding this outcome
+            excluded_price = orderbooks[excluded_idx].best_ask_price
+            cost_excluding = total_cost - excluded_price
 
-                profit_margin = 1.0 - sum_selected_asks
-                if profit_margin > dynamic_threshold:
-                    logger.debug(
-                        f"Multi-outcome subset arb: {len(selected)}/{n} outcomes, "
-                        f"sum_asks={sum_selected_asks:.4f}, margin={profit_margin*100:.2f}%"
-                    )
-                    return (selected, profit_margin)
+            # Profit margin if we buy all except this one
+            margin = 1.0 - cost_excluding
 
-        # Strategy 2: Full market arb (standard check)
-        sum_all_asks = sum(ob.best_ask_price for ob in orderbooks)
-        if sum_all_asks < (1.0 - dynamic_threshold):
-            return (orderbooks, 1.0 - sum_all_asks)
+            if margin > dynamic_threshold and margin > best_margin:
+                best_margin = margin
+                # Select all orderbooks except the excluded one
+                best_selection = [ob for i, ob in enumerate(orderbooks) if i != excluded_idx]
+
+        if best_selection and best_margin > dynamic_threshold:
+            logger.debug(
+                f"Multi-outcome arb (O(n) linear): {len(best_selection)}/{n} outcomes, "
+                f"cost={1.0 - best_margin:.4f}, margin={best_margin*100:.2f}%"
+            )
+            return (best_selection, best_margin)
+
+        # Per Grok Round 22/23: Also check exclude-2 for 3-4 outcome markets
+        # This is O(n^2) but bounded (max 6 checks for 4 outcomes)
+        if n <= 4:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    # Cost excluding outcomes i and j
+                    cost_excluding = total_cost - orderbooks[i].best_ask_price - orderbooks[j].best_ask_price
+                    margin = 1.0 - cost_excluding
+
+                    if margin > dynamic_threshold and margin > best_margin:
+                        best_margin = margin
+                        best_selection = [ob for k, ob in enumerate(orderbooks) if k != i and k != j]
+
+            if best_selection and best_margin > dynamic_threshold:
+                logger.debug(
+                    f"Multi-outcome arb (exclude-2): {len(best_selection)}/{n} outcomes, "
+                    f"cost={1.0 - best_margin:.4f}, margin={best_margin*100:.2f}%"
+                )
+                return (best_selection, best_margin)
+
+        # Per Grok Round 23: Full combinatorial check for soccer 3-way
+        # Soccer 3-way (Home/Draw/Away) is rn1's core - check ALL subset combinations
+        # For 3 outcomes: subsets are (H,D), (H,A), (D,A), (H), (D), (A)
+        # Formula: if sum(subset asks) < 1 - (n - len(subset)), arb exists
+        # This catches cases the linear/exclude-2 misses
+        if n == 3:
+            from itertools import combinations
+
+            # Check all subsets of size 1 and 2
+            for subset_size in [1, 2]:
+                for indices in combinations(range(n), subset_size):
+                    subset_obs = [orderbooks[i] for i in indices]
+                    subset_cost = sum(ob.best_ask_price for ob in subset_obs)
+
+                    # For neg-risk: buying k outcomes guarantees $1 if ANY wins
+                    # Arb if: cost < 1 (since one will win)
+                    # Adjust threshold by number excluded
+                    adjusted_threshold = dynamic_threshold * (n - subset_size + 1)
+                    margin = 1.0 - subset_cost
+
+                    if margin > adjusted_threshold and margin > best_margin:
+                        best_margin = margin
+                        best_selection = subset_obs
+                        logger.debug(
+                            f"Multi-outcome arb (combinatorial {subset_size}/{n}): "
+                            f"cost={subset_cost:.4f}, margin={margin*100:.2f}%"
+                        )
+
+            if best_selection and best_margin > dynamic_threshold:
+                return (best_selection, best_margin)
+
+        # Full market arb check (buy ALL outcomes)
+        if total_cost < (1.0 - dynamic_threshold):
+            return (orderbooks, 1.0 - total_cost)
 
         return None
 
@@ -1599,12 +1660,14 @@ class OrderbookPoller:
 
     def prioritize_markets(self, markets: List[Market]) -> List[Market]:
         """
-        Prioritize markets for polling based on arb frequency and neg_risk.
+        Per Grok Round 22: Enhanced market prioritization scoring.
 
-        High-priority markets:
-        1. Markets with recent arb finds (burst mode)
-        2. Neg-risk markets (more capital efficient, like RN1)
-        3. Higher volume markets
+        rn1 pattern prioritization:
+        1. Burst mode (recent arb finds) - highest priority
+        2. Neg-risk markets (5x boost) - more capital efficient, better liquidation
+        3. Sports/live events (3x boost) - rn1's core edge was in-play sports
+        4. 3-outcome markets (2x boost) - soccer win/draw/win pattern
+        5. Higher volume (normalized)
 
         Args:
             markets: List of markets to prioritize.
@@ -1612,15 +1675,62 @@ class OrderbookPoller:
         Returns:
             Sorted list with highest priority first.
         """
-        def market_priority(m: Market) -> tuple:
-            # Higher values = higher priority
-            arb_freq = self._market_arb_frequency.get(m.condition_id, 0)
-            is_burst = 1 if m.condition_id in self._burst_markets else 0
-            # Neg-risk gets 3x weighting (more capital efficient, better liquidation)
-            is_neg_risk = 3 if getattr(m, 'neg_risk', False) else 0
-            volume_score = min(m.volume / 100000, 1.0)  # Normalize to 0-1
+        def market_priority(m: Market) -> float:
+            # Per Grok Round 22: rn1-accurate priority scoring
+            score = 0.0
 
-            return (is_burst, arb_freq, is_neg_risk, volume_score)
+            # Base volume score (0-1 normalized)
+            volume_score = min(m.volume / 100000, 1.0)
+            score += volume_score
+
+            # Burst mode: +10 (highest priority for active arbs)
+            if m.condition_id in self._burst_markets:
+                score += 10.0
+
+            # Recent arb frequency: +freq*2
+            arb_freq = self._market_arb_frequency.get(m.condition_id, 0)
+            score += arb_freq * 2.0
+
+            # Per Grok Round 22: Neg-risk markets (5x boost)
+            # rn1 heavily preferred neg-risk for capital efficiency
+            if getattr(m, 'neg_risk', False):
+                score += 5.0
+
+            # Per Grok Round 22: Sports/live events (3x boost)
+            # rn1's core edge was in-play sports with fast-moving prices
+            tags = getattr(m, 'tags', []) or []
+            question_lower = m.question.lower() if m.question else ""
+
+            is_sports = any(
+                tag.lower() in ['sports', 'soccer', 'football', 'basketball', 'nfl', 'nba', 'mlb', 'tennis']
+                for tag in tags
+            ) or any(
+                keyword in question_lower
+                for keyword in ['soccer', 'football', 'basketball', 'tennis', 'game', 'match', 'vs']
+            )
+
+            if is_sports:
+                score += 3.0
+
+            # Live/in-play events get extra boost
+            is_live = any(
+                keyword in question_lower
+                for keyword in ['live', 'in-play', 'current', 'tonight', 'today']
+            )
+            if is_live:
+                score += 2.0
+
+            # Per Grok Round 22: 3-outcome markets (2x boost)
+            # Soccer 3-way consists of: Home Win / Draw / Away Win
+            # These are 3 mutually exclusive outcomes - exactly one must win
+            # rn1's specialty: buy 2 of 3 outcomes, profit if either wins
+            num_outcomes = len(m.outcomes) if hasattr(m, 'outcomes') else 2
+            if num_outcomes == 3:
+                score += 2.0
+            elif num_outcomes == 4:
+                score += 1.0
+
+            return score
 
         return sorted(markets, key=market_priority, reverse=True)
 
