@@ -95,10 +95,43 @@ def main():
                 print(f"  - Order: (unknown id) - raw: {str(order)[:80]}...")
 
         # Cancel all orders with rate limiting
+        # Per Grok Round 17: Use cancel_orders (batch) instead of cancel_all
+        # cancel_all may not exist in latest py-clob-client
         print("\nCancelling all orders...")
         time.sleep(0.5)  # Rate limit before cancel
-        result = client.cancel_all()
-        print(f"Cancel result: {result}")
+
+        # Collect order IDs for batch cancel
+        order_ids = []
+        for order in open_orders:
+            for key in ["id", "order_id", "orderID", "orderId"]:
+                try:
+                    order_id = order.get(key)
+                    if order_id:
+                        order_ids.append(order_id)
+                        break
+                except (KeyError, AttributeError, TypeError):
+                    continue
+
+        if order_ids:
+            try:
+                # Try batch cancel first (cancel_orders method)
+                result = client.cancel_orders(order_ids)
+                print(f"Batch cancel result: {result}")
+            except AttributeError:
+                # Fallback: cancel_all if available
+                try:
+                    result = client.cancel_all()
+                    print(f"Cancel all result: {result}")
+                except AttributeError:
+                    # Last resort: individual cancels
+                    print("Using individual cancellation (batch methods unavailable)...")
+                    for oid in order_ids:
+                        time.sleep(0.3)
+                        try:
+                            client.cancel(oid)
+                            print(f"  Cancelled: {oid}")
+                        except Exception as e:
+                            print(f"  Failed: {oid} - {e}")
 
         # Verify cancellation with rate limiting
         time.sleep(1.0)  # Wait for cancellation to propagate

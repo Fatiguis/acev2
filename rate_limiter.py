@@ -336,8 +336,27 @@ async def handle_response_status(status: int, endpoint: str = "") -> bool:
 
     Returns:
         True if should retry, False otherwise.
+
+    Raises:
+        GeoBlockError: If 451/403 indicates geographic restriction.
     """
     limiter = get_global_limiter()
+
+    # Per Grok Round 17: Handle geoblocking (451/403)
+    # Polymarket blocks US/restricted IPs - fatal error, no retry
+    if status == 451:
+        logger.critical(
+            f"451 GEOBLOCKED: Polymarket restricts access from this region! "
+            f"Endpoint: {endpoint}. Move VPS to allowed region (EU/Asia)."
+        )
+        raise GeoBlockError(f"451 Unavailable For Legal Reasons on {endpoint}")
+
+    if status == 403:
+        logger.error(
+            f"403 FORBIDDEN on {endpoint} - may be geoblocking or auth issue. "
+            f"Check IP region and API credentials."
+        )
+        # Don't raise - could be auth issue, let caller handle
 
     # Per Grok audit: Handle various rate limit status codes
     # 429 = Rate limited (standard)
@@ -352,6 +371,11 @@ async def handle_response_status(status: int, endpoint: str = "") -> bool:
         await limiter.record_success()
 
     return False  # No retry needed
+
+
+class GeoBlockError(Exception):
+    """Raised when Polymarket returns 451 (geographic restriction)."""
+    pass
 
 
 def is_rate_limit_error(exception: Exception) -> bool:

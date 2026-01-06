@@ -27,10 +27,13 @@ from clob_client_patch import run_sync_in_thread
 
 logger = logging.getLogger(__name__)
 
-# FAK (Fill-And-Kill) is Polymarket's IOC equivalent - allows partial fills
-# Unlike FOK (all-or-nothing), FAK fills whatever is available and cancels the rest
-# This is critical for rn1-style high-frequency trading (2-5x more fills)
-HAS_FAK = hasattr(OrderType, 'FAK')  # Should always be True in py-clob-client
+# Per Grok Round 17: FAK (Fill-And-Kill) removed from py-clob-client
+# Current py-clob-client (v0.34-0.36) only supports: GTC, Post-Only, FOK
+# Strategy: Post-Only primary (maker rebates) → FOK fallback (clipped to L1 depth)
+# rn1's edge came from maker rebates via post-only, not from partial fills
+HAS_FAK = hasattr(OrderType, 'FAK')  # Will be False in current py-clob-client
+if not HAS_FAK:
+    logger.info("FAK order type not available - using Post-Only + FOK strategy (rn1 pattern)")
 
 # Idempotency tracking for preventing duplicate arbs on restart
 from collections import OrderedDict
@@ -2213,17 +2216,16 @@ class ExecutionEngine:
 
         max_attempts = 2 if retry_on_no_match else 1
 
-        # Determine order type: FAK for more fills, FOK as fallback
-        # FAK = Fill-And-Kill (Polymarket's IOC - partial fills allowed, remainder auto-cancelled)
-        # FOK = Fill or Kill (all or nothing - higher rejection rate)
-        use_fak_mode = use_ioc and self._use_ioc and HAS_FAK
+        # Per Grok Round 17: FAK removed from py-clob-client - use FOK only
+        # FOK = Fill or Kill (all or nothing) - clip size to L1 depth for higher fill rate
+        # rn1 pattern: Post-Only primary → FOK fallback (clipped)
+        # Note: use_ioc parameter kept for API compatibility but FAK path removed
 
         for attempt in range(max_attempts):
             try:
-                # Create market order args
-                # FAK (Fill-And-Kill) is Polymarket's native IOC equivalent
-                # It fills whatever liquidity is available and auto-cancels the rest
-                order_type_to_use = OrderType.FAK if use_fak_mode else OrderType.FOK
+                # Per Grok Round 17: Always use FOK (FAK not available)
+                # FOK requires full fill - clip to available depth for success
+                order_type_to_use = OrderType.FOK
                 order_args = MarketOrderArgs(
                     token_id=token_id,
                     amount=size_usd,
@@ -2243,57 +2245,16 @@ class ExecutionEngine:
                     order_id = response.get("orderID")
                     result.order_id = order_id
 
-                    if use_fak_mode:
-                        # FAK mode: check actual fill amount (FAK auto-cancels remainder)
-                        # Brief wait for order to process
-                        await asyncio.sleep(0.05)  # 50ms for fills to process
-
-                        try:
-                            # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
-                            order_status = await run_sync_in_thread(execution_client.get_order, order_id)
-                            if order_status:
-                                filled_size = float(order_status.get("sizeFilled", 0))
-                                total_size = float(order_status.get("size", size_usd))
-
-                                # Calculate filled USD
-                                fill_price = float(order_status.get("price", limit_price))
-                                result.executed_size_usd = filled_size * fill_price
-
-                                if filled_size >= total_size * 0.99:  # ~100% filled
-                                    result.status = OrderStatus.FILLED
-                                    logger.debug(
-                                        f"FAK filled: {side} {outcome_name} @ {limit_price:.4f} "
-                                        f"for ${result.executed_size_usd:.2f}"
-                                    )
-                                elif filled_size > 0:
-                                    # Partial fill - FAK auto-cancelled remainder
-                                    result.status = OrderStatus.PARTIAL
-                                    result.unfilled_size_usd = size_usd - result.executed_size_usd
-
-                                    logger.info(
-                                        f"FAK partial: {side} {outcome_name} "
-                                        f"${result.executed_size_usd:.2f} filled, "
-                                        f"${result.unfilled_size_usd:.2f} auto-cancelled"
-                                    )
-                                else:
-                                    # No fill - FAK order completed with 0 fills
-                                    result.status = OrderStatus.CANCELLED
-                                    logger.debug(f"FAK no fill: {outcome_name}")
-
-                        except Exception as e:
-                            # If can't check status, assume filled (optimistic)
-                            logger.debug(f"FAK status check failed: {e}, assuming filled")
-                            result.status = OrderStatus.FILLED
-                            result.executed_size_usd = size_usd
-
-                    else:
-                        # FOK mode: all or nothing
-                        result.status = OrderStatus.FILLED
-                        result.executed_size_usd = size_usd
-                        logger.debug(
-                            f"FOK filled: {side} {outcome_name} @ {limit_price:.4f} "
-                            f"for ${size_usd:.2f}"
-                        )
+                    # Per Grok Round 17: FOK mode only - all or nothing
+                    # Success means full fill (FOK rejects if can't fill entirely)
+                    result.status = OrderStatus.FILLED
+                    result.executed_size_usd = size_usd
+                    self._taker_fills += 1
+                    self._taker_volume_usd += size_usd
+                    logger.debug(
+                        f"FOK filled: {side} {outcome_name} @ {limit_price:.4f} "
+                        f"for ${size_usd:.2f}"
+                    )
 
                     return result
 
