@@ -589,6 +589,12 @@ class ExecutionEngine:
         self._use_ioc = True  # Use FAK instead of FOK for more fills (2-5x fill rate)
         self._partial_hedge_slippage_threshold = 0.003  # 0.3% max slippage for partial hedging
 
+        # Per Grok Round 23: High-confidence IOC toggle
+        # Only use IOC/FAK when fill probability is high enough to justify partial risk
+        # In hot/blazing markets with low fill prob, stick to post-only (safer)
+        self._ioc_min_fill_prob = 0.60  # 60% fill prob threshold for IOC
+        self._ioc_high_confidence_only = True  # Enable confidence-based IOC toggle
+
         # Maker vs Taker tracking for post-only orders
         self._maker_fills = 0  # Post-only GTC orders that filled as maker
         self._taker_fills = 0  # FAK/FOK orders that filled as taker
@@ -728,6 +734,53 @@ class ExecutionEngine:
                 f"(edge={edge_pct*100:.2f}%, fill_prob={fill_probability:.0%})"
             )
             return False
+        return True
+
+    def should_use_ioc(self, fill_probability: float, heat: str = "warm") -> bool:
+        """
+        Per Grok Round 23: Determine if IOC/FAK should be used based on confidence.
+
+        High-confidence IOC toggle logic:
+        - In cold/warm markets with good fill prob (>60%): Use IOC for more fills
+        - In hot/blazing markets OR low fill prob: Stick to post-only (safer)
+
+        IOC trades faster but risks partials. Post-only is safer but slower.
+        rn1 used post-only primarily but may have used IOC in high-confidence scenarios.
+
+        Args:
+            fill_probability: Estimated fill probability (0-1).
+            heat: Market heat level.
+
+        Returns:
+            True if IOC should be used, False for post-only.
+        """
+        if not self._use_ioc:
+            return False
+
+        if not self._ioc_high_confidence_only:
+            return True  # Always use IOC if high-confidence mode disabled
+
+        # Per Grok Round 23: High-confidence IOC logic
+        heat_lower = heat.lower()
+
+        # Never use IOC in blazing markets (too competitive, partials hurt)
+        if heat_lower == "blazing":
+            logger.debug(f"IOC disabled: blazing market (fill_prob={fill_probability:.0%})")
+            return False
+
+        # In hot markets, require higher fill probability
+        if heat_lower == "hot":
+            hot_threshold = self._ioc_min_fill_prob + 0.15  # 75% for hot
+            if fill_probability < hot_threshold:
+                logger.debug(f"IOC disabled: hot market fill_prob {fill_probability:.0%} < {hot_threshold:.0%}")
+                return False
+
+        # Standard threshold for cold/warm
+        if fill_probability < self._ioc_min_fill_prob:
+            logger.debug(f"IOC disabled: fill_prob {fill_probability:.0%} < {self._ioc_min_fill_prob:.0%}")
+            return False
+
+        logger.debug(f"IOC enabled: {heat_lower} market, fill_prob={fill_probability:.0%}")
         return True
 
     async def get_execution_client(self, min_balance: float = 0.0) -> Tuple[Optional[ClobClient], Optional[Any]]:
