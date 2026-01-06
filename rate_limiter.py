@@ -1,13 +1,16 @@
 """
 Global Rate Limiter Module.
 Handles 429 rate-limit backoff across all HTTP clients.
+
+Per Grok Round 7: Added per-wallet rate limiting to prevent multi-wallet
+burst hitting global limits.
 """
 
 import logging
 import asyncio
 import time
-from typing import Optional
-from dataclasses import dataclass
+from typing import Optional, Dict
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +131,160 @@ class GlobalRateLimiter:
         return self._state.is_limited and time.time() < self._state.backoff_until
 
 
+@dataclass
+class WalletRateLimitState:
+    """
+    Per Grok Round 7: Track rate limit state per wallet.
+
+    Multi-wallet execution can burst-hit global limits if all wallets
+    fire simultaneously. This tracks per-wallet request timing to
+    stagger requests and avoid 429s.
+    """
+    wallet_address: str
+    last_request_time: float = 0.0
+    requests_in_window: int = 0
+    window_start: float = 0.0
+    consecutive_429s: int = 0
+
+
+class PerWalletRateLimiter:
+    """
+    Per Grok Round 7: Per-wallet rate limiting for multi-wallet execution.
+
+    Prevents multiple wallets from firing simultaneously and hitting
+    global API limits. Each wallet gets its own bucket with configurable
+    requests per second.
+    """
+
+    def __init__(
+        self,
+        requests_per_second: float = 2.0,
+        window_size_seconds: float = 1.0,
+        min_delay_between_requests: float = 0.1
+    ):
+        """
+        Initialize per-wallet rate limiter.
+
+        Args:
+            requests_per_second: Max requests per wallet per second.
+            window_size_seconds: Rolling window size for counting requests.
+            min_delay_between_requests: Minimum delay between any two requests.
+        """
+        self.requests_per_second = requests_per_second
+        self.window_size_seconds = window_size_seconds
+        self.min_delay_between_requests = min_delay_between_requests
+
+        self._wallet_states: Dict[str, WalletRateLimitState] = {}
+        self._lock = asyncio.Lock()
+        self._global_last_request = 0.0  # Global timing to stagger across wallets
+
+    async def acquire(self, wallet_address: str) -> float:
+        """
+        Acquire permission to make a request for a wallet.
+
+        Waits if necessary to stay within rate limits.
+
+        Args:
+            wallet_address: The wallet making the request.
+
+        Returns:
+            Time waited in seconds (0 if no wait needed).
+        """
+        async with self._lock:
+            now = time.time()
+            wait_time = 0.0
+
+            # Get or create wallet state
+            if wallet_address not in self._wallet_states:
+                self._wallet_states[wallet_address] = WalletRateLimitState(
+                    wallet_address=wallet_address,
+                    window_start=now
+                )
+
+            state = self._wallet_states[wallet_address]
+
+            # Reset window if expired
+            if now - state.window_start >= self.window_size_seconds:
+                state.window_start = now
+                state.requests_in_window = 0
+
+            # Check per-wallet limit
+            max_requests = int(self.requests_per_second * self.window_size_seconds)
+            if state.requests_in_window >= max_requests:
+                # Wait until window resets
+                wait_time = state.window_start + self.window_size_seconds - now
+                if wait_time > 0:
+                    logger.debug(
+                        f"Per-wallet limit: {wallet_address[:8]}... waiting {wait_time:.2f}s"
+                    )
+
+            # Check minimum delay since last request (global staggering)
+            time_since_global = now - self._global_last_request
+            if time_since_global < self.min_delay_between_requests:
+                global_wait = self.min_delay_between_requests - time_since_global
+                wait_time = max(wait_time, global_wait)
+
+            # Check minimum delay since wallet's last request
+            time_since_wallet = now - state.last_request_time
+            if time_since_wallet < self.min_delay_between_requests:
+                wallet_wait = self.min_delay_between_requests - time_since_wallet
+                wait_time = max(wait_time, wallet_wait)
+
+        # Wait outside lock if needed
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+
+        # Update state after wait
+        async with self._lock:
+            now = time.time()
+            state = self._wallet_states[wallet_address]
+            state.last_request_time = now
+            state.requests_in_window += 1
+            self._global_last_request = now
+
+        return wait_time
+
+    async def record_429(self, wallet_address: str):
+        """
+        Record a 429 for a specific wallet.
+
+        Args:
+            wallet_address: The wallet that got rate limited.
+        """
+        async with self._lock:
+            if wallet_address in self._wallet_states:
+                self._wallet_states[wallet_address].consecutive_429s += 1
+                logger.warning(
+                    f"Wallet {wallet_address[:8]}... got 429, "
+                    f"consecutive: {self._wallet_states[wallet_address].consecutive_429s}"
+                )
+
+    async def record_success(self, wallet_address: str):
+        """
+        Record a successful request for a wallet.
+
+        Args:
+            wallet_address: The wallet that succeeded.
+        """
+        async with self._lock:
+            if wallet_address in self._wallet_states:
+                self._wallet_states[wallet_address].consecutive_429s = 0
+
+    def get_stats(self) -> Dict[str, dict]:
+        """Get per-wallet rate limiter statistics."""
+        return {
+            addr: {
+                "requests_in_window": state.requests_in_window,
+                "consecutive_429s": state.consecutive_429s,
+                "last_request": state.last_request_time,
+            }
+            for addr, state in self._wallet_states.items()
+        }
+
+
 # Global singleton instance
 _global_limiter: Optional[GlobalRateLimiter] = None
+_wallet_limiter: Optional[PerWalletRateLimiter] = None
 
 
 def get_global_limiter() -> GlobalRateLimiter:
@@ -138,6 +293,18 @@ def get_global_limiter() -> GlobalRateLimiter:
     if _global_limiter is None:
         _global_limiter = GlobalRateLimiter()
     return _global_limiter
+
+
+def get_wallet_limiter() -> PerWalletRateLimiter:
+    """
+    Per Grok Round 7: Get or create the per-wallet rate limiter instance.
+
+    Use this in multi-wallet execution to prevent burst-hitting API limits.
+    """
+    global _wallet_limiter
+    if _wallet_limiter is None:
+        _wallet_limiter = PerWalletRateLimiter()
+    return _wallet_limiter
 
 
 async def handle_response_status(status: int, endpoint: str = "") -> bool:

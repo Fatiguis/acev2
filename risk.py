@@ -1,18 +1,25 @@
 """
 Risk Management Module.
 Handles position sizing, exposure limits, and safety checks.
+
+Per Grok Round 7: Integrated edge_model expectancy for smarter sizing.
+Hot markets get reduced sizing due to lower fill probability.
 """
 
 import logging
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, TYPE_CHECKING
 from collections import deque
 
 from config import BotConfig, calculate_dynamic_threshold
 from orderbook import ArbOpportunity, ArbType
 from positions import Position
+
+# Per Grok Round 7: Integrate edge model for expectancy-based sizing
+if TYPE_CHECKING:
+    from edge_model import EdgeExpectancyModel
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +108,27 @@ class RiskManager:
 
         # Unhedged exposure tracking (per audit)
         self._current_unhedged_exposure = 0.0
+
+        # Per Grok Round 7: Edge model for expectancy-based sizing
+        self._edge_model: Optional['EdgeExpectancyModel'] = None
+        self._init_edge_model()
+
+    def _init_edge_model(self):
+        """
+        Per Grok Round 7: Initialize edge model for expectancy-based sizing.
+
+        The edge model adjusts sizing based on:
+        - Market heat (hot markets = lower fill probability = smaller size)
+        - Fill probability decay with latency
+        - Competition estimation
+        """
+        try:
+            from edge_model import EdgeExpectancyModel
+            self._edge_model = EdgeExpectancyModel()
+            logger.debug("Edge model initialized for expectancy-based sizing")
+        except ImportError:
+            logger.debug("Edge model not available, using standard sizing")
+            self._edge_model = None
 
     def update_capital(self, new_capital: float):
         """Update current capital."""
@@ -234,16 +262,25 @@ class RiskManager:
     def calculate_position_size(
         self,
         opportunity: ArbOpportunity,
-        orderbooks_depth: Dict[str, float]
+        orderbooks_depth: Dict[str, float],
+        market_volume_24h: float = 0.0,
+        is_live_event: bool = False,
+        latency_ms: float = 80.0
     ) -> float:
         """
         Calculate optimal position size for an opportunity.
 
         Uses gas-aware sizing: only trade sizes where expected profit > gas cost.
 
+        Per Grok Round 7: Integrated edge model expectancy for smarter sizing.
+        Hot markets get reduced sizing due to lower fill probability.
+
         Args:
             opportunity: The arbitrage opportunity.
             orderbooks_depth: Available depth at best prices by token_id.
+            market_volume_24h: 24-hour volume for market heat estimation.
+            is_live_event: True if this is a live sports event.
+            latency_ms: Our estimated latency in milliseconds.
 
         Returns:
             Recommended position size in USD.
@@ -261,6 +298,18 @@ class RiskManager:
         # ABSOLUTE cap regardless of capital (per audit: $200 max)
         absolute_max = self.config.trading.absolute_max_trade_size_usd
         position_size = min(position_size, absolute_max)
+
+        # Per Grok Round 7: Apply edge model expectancy adjustment
+        # Reduce size in hot markets where fill probability is lower
+        if self._edge_model is not None:
+            position_size = self._apply_expectancy_sizing(
+                position_size,
+                opportunity.profit_margin,
+                min_depth,
+                market_volume_24h,
+                is_live_event,
+                latency_ms
+            )
 
         # Reduce size based on consecutive losses (risk scaling)
         if self._consecutive_losses > 0:
@@ -291,6 +340,108 @@ class RiskManager:
             return 0
 
         return position_size
+
+    def _apply_expectancy_sizing(
+        self,
+        base_size: float,
+        edge_pct: float,
+        available_depth: float,
+        volume_24h: float,
+        is_live_event: bool,
+        latency_ms: float
+    ) -> float:
+        """
+        Per Grok Round 7: Apply edge model expectancy adjustment to sizing.
+
+        Reduces size in hot markets where fill probability is lower.
+        Uses the edge model's optimal sizing calculation.
+
+        Args:
+            base_size: Initial position size.
+            edge_pct: Arbitrage edge as decimal.
+            available_depth: Available depth at best price.
+            volume_24h: 24-hour market volume.
+            is_live_event: True if live sports event.
+            latency_ms: Our latency estimate.
+
+        Returns:
+            Adjusted position size.
+        """
+        if self._edge_model is None:
+            return base_size
+
+        try:
+            from edge_model import MarketHeat
+
+            # Estimate market heat
+            heat = self._edge_model.estimate_market_heat(
+                volume_24h=volume_24h,
+                is_live_event=is_live_event,
+                recent_price_volatility=0.0  # Could be enhanced with actual volatility
+            )
+
+            # Get optimal size from edge model
+            estimate = self._edge_model.calculate_optimal_size(
+                raw_edge_pct=edge_pct,
+                max_size_usd=base_size,
+                available_depth_usd=available_depth,
+                latency_ms=latency_ms,
+                heat=heat,
+                capital_usd=self._current_capital,
+                use_websocket=True  # Assume WebSocket usage
+            )
+
+            optimal_size = estimate.optimal_size_usd
+
+            # If edge model suggests smaller size, use it
+            if optimal_size < base_size and optimal_size > 0:
+                logger.debug(
+                    f"Expectancy sizing: ${base_size:.2f} -> ${optimal_size:.2f} "
+                    f"(heat={heat.value}, fill_prob={estimate.fill_probability:.1%})"
+                )
+                return optimal_size
+
+            # If edge model suggests zero (expected profit negative), return 0
+            if optimal_size == 0 and estimate.fill_probability < 0.05:
+                logger.debug(
+                    f"Expectancy sizing: SKIP (fill_prob={estimate.fill_probability:.1%} too low)"
+                )
+                return 0
+
+            return base_size
+
+        except Exception as e:
+            logger.debug(f"Edge model sizing failed: {e}, using base size")
+            return base_size
+
+    def record_fill_attempt(self, latency_ms: float, edge_pct: float, filled: bool, heat_str: str = "warm"):
+        """
+        Per Grok Round 7: Record fill attempt for edge model calibration.
+
+        Args:
+            latency_ms: Latency of the fill attempt.
+            edge_pct: Edge of the opportunity.
+            filled: Whether the order filled.
+            heat_str: Market heat level as string.
+        """
+        if self._edge_model is None:
+            return
+
+        try:
+            from edge_model import MarketHeat
+
+            heat_map = {
+                "cold": MarketHeat.COLD,
+                "warm": MarketHeat.WARM,
+                "hot": MarketHeat.HOT,
+                "blazing": MarketHeat.BLAZING,
+            }
+            heat = heat_map.get(heat_str.lower(), MarketHeat.WARM)
+
+            self._edge_model.record_fill_attempt(latency_ms, edge_pct, filled, heat)
+
+        except Exception:
+            pass
 
     def calculate_geometric_mean_return(self) -> float:
         """
