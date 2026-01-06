@@ -520,6 +520,38 @@ class PolymarketWebSocket:
         else:
             logger.debug(f"Unknown message type: {msg_type}")
 
+    def _parse_orderbook_levels(self, levels_data: list) -> List[OrderbookLevel]:
+        """
+        Per Grok Round 12: Parse orderbook levels with dual format support.
+
+        Polymarket WS can send levels in two formats:
+        1. Array format (per docs): [["0.50", "100.0"], ["0.48", "50.0"], ...]
+        2. Dict format (legacy): [{"price": "0.50", "size": "100"}, ...]
+
+        This handles both safely, skipping malformed entries.
+        """
+        levels = []
+        for level in levels_data:
+            try:
+                if isinstance(level, list) and len(level) >= 2:
+                    # Array format: [price_str, size_str]
+                    price = float(level[0])
+                    size = float(level[1])
+                elif isinstance(level, dict):
+                    # Dict format: {"price": "0.50", "size": "100"}
+                    raw_price = level.get("price", 0)
+                    raw_size = level.get("size", 0)
+                    price = float(raw_price) if raw_price else 0.0
+                    size = float(raw_size) if raw_size else 0.0
+                else:
+                    continue
+
+                if price > 0 and size > 0:
+                    levels.append(OrderbookLevel(price=price, size=size))
+            except (ValueError, TypeError, AttributeError, IndexError):
+                continue
+        return levels
+
     async def _handle_book_update(self, message: Dict, receive_time_ms: float):
         """
         Process orderbook update message.
@@ -556,31 +588,11 @@ class PolymarketWebSocket:
         except (ValueError, TypeError, OverflowError) as e:
             logger.debug(f"Timestamp coercion error: {e}, raw={server_timestamp}")
 
-        # Parse orderbook levels with robust type handling
-        bids = []
-        for bid in message.get("bids", []):
-            try:
-                # Handle both string and numeric price/size
-                raw_price = bid.get("price", 0)
-                raw_size = bid.get("size", 0)
-                price = float(raw_price) if raw_price else 0.0
-                size = float(raw_size) if raw_size else 0.0
-                if price > 0 and size > 0:
-                    bids.append(OrderbookLevel(price=price, size=size))
-            except (ValueError, TypeError, AttributeError):
-                continue
-
-        asks = []
-        for ask in message.get("asks", []):
-            try:
-                raw_price = ask.get("price", 0)
-                raw_size = ask.get("size", 0)
-                price = float(raw_price) if raw_price else 0.0
-                size = float(raw_size) if raw_size else 0.0
-                if price > 0 and size > 0:
-                    asks.append(OrderbookLevel(price=price, size=size))
-            except (ValueError, TypeError, AttributeError):
-                continue
+        # Per Grok Round 12: Parse orderbook levels with dual format support
+        # Polymarket WS sends levels as arrays: [["0.50", "100.0"], ...]
+        # Some implementations send dicts: [{"price": "0.50", "size": "100"}, ...]
+        bids = self._parse_orderbook_levels(message.get("bids", []))
+        asks = self._parse_orderbook_levels(message.get("asks", []))
 
         # Sort properly
         bids.sort(key=lambda x: x.price, reverse=True)
@@ -635,11 +647,21 @@ class PolymarketWebSocket:
         prev_best_ask = cached.asks[0].price if cached.asks else None
 
         # Update best bid/ask from price change
-        changes = message.get("changes", [])
+        # Per Grok Round 12: Handle both array and dict formats for changes
+        changes = message.get("changes", []) or message.get("price_changes", [])
         for change in changes:
-            side = change.get("side")
-            price = float(change.get("price", 0))
-            size = float(change.get("size", 0))
+            # Parse change - can be dict or array format
+            if isinstance(change, dict):
+                side = change.get("side")
+                price = float(change.get("price", 0))
+                size = float(change.get("size", 0))
+            elif isinstance(change, list) and len(change) >= 3:
+                # Array format: [side, price, size]
+                side = change[0]
+                price = float(change[1])
+                size = float(change[2])
+            else:
+                continue
 
             if price <= 0:
                 continue

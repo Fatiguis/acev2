@@ -105,8 +105,10 @@ class TradingConfig:
 
     # Buy arb only mode: skip sell arbs that require holding tokens
     # When True, only execute buy arbs (safer, no position requirements)
+    # Per Grok Round 12: Default True - RN1 never sells (buys opposites for hedges)
+    # This avoids taker fees on sells and earns maker rebates on buy hedges
     buy_arb_only: bool = field(
-        default_factory=lambda: os.getenv("BUY_ARB_ONLY", "false").lower() == "true"
+        default_factory=lambda: os.getenv("BUY_ARB_ONLY", "true").lower() == "true"
     )
 
     # Post-only mode: try post-only limit orders first for maker rebates
