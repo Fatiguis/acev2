@@ -38,6 +38,29 @@ def _get_executor() -> ThreadPoolExecutor:
     return _executor
 
 
+def shutdown_executor(wait: bool = True, cancel_futures: bool = False) -> None:
+    """
+    Shutdown the shared thread pool executor.
+
+    Per Grok Round 6 optimization: Explicit shutdown prevents resource leaks
+    on restarts in long-running async apps. Should be called during cleanup.
+
+    Args:
+        wait: If True, wait for pending futures to complete.
+        cancel_futures: If True, cancel pending futures (Python 3.9+).
+    """
+    global _executor
+    if _executor is not None:
+        logger.info("Shutting down CLOB thread pool executor...")
+        try:
+            _executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+        except TypeError:
+            # Python < 3.9 doesn't support cancel_futures
+            _executor.shutdown(wait=wait)
+        _executor = None
+        logger.debug("CLOB thread pool executor shutdown complete")
+
+
 async def run_sync_in_thread(func: Callable[..., T], *args, **kwargs) -> T:
     """
     Run a synchronous function in a thread pool without blocking the event loop.

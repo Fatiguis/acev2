@@ -30,6 +30,7 @@ from positions import PositionMonitor, ProfitLocker
 from risk import RiskManager, DepthValidator, TradeRecord
 from edge_model import EdgeExpectancyModel, MarketHeat
 from supervisor import get_supervisor, heartbeat as supervisor_heartbeat
+from clob_client_patch import shutdown_executor as shutdown_clob_executor
 # Note: Monkey-patching deprecated per audit - rate limiting handled at application level
 
 # Optional WebSocket support
@@ -1527,6 +1528,13 @@ async def main():
             except Exception as e:
                 logger.error(f"Cleanup error: {e}")
             bot = None
+
+        # Per Grok Round 6 optimization: Explicit executor shutdown prevents
+        # resource leaks on restarts in long-running async apps
+        try:
+            shutdown_clob_executor(wait=True, cancel_futures=False)
+        except Exception as e:
+            logger.debug(f"Executor shutdown note: {e}")
 
     # Use supervisor for crash recovery
     # Supervisor handles: automatic restarts, heartbeat monitoring, signal handling

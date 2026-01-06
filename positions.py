@@ -5,6 +5,7 @@ Monitors positions and automatically claims winnings on market resolution.
 
 import logging
 import asyncio
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Any, Callable, TypeVar
@@ -19,6 +20,7 @@ import aiohttp
 
 from config import BotConfig
 from rate_limiter import get_global_limiter
+from clob_client_patch import run_sync_in_thread
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,30 @@ T = TypeVar('T')
 def _exponential_backoff(attempt: int, base: float = 1.0, max_backoff: float = 30.0) -> float:
     """Calculate exponential backoff delay."""
     return min(base * (2 ** attempt), max_backoff)
+
+
+def generate_dvm_salt() -> int:
+    """
+    Generate a cryptographically secure random salt for DVM voting.
+
+    Per Grok Round 6 optimization: UMA recommends unique per-vote salts for privacy.
+    Using secrets module ensures cryptographic randomness (vs random module).
+
+    The salt is used in commit-reveal scheme:
+    - Commit: hash(price + salt) - hides your vote
+    - Reveal: price + salt - proves your commit
+
+    Same salt reuse across votes could leak voting patterns.
+
+    Returns:
+        256-bit random integer suitable for int256 salt parameter.
+    """
+    # Generate 32 bytes (256 bits) of cryptographic randomness
+    # Convert to int, ensuring it fits in int256 (signed, so max is 2^255-1)
+    random_bytes = secrets.token_bytes(32)
+    salt = int.from_bytes(random_bytes, byteorder='big')
+    # Ensure positive and within int256 range
+    return salt % (2 ** 255)
 
 
 async def _retry_rpc_with_backoff(
@@ -501,11 +527,12 @@ class PositionMonitor:
 
             try:
                 # Check if market is resolved by checking payoutDenominator
+                # Per Grok Round 6: Wrap sync Web3 call in thread to avoid blocking
                 if self._contract and self._web3:
                     condition_id_bytes = bytes.fromhex(position.condition_id.replace("0x", ""))
-                    payout_denominator = self._contract.functions.payoutDenominator(
-                        condition_id_bytes
-                    ).call()
+                    payout_denominator = await run_sync_in_thread(
+                        self._contract.functions.payoutDenominator(condition_id_bytes).call
+                    )
 
                     # payoutDenominator == 0 means disputed/invalid market
                     # Redeem will fail on these - skip and log
@@ -602,8 +629,11 @@ class PositionMonitor:
                 })
 
                 # Sign and send
+                # Per Grok Round 6: Wrap sync Web3 call in thread to avoid blocking
                 signed_tx = self._account.sign_transaction(tx)
-                tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                tx_hash = await run_sync_in_thread(
+                    self._web3.eth.send_raw_transaction, signed_tx.raw_transaction
+                )
 
                 # Wait for confirmation with retry logic
                 receipt = await _retry_rpc_with_backoff(
@@ -749,7 +779,7 @@ class PositionMonitor:
         timestamp: int,
         ancillary_data: bytes,
         vote_price: int,
-        salt: int
+        salt: Optional[int] = None
     ) -> Optional[str]:
         """
         Submit a vote to UMA DVM for a disputed market.
@@ -762,16 +792,24 @@ class PositionMonitor:
         WARNING: This requires UMA tokens staked to vote. If you don't have
         staked UMA, you cannot participate in DVM voting.
 
+        Per Grok Round 6 optimization: Salt is now auto-generated if not provided,
+        using cryptographically secure randomness for privacy.
+
         Args:
             identifier: The price request identifier (bytes32).
             timestamp: The price request timestamp.
             ancillary_data: Additional data for the request.
             vote_price: Your vote (e.g., 1e18 for YES, 0 for NO).
-            salt: Random salt for commit-reveal scheme.
+            salt: Random salt for commit-reveal scheme. If None, auto-generated
+                  using cryptographically secure randomness.
 
         Returns:
             Transaction hash if successful, None otherwise.
         """
+        # Per Grok Round 6: Auto-generate secure salt if not provided
+        if salt is None:
+            salt = generate_dvm_salt()
+            logger.debug(f"Generated secure DVM salt: {salt % 1000}... (truncated)")
         if self.config.dry_run:
             logger.info(f"[DRY RUN] Would submit DVM vote for identifier {identifier.hex()[:16]}...")
             return "0xdryrun"
@@ -794,9 +832,10 @@ class PositionMonitor:
             )
 
             # Check if already voted
-            has_voted = voting_contract.functions.hasVoted(
-                identifier, timestamp, ancillary_data
-            ).call()
+            # Per Grok Round 6: Wrap sync Web3 call in thread to avoid blocking
+            has_voted = await run_sync_in_thread(
+                voting_contract.functions.hasVoted(identifier, timestamp, ancillary_data).call
+            )
 
             if has_voted:
                 logger.info(f"Already voted on this price request")
@@ -830,8 +869,11 @@ class PositionMonitor:
             })
 
             # Sign and send
+            # Per Grok Round 6: Wrap sync Web3 call in thread to avoid blocking
             signed_tx = self._account.sign_transaction(tx)
-            tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            tx_hash = await run_sync_in_thread(
+                self._web3.eth.send_raw_transaction, signed_tx.raw_transaction
+            )
 
             logger.info(f"DVM vote commit submitted: {tx_hash.hex()}")
 
@@ -885,7 +927,10 @@ class PositionMonitor:
                     abi=UMA_VOTING_ABI
                 )
 
-            phase = self._voting_contract.functions.getVotePhase().call()
+            # Per Grok Round 6: Wrap sync Web3 call in thread to avoid blocking
+            phase = await run_sync_in_thread(
+                self._voting_contract.functions.getVotePhase().call
+            )
             return phase
 
         except Exception as e:
@@ -956,8 +1001,11 @@ class PositionMonitor:
             })
 
             # Sign and send
+            # Per Grok Round 6: Wrap sync Web3 call in thread to avoid blocking
             signed_tx = self._account.sign_transaction(tx)
-            tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            tx_hash = await run_sync_in_thread(
+                self._web3.eth.send_raw_transaction, signed_tx.raw_transaction
+            )
 
             logger.info(f"DVM vote reveal submitted: {tx_hash.hex()}")
 
