@@ -64,7 +64,12 @@ class TradingConfig:
 
     # ABSOLUTE maximum trade size regardless of capital (safety cap per audit)
     # Even with $1M capital, never exceed this per trade
+    # Per Grok Round 3: rn1 observed max was $129K - cap well below for safety
     absolute_max_trade_size_usd: float = 200.0
+
+    # Per Grok Round 3: Hard cap at rn1's observed maximum ($129K from KuCoin data)
+    # This is the lifetime max - never scale beyond this regardless of capital
+    lifetime_max_trade_size_usd: float = 129_000.0
 
     # Minimum trade size (gas must be covered)
     min_trade_size_usd: float = 10.0

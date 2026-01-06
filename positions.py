@@ -149,6 +149,15 @@ class PositionStatus(Enum):
 
     Per Grok audit: Added detailed dispute handling for UMA Optimistic Oracle.
     Polymarket uses UMA for resolution - disputes can invalidate outcomes.
+
+    Per Grok Round 3: UMA dispute flow:
+    1. Market resolves via Optimistic Oracle (72h window)
+    2. If disputed, escalates to UMA DVM (Data Verification Mechanism)
+    3. DVM voting takes ~48h additional
+    4. During dispute, funds are LOCKED - cannot claim or trade
+
+    Action: If DISPUTE_PENDING, wait for DVM resolution. Do NOT hedge
+    (position is locked). Monitor UMA DVM for outcome.
     """
     OPEN = "open"
     WINNING = "winning"
@@ -156,7 +165,33 @@ class PositionStatus(Enum):
     CLAIMED = "claimed"
     DISPUTED = "disputed"  # Market is disputed (payoutDenominator == 0 after resolution)
     DISPUTE_PENDING = "dispute_pending"  # Dispute raised, awaiting DVM resolution
+    DVM_VOTING = "dvm_voting"  # Per Grok Round 3: Escalated to DVM, voting in progress
     UNKNOWN = "unknown"
+
+
+# Per Grok Round 3: UMA DVM escalation info
+DVM_ESCALATION_INFO = """
+UMA Optimistic Oracle Dispute Resolution Flow (per uma-ctf-adapter):
+
+1. INITIAL RESOLUTION (72 hours)
+   - Oracle proposes outcome
+   - Disputers can challenge within window
+
+2. IF DISPUTED -> DVM ESCALATION
+   - Dispute bond required (significant USDC)
+   - Escalates to UMA DVM for token-holder vote
+   - Voting takes ~48 hours
+
+3. DVM OUTCOME
+   - If original correct: disputer loses bond
+   - If original wrong: proposer loses bond, outcome reversed
+
+ACTION FOR BOT:
+- If position is DISPUTE_PENDING or DVM_VOTING: DO NOT TRADE
+- Funds are locked until resolution
+- Monitor UMA subgraph for dispute status
+- Exit positions BEFORE 6h from resolution to avoid lock risk
+"""
 
 
 @dataclass

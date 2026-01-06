@@ -598,6 +598,43 @@ class RiskManager:
 
         return at_risk
 
+    def should_auto_hedge_aged_positions(self, positions: List[Position]) -> List[Position]:
+        """
+        Get positions that should be auto-hedged due to age risk.
+
+        Per Grok Round 3: Instead of just flagging, provide actionable list
+        for auto-hedge. Positions >24h old or <6h from resolution should be
+        automatically hedged to avoid UMA dispute lock.
+
+        Args:
+            positions: List of current open positions.
+
+        Returns:
+            List of positions that should be auto-hedged immediately.
+        """
+        at_risk = self.check_position_age_risk(positions)
+
+        # Filter to only positions with significant value (avoid gas waste on dust)
+        min_value_to_hedge = 5.0  # $5 minimum to bother hedging
+        actionable = []
+
+        for pos in at_risk:
+            pos_value = getattr(pos, 'current_value_usd', 0) or getattr(pos, 'size', 0)
+            if pos_value >= min_value_to_hedge:
+                actionable.append(pos)
+                logger.info(
+                    f"AUTO-HEDGE TRIGGERED: Position {pos.token_id[:16]}... "
+                    f"value ${pos_value:.2f} queued for hedge"
+                )
+
+        if actionable:
+            logger.warning(
+                f"Per Grok Round 3: {len(actionable)} positions flagged for auto-hedge "
+                f"due to age/resolution risk"
+            )
+
+        return actionable
+
     def is_halted(self) -> tuple[bool, Optional[str]]:
         """Check if trading is halted."""
         return self._is_halted, self._halt_reason

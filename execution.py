@@ -448,6 +448,74 @@ class GasEstimator:
         # Add 20% safety margin for gas price volatility
         return gas_cost * 1.2
 
+    def check_gas_spike(self, max_gas_cost_usd: float = 0.10) -> Tuple[bool, float, str]:
+        """
+        Check if gas is currently spiking above safe threshold.
+
+        Per Grok Round 3: Polygon gas can spike during network congestion.
+        This check prevents executing trades when gas would eat the edge.
+
+        Args:
+            max_gas_cost_usd: Maximum acceptable gas cost per trade.
+
+        Returns:
+            Tuple of (is_safe, current_cost_usd, message).
+        """
+        gas_cost, is_fallback = self.estimate_gas_cost_usd(
+            operation="market_order",
+            num_operations=2,  # Typical arb = 2 orders
+            num_outcomes=2
+        )
+
+        if is_fallback:
+            # Can't determine - assume safe but warn
+            return True, gas_cost, "Gas estimation unavailable (using fallback)"
+
+        if gas_cost > max_gas_cost_usd:
+            logger.warning(
+                f"GAS SPIKE DETECTED: ${gas_cost:.4f} > max ${max_gas_cost_usd:.4f}. "
+                f"Per Grok Round 3: Pausing trades until gas normalizes."
+            )
+            return False, gas_cost, f"Gas spike: ${gas_cost:.4f} exceeds max ${max_gas_cost_usd:.4f}"
+
+        return True, gas_cost, f"Gas OK: ${gas_cost:.4f}"
+
+    def is_trade_profitable_after_gas(
+        self,
+        profit_usd: float,
+        num_outcomes: int = 2
+    ) -> Tuple[bool, float, str]:
+        """
+        Check if trade is profitable after accounting for gas costs.
+
+        Per Grok Round 3: Always verify profit > gas before executing.
+
+        Args:
+            profit_usd: Expected raw profit in USD.
+            num_outcomes: Number of outcomes (affects gas).
+
+        Returns:
+            Tuple of (is_profitable, net_profit, message).
+        """
+        gas_cost, is_fallback = self.estimate_gas_cost_usd(
+            operation="market_order",
+            num_operations=num_outcomes,  # One order per outcome
+            num_outcomes=num_outcomes
+        )
+
+        # Add 30% buffer for gas price movement during execution
+        gas_cost_with_buffer = gas_cost * 1.3
+
+        net_profit = profit_usd - gas_cost_with_buffer
+
+        if net_profit <= 0:
+            return False, net_profit, (
+                f"Trade not profitable after gas: profit=${profit_usd:.4f}, "
+                f"gas=${gas_cost_with_buffer:.4f}, net=${net_profit:.4f}"
+            )
+
+        return True, net_profit, f"Profitable: net=${net_profit:.4f} after gas=${gas_cost_with_buffer:.4f}"
+
 
 class ExecutionEngine:
     """Handles order execution for arbitrage opportunities."""

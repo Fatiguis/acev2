@@ -174,7 +174,9 @@ def is_rate_limit_error(exception: Exception) -> bool:
     """
     Check if an exception indicates a rate limit.
 
-    Per Grok audit: py-clob-client exceptions vary - check string patterns.
+    Per Grok audit Round 3: py-clob-client raises custom exceptions with
+    varying messages. Added patterns for allowance/approval failures that
+    may indicate transient issues.
 
     Args:
         exception: The exception to check.
@@ -185,6 +187,33 @@ def is_rate_limit_error(exception: Exception) -> bool:
     error_str = str(exception).lower()
     rate_limit_patterns = [
         '429', 'rate limit', 'too many', 'throttl',
-        'exceeded', 'slow down', 'quota', 'limit exceeded'
+        'exceeded', 'slow down', 'quota', 'limit exceeded',
+        # Per Grok Round 3: py-clob-client specific patterns
+        'invalid allowance',  # Can occur during high-frequency trading
+        'nonce too low',      # Often from burst requests
+        'replacement transaction',  # Gas price race condition
+        'already known',      # Duplicate tx submission
     ]
     return any(pattern in error_str for pattern in rate_limit_patterns)
+
+
+def is_approval_error(exception: Exception) -> bool:
+    """
+    Check if an exception indicates an approval/allowance failure.
+
+    Per Grok Round 3: py-clob-client raises on insufficient approvals.
+    These should trigger re-approval flow, not just retry.
+
+    Args:
+        exception: The exception to check.
+
+    Returns:
+        True if this is an approval-related error.
+    """
+    error_str = str(exception).lower()
+    approval_patterns = [
+        'allowance', 'approval', 'not approved',
+        'insufficient allowance', 'erc20: insufficient allowance',
+        'transfer amount exceeds allowance'
+    ]
+    return any(pattern in error_str for pattern in approval_patterns)

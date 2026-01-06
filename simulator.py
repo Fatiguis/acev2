@@ -337,6 +337,8 @@ class Simulator:
         """
         Simulate execution of an opportunity.
 
+        Per Grok Round 3: Added fee and slippage modeling for realistic simulation.
+
         Returns:
             Tuple of (success, profit, was_partial).
         """
@@ -345,9 +347,44 @@ class Simulator:
             # Partial fill - assume we hedge and break even
             return False, 0.0, True
 
-        # Successful execution
-        profit = opportunity.trade_size_usd * opportunity.profit_margin
-        return True, profit, False
+        # Per Grok Round 3: Add fee and slippage modeling
+        trade_size = opportunity.trade_size_usd
+        raw_profit = trade_size * opportunity.profit_margin
+
+        # Fee modeling (Polymarket implied from POST_ONLY vs taker)
+        # Maker rebate: +0.1%, Taker fee: ~0.2%
+        # Assume 70% maker (post-only), 30% taker (fallback)
+        maker_ratio = 0.70
+        maker_rebate_pct = 0.001  # 0.1%
+        taker_fee_pct = 0.002     # 0.2%
+
+        fee_impact = trade_size * (
+            maker_ratio * (-maker_rebate_pct) +  # Rebate = negative cost
+            (1 - maker_ratio) * taker_fee_pct    # Taker = positive cost
+        )
+
+        # Slippage modeling (price movement between detection and execution)
+        # Conservative: 0.05% avg slippage on small trades
+        avg_slippage_pct = 0.0005
+        slippage_variation = random.gauss(0, 0.0003)  # Std dev 0.03%
+        actual_slippage_pct = max(0, avg_slippage_pct + slippage_variation)
+        slippage_cost = trade_size * actual_slippage_pct
+
+        # Gas cost (Polygon ~$0.01-0.05 per tx, 2 txs per arb)
+        gas_cost = 0.03  # Avg $0.03 total
+
+        # Net profit after fees, slippage, gas
+        net_profit = raw_profit - fee_impact - slippage_cost - gas_cost
+
+        # Log for debugging large discrepancies
+        if abs(net_profit - raw_profit) / max(raw_profit, 0.01) > 0.5:
+            logger.debug(
+                f"Large fee/slippage impact: raw=${raw_profit:.4f}, "
+                f"fees=${fee_impact:.4f}, slip=${slippage_cost:.4f}, "
+                f"net=${net_profit:.4f}"
+            )
+
+        return True, net_profit, False
 
     def run_simulation(self) -> SimulationResult:
         """
