@@ -1325,6 +1325,11 @@ class ArbBot:
         # New enhanced stats
         logger.info(f"Drawdown: {exec_stats.get('drawdown_pct', 0):.2f}% | Circuit breaker: {'ACTIVE' if exec_stats.get('circuit_breaker_active') else 'OK'}")
         logger.info(f"FAK mode: {exec_stats.get('fak_mode', False)} | Idempotency tracked: {exec_stats.get('idempotency_tracked', 0)}")
+        # Per Grok Round 10: Airdrop projection for volume farming motivation
+        if risk_stats.get('trash_mode_enabled'):
+            trash_vol = risk_stats.get('trash_mode_volume_usd', 0)
+            projected_airdrop = risk_stats.get('projected_airdrop_equity_usd', 0)
+            logger.info(f"TRASH MODE: Volume ${trash_vol:.2f} | Projected airdrop: ${projected_airdrop:.4f}")
 
         # Periodic allowance check (for EOA wallets) - detect approval issues early
         if not self.config.dry_run and self.config.wallet.signature_type == 0:
@@ -1367,7 +1372,10 @@ class ArbBot:
             "max_drawdown_pct": risk_stats['max_drawdown_pct'],
             "geo_mean_daily_pct": geo_stats['geo_mean_daily_pct'],
             "compounded_return_pct": geo_stats['compounded_return_pct'],
-            "big_arb_alerts": self._big_arb_alerts_sent
+            "big_arb_alerts": self._big_arb_alerts_sent,
+            # Per Grok Round 10: Airdrop projection for hourly tracking
+            "trash_mode_volume_usd": risk_stats.get('trash_mode_volume_usd', 0),
+            "projected_airdrop_usd": risk_stats.get('projected_airdrop_equity_usd', 0)
         })
 
     async def run(self):
@@ -1483,7 +1491,12 @@ class ArbBot:
             "projected_30d_multiple": risk_stats['projected_30d_multiple'],
             "claims_count": claim_stats['claims_count'],
             "total_claimed_usd": claim_stats['total_claimed_usd'],
-            "mode": "dry_run" if self.config.dry_run else "live"
+            "mode": "dry_run" if self.config.dry_run else "live",
+            # Per Grok Round 10: Airdrop projection for volume farming tracking
+            "trash_mode_enabled": risk_stats.get('trash_mode_enabled', False),
+            "trash_mode_volume_usd": risk_stats.get('trash_mode_volume_usd', 0),
+            "trash_mode_trades": risk_stats.get('trash_mode_trades', 0),
+            "projected_airdrop_usd": risk_stats.get('projected_airdrop_equity_usd', 0)
         }
         exported = self.metrics_exporter.export_all(final_stats)
         if exported.get("session"):

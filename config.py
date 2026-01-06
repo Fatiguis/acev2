@@ -140,6 +140,12 @@ class TradingConfig:
     # Alert if maker fill ratio drops below this threshold
     maker_ratio_alert_threshold: float = 0.30  # Alert if <30% maker fills
 
+    # Per Grok Round 8: Maker rebate rate for PnL tracking
+    # Per Grok Round 10: Polymarket main 0% fees as of Jan 2026 (docs confirmed)
+    # Historical: ~0.02% (2 bps) maker rebate - no longer applicable
+    # Keep field for future fee changes but set to 0.0
+    maker_rebate_rate: float = 0.0  # 0% - Polymarket 0% fees (Jan 2026)
+
     # Fixed gas buffer in USD (Polygon gas ~$0.01-0.05 per tx)
     gas_buffer_usd: float = 0.05
 

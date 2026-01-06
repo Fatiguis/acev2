@@ -9,6 +9,7 @@ burst hitting global limits.
 import logging
 import asyncio
 import time
+import random
 from typing import Optional, Dict
 from dataclasses import dataclass, field
 
@@ -154,13 +155,18 @@ class PerWalletRateLimiter:
     Prevents multiple wallets from firing simultaneously and hitting
     global API limits. Each wallet gets its own bucket with configurable
     requests per second.
+
+    Per Grok Round 8: Added random jitter (0.05-0.2s) to prevent synchronized
+    bursts from hitting Cloudflare/API limits.
     """
 
     def __init__(
         self,
         requests_per_second: float = 2.0,
         window_size_seconds: float = 1.0,
-        min_delay_between_requests: float = 0.1
+        min_delay_between_requests: float = 0.1,
+        jitter_min: float = 0.05,
+        jitter_max: float = 0.2
     ):
         """
         Initialize per-wallet rate limiter.
@@ -169,10 +175,14 @@ class PerWalletRateLimiter:
             requests_per_second: Max requests per wallet per second.
             window_size_seconds: Rolling window size for counting requests.
             min_delay_between_requests: Minimum delay between any two requests.
+            jitter_min: Minimum random jitter in seconds (Per Grok Round 8).
+            jitter_max: Maximum random jitter in seconds (Per Grok Round 8).
         """
         self.requests_per_second = requests_per_second
         self.window_size_seconds = window_size_seconds
         self.min_delay_between_requests = min_delay_between_requests
+        self.jitter_min = jitter_min
+        self.jitter_max = jitter_max
 
         self._wallet_states: Dict[str, WalletRateLimitState] = {}
         self._lock = asyncio.Lock()
@@ -229,6 +239,13 @@ class PerWalletRateLimiter:
             if time_since_wallet < self.min_delay_between_requests:
                 wallet_wait = self.min_delay_between_requests - time_since_wallet
                 wait_time = max(wait_time, wallet_wait)
+
+        # Per Grok Round 8: Add random jitter to prevent synchronized bursts
+        # Multiple wallets or reconnects can synchronize their request timing,
+        # causing burst patterns that trigger Cloudflare/API rate limits.
+        # Random jitter (0.05-0.2s default) breaks this synchronization.
+        jitter = random.uniform(self.jitter_min, self.jitter_max)
+        wait_time += jitter
 
         # Wait outside lock if needed
         if wait_time > 0:

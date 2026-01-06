@@ -584,6 +584,10 @@ class ExecutionEngine:
         self._taker_volume_usd = 0.0  # Volume from taker fills
         self._maker_ratio_alert_sent = False  # Only alert once per session
 
+        # Per Grok Round 8: Track estimated maker rebates for PnL
+        # Polymarket maker rebate is ~0.02% (2 bps), compounds significantly over thousands of trades
+        self._estimated_maker_rebates = 0.0
+
     def set_client(self, client: ClobClient):
         """Set the CLOB client."""
         self.client = client
@@ -2339,22 +2343,28 @@ class ExecutionEngine:
         limit_price: float,
         edge_pct: float = 0.0,
         client: Optional[ClobClient] = None,
-        wallet_state: Optional[Any] = None
+        wallet_state: Optional[Any] = None,
+        is_trash_trade: bool = False
     ) -> OrderResult:
         """
-        Place a post-only limit order for maker rebates, with FAK fallback.
+        Place a post-only limit order for maker rebates - absolute primary strategy.
 
-        Per Grok Round 7: rn1 achieved >90% maker fills by using post-only primary.
-        Post-only orders earn maker rebates (~0.1-0.3% on Polymarket).
-        If not filled within 500ms timeout, falls back to FAK (Fill-And-Kill) to
-        capture remaining edge before other traders take it.
+        Per Grok Round 8: rn1 NEVER pays taker fees - accepts non-fills over crosses.
+        This matches on-chain evidence: >90% maker volume, rebates are core edge.
 
-        FAK vs FOK: FAK allows partial fills (better than nothing), FOK is all-or-nothing.
-        rn1 minimized taker fees via this post-only + FAK fallback pattern.
+        Strategy:
+        1. Post-only GTC order with price improvement
+        2. Wait 500ms for fill
+        3. Check fill status - if >=50% filled, ACCEPT IT (rn1 tolerated partials)
+        4. Only FAK remaining unfilled portion as LAST RESORT
 
-        Dynamic price improvement formula: improvement = base + (edge_pct * 0.5)
-        - Scales linearly with edge: bigger edges get bolder pricing for fill probability
-        - Still earns maker rebates on successful post-only fills
+        Per Grok Round 9: When is_trash_trade=True (volume farming mode):
+        - Use PURE post-only with NO FAK retry
+        - Accept ANY partial or zero fill
+        - rn1 bought cheap losers without chasing crosses - volume over fills
+
+        Key insight: rn1 preferred losing an arb opportunity over paying taker fees.
+        Maker rebates (~0.02%) compound significantly over thousands of trades.
 
         Args:
             token_id: Token ID to trade.
@@ -2365,6 +2375,7 @@ class ExecutionEngine:
             edge_pct: Arb edge as decimal (e.g., 0.005 for 0.5%).
             client: Optional CLOB client to use.
             wallet_state: Optional wallet state for tracking.
+            is_trash_trade: If True, pure post-only mode (no FAK retry, accept any fill).
 
         Returns:
             OrderResult with execution details.
@@ -2382,26 +2393,16 @@ class ExecutionEngine:
         )
 
         # Dynamic price improvement: improvement = base + (edge_pct * 0.5)
-        # e.g., 0.5% edge (0.005) -> 0.005 + 0.005*0.5 = 0.0075 (0.75 cents)
-        # e.g., 1% edge (0.01) -> 0.005 + 0.01*0.5 = 0.01 (1 cent)
-        # e.g., 2% edge (0.02) -> 0.005 + 0.02*0.5 = 0.015 (1.5 cents)
-        # Bolder on bigger edges for fill probability, still earns maker rebates
         price_improvement = base_improvement + (edge_pct * 0.5)
-
-        # Cap improvement at 3 cents to preserve margin
-        price_improvement = min(price_improvement, 0.03)
+        price_improvement = min(price_improvement, 0.03)  # Cap at 3 cents
 
         # Calculate improved price for post-only
-        # For BUY: post above current best bid (to be at top of book)
-        # For SELL: post below current best ask (to be at top of book)
         if side == BUY:
-            post_price = min(limit_price + price_improvement, 0.99)  # Cap at 0.99
+            post_price = min(limit_price + price_improvement, 0.99)
         else:
-            post_price = max(limit_price - price_improvement, 0.01)  # Floor at 0.01
+            post_price = max(limit_price - price_improvement, 0.01)
 
         try:
-            # Create limit order args with post-only flag
-            # Calculate size in shares from USD
             size_shares = size_usd / post_price if post_price > 0 else 0
 
             order_args = OrderArgs(
@@ -2411,43 +2412,121 @@ class ExecutionEngine:
                 side=side,
             )
 
-            # Create order with post-only option
-            # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
             signed_order = await run_sync_in_thread(execution_client.create_order, order_args)
-
-            # Submit as GTC (Good Till Cancelled) - will act as post-only
             response = await run_sync_in_thread(execution_client.post_order, signed_order, OrderType.GTC)
 
             if response and response.get("success"):
                 order_id = response.get("orderID")
                 result.order_id = order_id
 
-                # Wait for fill or timeout
-                filled = await self._wait_for_fill(execution_client, order_id, timeout)
+                # Per Grok Round 8: Wait and check for partial fills
+                fill_status = await self._wait_for_fill_with_partial(
+                    execution_client, order_id, timeout, size_shares
+                )
 
-                if filled:
+                filled_shares = fill_status.get("filled_shares", 0)
+                filled_usd = filled_shares * post_price
+                fill_ratio = filled_shares / size_shares if size_shares > 0 else 0
+
+                if fill_ratio >= 1.0:
+                    # Full fill - best case
                     result.status = OrderStatus.FILLED
                     result.executed_size_usd = size_usd
-                    # Track maker fill
                     self._maker_fills += 1
                     self._maker_volume_usd += size_usd
+                    # Track maker rebate estimate
+                    self._track_maker_rebate(size_usd)
                     logger.debug(
-                        f"Post-only filled (MAKER): {side} {outcome_name} @ {post_price:.4f} "
-                        f"for ${size_usd:.2f} (rebate earned!)"
+                        f"Post-only FULL FILL (MAKER): {side} {outcome_name} @ {post_price:.4f} "
+                        f"${size_usd:.2f} (rebate: ${size_usd * 0.0002:.4f})"
                     )
                     return result
-                else:
-                    # Cancel unfilled order and fall back to FAK
-                    # Per Grok Round 7: FAK allows partial fills (better than nothing)
+
+                elif fill_ratio >= 0.5:
+                    # Per Grok Round 8: >=50% filled - ACCEPT IT (rn1 pattern)
+                    # Cancel remaining, don't chase with taker order
                     try:
-                        # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
                         await run_sync_in_thread(execution_client.cancel, order_id)
-                        logger.debug(f"Post-only timed out after {timeout}s, cancelled {order_id}, falling back to FAK")
                     except Exception:
                         pass
 
-                    # Fall back to FAK (Fill-And-Kill) - allows partial fills
-                    # Per Grok Round 7: Don't reduce size - FAK handles partial liquidity
+                    result.status = OrderStatus.PARTIAL
+                    result.executed_size_usd = filled_usd
+                    self._maker_fills += 1
+                    self._maker_volume_usd += filled_usd
+                    self._track_maker_rebate(filled_usd)
+                    logger.info(
+                        f"Post-only PARTIAL ACCEPTED (MAKER): {side} {outcome_name} "
+                        f"${filled_usd:.2f}/{size_usd:.2f} ({fill_ratio*100:.0f}%) - rn1 pattern"
+                    )
+                    return result
+
+                elif fill_ratio > 0:
+                    # <50% filled - cancel order
+                    try:
+                        await run_sync_in_thread(execution_client.cancel, order_id)
+                    except Exception:
+                        pass
+
+                    # Track the partial maker fill
+                    self._maker_fills += 1
+                    self._maker_volume_usd += filled_usd
+                    self._track_maker_rebate(filled_usd)
+
+                    # Per Grok Round 9: For trash trades, accept ANY partial - no FAK chase
+                    # rn1 bought cheap losers for volume, not fill optimization
+                    if is_trash_trade:
+                        result.status = OrderStatus.PARTIAL
+                        result.executed_size_usd = filled_usd
+                        logger.info(
+                            f"TRASH TRADE partial accepted (MAKER): {side} {outcome_name} "
+                            f"${filled_usd:.2f}/{size_usd:.2f} ({fill_ratio*100:.0f}%) - volume farming"
+                        )
+                        return result
+
+                    remaining_usd = size_usd - filled_usd
+                    logger.debug(
+                        f"Post-only partial ({fill_ratio*100:.0f}%), FAK remaining ${remaining_usd:.2f}"
+                    )
+
+                    # FAK only the remaining unfilled portion
+                    fak_result = await self._place_market_order(
+                        token_id=token_id,
+                        outcome_name=outcome_name,
+                        side=side,
+                        size_usd=remaining_usd,
+                        limit_price=limit_price,
+                        retry_on_no_match=False,
+                        client=client,
+                        wallet_state=wallet_state,
+                        use_ioc=True
+                    )
+
+                    # Combine results
+                    result.executed_size_usd = filled_usd + fak_result.executed_size_usd
+                    result.status = OrderStatus.FILLED if result.executed_size_usd >= size_usd * 0.9 else OrderStatus.PARTIAL
+                    return result
+
+                else:
+                    # Zero fill - cancel order
+                    try:
+                        await run_sync_in_thread(execution_client.cancel, order_id)
+                    except Exception:
+                        pass
+
+                    # Per Grok Round 9: For trash trades, accept zero fill - no FAK chase
+                    # rn1 prioritized volume (order count) over actual fills
+                    if is_trash_trade:
+                        result.status = OrderStatus.CANCELLED
+                        result.executed_size_usd = 0
+                        logger.info(
+                            f"TRASH TRADE zero fill accepted: {side} {outcome_name} "
+                            f"${size_usd:.2f} @ ${limit_price:.4f} - pure post-only, no FAK"
+                        )
+                        return result
+
+                    logger.debug(f"Post-only zero fill after {timeout}s, FAK fallback")
+
                     return await self._place_market_order(
                         token_id=token_id,
                         outcome_name=outcome_name,
@@ -2457,13 +2536,20 @@ class ExecutionEngine:
                         retry_on_no_match=True,
                         client=client,
                         wallet_state=wallet_state,
-                        use_ioc=True  # FAK mode explicitly
+                        use_ioc=True
                     )
             else:
                 error_msg = response.get("errorMsg", "Unknown error") if response else "No response"
-                logger.debug(f"Post-only submission failed: {error_msg}, falling back to FAK")
 
-                # Fall back to FAK on submission error
+                # Per Grok Round 9: For trash trades, don't fall back to FAK on submission failure
+                if is_trash_trade:
+                    logger.debug(f"TRASH TRADE submission failed: {error_msg} - no FAK fallback")
+                    result.status = OrderStatus.FAILED
+                    result.error = error_msg
+                    return result
+
+                logger.debug(f"Post-only submission failed: {error_msg}, FAK fallback")
+
                 return await self._place_market_order(
                     token_id=token_id,
                     outcome_name=outcome_name,
@@ -2473,13 +2559,19 @@ class ExecutionEngine:
                     retry_on_no_match=True,
                     client=client,
                     wallet_state=wallet_state,
-                    use_ioc=True  # FAK mode explicitly
+                    use_ioc=True
                 )
 
         except Exception as e:
-            logger.debug(f"Post-only exception: {e}, falling back to FAK")
+            # Per Grok Round 9: For trash trades, don't fall back to FAK on exception
+            if is_trash_trade:
+                logger.debug(f"TRASH TRADE exception: {e} - no FAK fallback")
+                result.status = OrderStatus.FAILED
+                result.error = str(e)
+                return result
 
-            # Fall back to FAK on any error
+            logger.debug(f"Post-only exception: {e}, FAK fallback")
+
             return await self._place_market_order(
                 token_id=token_id,
                 outcome_name=outcome_name,
@@ -2489,8 +2581,22 @@ class ExecutionEngine:
                 retry_on_no_match=True,
                 client=client,
                 wallet_state=wallet_state,
-                use_ioc=True  # FAK mode explicitly
+                use_ioc=True
             )
+
+    def _track_maker_rebate(self, volume_usd: float):
+        """
+        Per Grok Round 8: Track estimated maker rebates for PnL.
+
+        Polymarket maker rebate is ~0.02% (2 bps). This compounds significantly
+        over thousands of trades - core to rn1's edge.
+
+        Args:
+            volume_usd: Volume that earned maker rebate.
+        """
+        rebate_rate = self.config.trading.maker_rebate_rate
+        rebate = volume_usd * rebate_rate
+        self._estimated_maker_rebates += rebate
 
     async def _wait_for_fill(
         self,
@@ -2528,6 +2634,77 @@ class ExecutionEngine:
             await asyncio.sleep(check_interval)
 
         return False
+
+    async def _wait_for_fill_with_partial(
+        self,
+        client: ClobClient,
+        order_id: str,
+        timeout_seconds: float,
+        total_size_shares: float
+    ) -> dict:
+        """
+        Per Grok Round 8: Wait for order fill and return partial fill status.
+
+        Unlike _wait_for_fill which returns bool, this returns fill details
+        to support rn1's partial acceptance strategy (>=50% filled = accept).
+
+        Args:
+            client: CLOB client to check order status.
+            order_id: Order ID to monitor.
+            timeout_seconds: Maximum time to wait.
+            total_size_shares: Total order size in shares for fill ratio calculation.
+
+        Returns:
+            Dict with:
+            - filled_shares: Number of shares filled (0 if none)
+            - status: Order status string
+            - is_complete: True if fully filled or cancelled/expired
+        """
+        start = datetime.now(timezone.utc)
+        check_interval = 0.1  # 100ms between checks
+        filled_shares = 0.0
+
+        while (datetime.now(timezone.utc) - start).total_seconds() < timeout_seconds:
+            try:
+                # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
+                order = await run_sync_in_thread(client.get_order, order_id)
+                if order:
+                    status = order.get("status", "").lower()
+
+                    # Check for filled amount (may be partial)
+                    # py-clob-client returns 'size_matched' for filled portion
+                    size_matched = float(order.get("size_matched", 0) or 0)
+                    original_size = float(order.get("original_size", total_size_shares) or total_size_shares)
+
+                    filled_shares = size_matched
+
+                    if status in ("matched", "filled"):
+                        # Fully filled
+                        return {
+                            "filled_shares": original_size,  # Full size for complete fill
+                            "status": status,
+                            "is_complete": True
+                        }
+                    elif status in ("cancelled", "expired"):
+                        # Cancelled/expired - return whatever was filled
+                        return {
+                            "filled_shares": filled_shares,
+                            "status": status,
+                            "is_complete": True
+                        }
+                    # Still open - continue waiting
+
+            except Exception as e:
+                logger.debug(f"Error checking order status: {e}")
+
+            await asyncio.sleep(check_interval)
+
+        # Timeout - return current fill state
+        return {
+            "filled_shares": filled_shares,
+            "status": "timeout",
+            "is_complete": False
+        }
 
     async def _dry_run_execute(self, opportunity: ArbOpportunity) -> ExecutionResult:
         """Simulate execution in dry run mode."""

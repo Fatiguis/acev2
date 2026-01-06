@@ -8,6 +8,7 @@ Hot markets get reduced sizing due to lower fill probability.
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Any, TYPE_CHECKING
@@ -112,6 +113,27 @@ class RiskManager:
         # Per Grok Round 7: Edge model for expectancy-based sizing
         self._edge_model: Optional['EdgeExpectancyModel'] = None
         self._init_edge_model()
+
+        # Per Grok Round 8: Optional trash_mode for volume farming
+        # When enabled, allows buying near-certain losers (<$0.03) for volume farming
+        # This is HIGHLY SPECULATIVE - only for airdrop farming speculation
+        # Default: OFF (disabled)
+        self._trash_mode_enabled = os.getenv("TRASH_MODE", "false").lower() == "true"
+        self._trash_mode_max_price = 0.03  # Only buy at <$0.03 (3 cents)
+        self._trash_mode_max_size_usd = 5.0  # Per Grok Round 9: Max $5 per trash trade (ultra-conservative)
+        self._trash_mode_trades = 0  # Track trash volume trades
+        self._trash_mode_volume_usd = 0.0  # Track trash volume in USD
+
+        # Per Grok Round 9: Airdrop allocation speculation
+        # Rumored allocation: $0.01-0.05 per $1k volume (highly speculative)
+        # rn1 farmed heavily (confirmed 2026 posts) - this motivates trash safely
+        self._airdrop_allocation_per_1k_volume = 0.03  # $0.03 per $1k volume (mid estimate)
+
+        if self._trash_mode_enabled:
+            logger.warning(
+                "TRASH MODE ENABLED: Buying near-certain losers at <$0.03 for volume farming. "
+                "This is HIGHLY SPECULATIVE and for airdrop farming only!"
+            )
 
     def _init_edge_model(self):
         """
@@ -709,6 +731,114 @@ class RiskManager:
         """Get current unhedged exposure in USD."""
         return self._current_unhedged_exposure
 
+    # =========================================================================
+    # TRASH MODE: Volume Farming (Per Grok Round 8)
+    # =========================================================================
+
+    def is_trash_mode_enabled(self) -> bool:
+        """
+        Per Grok Round 8: Check if trash mode is enabled.
+
+        Trash mode is for volume farming - buying near-certain losers (<$0.03)
+        purely for volume metrics (airdrop speculation).
+
+        Returns:
+            True if TRASH_MODE=true in env.
+        """
+        return self._trash_mode_enabled
+
+    def is_trash_trade_candidate(self, price: float, is_near_resolution: bool = False) -> bool:
+        """
+        Per Grok Round 8: Check if a price qualifies for trash volume trading.
+
+        Trash trades are:
+        - Priced at <$0.03 (near-certain losers)
+        - Near resolution (within 24h) - price won't recover
+
+        Args:
+            price: The ask price for the outcome.
+            is_near_resolution: True if market is <24h from resolution.
+
+        Returns:
+            True if this qualifies as a trash trade candidate.
+        """
+        if not self._trash_mode_enabled:
+            return False
+
+        if price > self._trash_mode_max_price:
+            return False
+
+        # Prefer markets near resolution (price won't recover)
+        # But allow any <$0.03 if trash mode is on
+        return True
+
+    def get_trash_trade_size(self, price: float, available_depth_usd: float) -> float:
+        """
+        Per Grok Round 8: Calculate size for a trash volume trade.
+
+        Trash trades are capped at a small fixed amount to minimize losses
+        while maximizing volume for airdrop farming.
+
+        Args:
+            price: The ask price for the outcome.
+            available_depth_usd: Available depth at this price.
+
+        Returns:
+            Trade size in USD (0 if not a valid trash trade).
+        """
+        if not self.is_trash_trade_candidate(price):
+            return 0.0
+
+        # Cap at trash mode max size
+        size = min(self._trash_mode_max_size_usd, available_depth_usd)
+
+        # Minimum viable size ($1)
+        if size < 1.0:
+            return 0.0
+
+        return size
+
+    def record_trash_trade(self, size_usd: float, price: float):
+        """
+        Per Grok Round 8: Record a trash volume trade.
+
+        Args:
+            size_usd: Trade size in USD.
+            price: Price paid per share.
+        """
+        self._trash_mode_trades += 1
+        self._trash_mode_volume_usd += size_usd
+        logger.info(
+            f"TRASH TRADE #{self._trash_mode_trades}: ${size_usd:.2f} @ ${price:.4f} "
+            f"(total trash volume: ${self._trash_mode_volume_usd:.2f})"
+        )
+
+    def get_trash_mode_stats(self) -> Dict[str, Any]:
+        """
+        Per Grok Round 8/9: Get trash mode statistics including airdrop projection.
+
+        Returns:
+            Dict with trash mode stats.
+        """
+        # Per Grok Round 9: Calculate projected airdrop equity
+        # Formula: trash_volume * (allocation_per_1k / 1000)
+        # Example: $10k volume * ($0.03 / $1k) = $0.30 projected airdrop
+        projected_airdrop_equity = (
+            self._trash_mode_volume_usd * self._airdrop_allocation_per_1k_volume / 1000
+        )
+
+        return {
+            "trash_mode_enabled": self._trash_mode_enabled,
+            "trash_mode_trades": self._trash_mode_trades,
+            "trash_mode_volume_usd": self._trash_mode_volume_usd,
+            "trash_mode_max_price": self._trash_mode_max_price,
+            "trash_mode_max_size_usd": self._trash_mode_max_size_usd,
+            # Per Grok Round 9: Speculative airdrop projection
+            # HIGHLY SPECULATIVE - rumored $0.01-0.05 per $1k volume
+            "projected_airdrop_equity_usd": projected_airdrop_equity,
+            "airdrop_allocation_per_1k_volume": self._airdrop_allocation_per_1k_volume,
+        }
+
     def check_position_age_risk(self, positions: List[Position]) -> List[Position]:
         """
         Check for positions approaching resolution that may need early exit.
@@ -797,7 +927,7 @@ class RiskManager:
     def get_stats(self) -> Dict[str, Any]:
         """Get risk management statistics."""
         metrics = self.get_metrics()
-        return {
+        stats = {
             "initial_capital_usd": self._initial_capital,
             "current_capital_usd": self._current_capital,
             "peak_capital_usd": self._peak_capital,
@@ -822,6 +952,9 @@ class RiskManager:
             "maker_ratio_pct": self.get_maker_ratio() * 100,
             "unhedged_exposure_usd": self._current_unhedged_exposure,
         }
+        # Per Grok Round 8: Include trash mode stats
+        stats.update(self.get_trash_mode_stats())
+        return stats
 
 
 class DepthValidator:
