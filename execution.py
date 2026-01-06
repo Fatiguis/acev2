@@ -600,6 +600,27 @@ class ExecutionEngine:
         # Polymarket maker rebate is ~0.02% (2 bps), compounds significantly over thousands of trades
         self._estimated_maker_rebates = 0.0
 
+        # Per Grok Round 23: Variance tracking for Kelly integration
+        # Track returns per heat level for variance-adjusted sizing
+        # f* = max(0, (edge - fees) / variance) - rn1's smooth compounding formula
+        from collections import deque
+        self._returns_by_heat: Dict[str, deque] = {
+            "cold": deque(maxlen=100),
+            "warm": deque(maxlen=100),
+            "hot": deque(maxlen=100),
+            "blazing": deque(maxlen=100),
+        }
+        self._partial_rates_by_heat: Dict[str, deque] = {
+            "cold": deque(maxlen=100),
+            "warm": deque(maxlen=100),
+            "hot": deque(maxlen=100),
+            "blazing": deque(maxlen=100),
+        }
+
+        # Per Grok Round 23: Minimum EV threshold (0.1% post-fees/slippage)
+        # rn1's ~0.8% avg edge filter - don't trade if expected value too low
+        self._min_ev_threshold = 0.001  # 0.1% minimum expected value
+
     def set_client(self, client: ClobClient):
         """Set the CLOB client."""
         self.client = client
@@ -613,6 +634,101 @@ class ExecutionEngine:
         """
         self._wallet_manager = wallet_manager
         logger.info(f"Wallet manager set with {wallet_manager.get_wallet_count()} wallet(s)")
+
+    def record_trade_return(self, return_pct: float, heat: str, was_partial: bool = False):
+        """
+        Per Grok Round 23: Record trade return for variance calculation.
+
+        Used by Kelly formula: f* = max(0, (edge - fees) / variance)
+        Tracks returns per heat level for heat-specific variance estimation.
+
+        Args:
+            return_pct: Return as decimal (e.g., 0.008 for 0.8% profit).
+            heat: Market heat level ("cold", "warm", "hot", "blazing").
+            was_partial: True if this was a partial fill.
+        """
+        heat_lower = heat.lower()
+        if heat_lower in self._returns_by_heat:
+            self._returns_by_heat[heat_lower].append(return_pct)
+            self._partial_rates_by_heat[heat_lower].append(1.0 if was_partial else 0.0)
+
+    def get_variance_for_heat(self, heat: str) -> float:
+        """
+        Per Grok Round 23: Get variance of returns for a heat level.
+
+        Used for Kelly sizing: f* = edge / variance
+        Returns default variance if insufficient data.
+
+        Args:
+            heat: Market heat level.
+
+        Returns:
+            Variance of returns (minimum 1e-6 to avoid division by zero).
+        """
+        heat_lower = heat.lower()
+        returns = list(self._returns_by_heat.get(heat_lower, []))
+
+        if len(returns) < 10:
+            # Default variance by heat (higher heat = higher variance)
+            default_variances = {
+                "cold": 0.0001,    # 0.01% std dev
+                "warm": 0.0004,    # 0.02% std dev
+                "hot": 0.0009,     # 0.03% std dev
+                "blazing": 0.0016, # 0.04% std dev
+            }
+            return default_variances.get(heat_lower, 0.0004)
+
+        mean_return = sum(returns) / len(returns)
+        variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
+
+        # Boost variance for high partial rate (partials = more volatility)
+        partial_rates = list(self._partial_rates_by_heat.get(heat_lower, []))
+        if partial_rates:
+            partial_rate = sum(partial_rates) / len(partial_rates)
+            variance *= (1 + partial_rate * 0.5)  # Up to 50% boost
+
+        return max(variance, 1e-6)
+
+    def get_partial_rate_for_heat(self, heat: str) -> float:
+        """
+        Per Grok Round 23: Get partial fill rate for a heat level.
+
+        Args:
+            heat: Market heat level.
+
+        Returns:
+            Partial fill rate (0.0 to 1.0).
+        """
+        heat_lower = heat.lower()
+        partial_rates = list(self._partial_rates_by_heat.get(heat_lower, []))
+        if not partial_rates:
+            # Default partial rates by heat (higher heat = more partials)
+            defaults = {"cold": 0.10, "warm": 0.18, "hot": 0.25, "blazing": 0.35}
+            return defaults.get(heat_lower, 0.22)
+        return sum(partial_rates) / len(partial_rates)
+
+    def check_ev_threshold(self, edge_pct: float, fill_probability: float, fees_pct: float = 0.0) -> bool:
+        """
+        Per Grok Round 23: Check if expected value meets minimum threshold.
+
+        rn1's ~0.8% avg edge filter - don't trade if EV too low after fees/slippage.
+
+        Args:
+            edge_pct: Raw edge as decimal.
+            fill_probability: Probability of fill (0-1).
+            fees_pct: Expected fees as decimal.
+
+        Returns:
+            True if EV >= min threshold (0.1%).
+        """
+        expected_value = (edge_pct - fees_pct) * fill_probability
+        if expected_value < self._min_ev_threshold:
+            logger.debug(
+                f"EV below threshold: {expected_value*100:.3f}% < {self._min_ev_threshold*100:.1f}% "
+                f"(edge={edge_pct*100:.2f}%, fill_prob={fill_probability:.0%})"
+            )
+            return False
+        return True
 
     async def get_execution_client(self, min_balance: float = 0.0) -> Tuple[Optional[ClobClient], Optional[Any]]:
         """

@@ -82,6 +82,11 @@ class EdgeEstimate:
     market_heat: MarketHeat       # Market activity level
     capture_rate_vs_rn1: float    # Our capture rate vs rn1-tier bots
 
+    # Per Grok Round 23: Variance output for Kelly integration
+    # f* = max(0, (edge - fees) / variance)
+    estimated_variance: float = 0.0004  # Default ~0.02% std dev
+    kelly_fraction: float = 0.0         # Optimal Kelly fraction for this trade
+
 
 class EdgeExpectancyModel:
     """
@@ -313,6 +318,27 @@ class EdgeExpectancyModel:
         )
         capture_rate = fill_prob / rn1_fill_prob if rn1_fill_prob > 0 else 0
 
+        # Per Grok Round 23: Estimate variance for Kelly integration
+        # Variance increases with heat (more competition = more volatility)
+        # Formula: σ² ∝ (1 - fill_prob) × heat_factor
+        heat_variance_factors = {
+            MarketHeat.COLD: 0.0001,    # 0.01% base variance
+            MarketHeat.WARM: 0.0004,    # 0.02% base variance
+            MarketHeat.HOT: 0.0009,     # 0.03% base variance
+            MarketHeat.BLAZING: 0.0016, # 0.04% base variance
+        }
+        base_variance = heat_variance_factors.get(heat, 0.0004)
+        # Adjust for fill probability (lower fill = higher variance)
+        estimated_variance = base_variance * (1 + (1 - fill_prob))
+
+        # Per Grok Round 23: Calculate optimal Kelly fraction
+        # f* = max(0, (edge - fees) / variance)
+        fees_pct = self.config.taker_fee_pct  # Conservative: assume taker
+        adjusted_edge = expected_edge - fees_pct
+        kelly_fraction = max(0, adjusted_edge / estimated_variance) if estimated_variance > 0 else 0
+        # Apply fractional Kelly (0.5 = half-Kelly for safety)
+        kelly_fraction = min(kelly_fraction * 0.5, 0.05)  # Cap at 5%
+
         return EdgeEstimate(
             raw_edge_pct=raw_edge_pct,
             fill_probability=fill_prob,
@@ -323,6 +349,8 @@ class EdgeExpectancyModel:
             latency_ms=effective_latency_ms,
             market_heat=heat,
             capture_rate_vs_rn1=capture_rate,
+            estimated_variance=estimated_variance,
+            kelly_fraction=kelly_fraction,
         )
 
     def calculate_expected_profit(
