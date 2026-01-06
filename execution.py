@@ -1248,7 +1248,7 @@ class ExecutionEngine:
         if opportunity.arb_type == ArbType.SELL_ARB:
             # Check buy_arb_only mode first
             if self.config.trading.buy_arb_only:
-                logger.debug("Skipping sell_arb: BUY_ARB_ONLY mode enabled")
+                logger.info("Skipped SELL_ARB (buy_only mode - RN1 alignment, no shorts on Polymarket)")
                 return ExecutionResult(
                     opportunity=opportunity,
                     is_complete=False,
