@@ -680,24 +680,23 @@ class WalletManager:
     def _calculate_dynamic_approval(self) -> int:
         """
         Per Grok Round 6: Calculate dynamic approval cap based on actual capital.
+        Per Grok Round 20: Aligned with auth.py capped approvals for consistency.
 
         Fixed $10M was arbitrary - should scale with actual trading capital.
-        Uses 2x total wallet balance as approval cap (headroom for profits/deposits).
+        Uses fixed $50k cap matching auth.py CAPPED_APPROVAL_USDC for security.
 
         Returns:
             Approval amount in USDC atomic units (6 decimals).
         """
-        total_balance = sum(w.usdc_balance for w in self._wallets if w.is_initialized)
+        # Per Grok Round 20: Use fixed $50k cap like auth.py for CTF approvals
+        # This matches the CAPPED_APPROVAL_USDC pattern - limits exposure if
+        # any CTF contract is compromised
+        #
+        # For rn1-style micro-arbs, $50k is more than sufficient per trade batch
+        # Re-approve when balance drops below $10k threshold
+        CAPPED_APPROVAL = 50_000  # $50k cap matching auth.py
 
-        # Minimum $100k approval (avoid re-approving for small amounts)
-        min_approval = 100_000
-
-        # 2x current balance gives headroom for deposits/profits
-        # Capped at $50M as reasonable maximum
-        dynamic_cap = max(total_balance * 2, min_approval)
-        dynamic_cap = min(dynamic_cap, 50_000_000)  # Cap at $50M
-
-        return int(dynamic_cap * 10**6)  # Convert to USDC atomic units
+        return int(CAPPED_APPROVAL * 10**6)  # Convert to USDC atomic units
 
     async def ensure_ctf_approvals(
         self,
@@ -720,12 +719,15 @@ class WalletManager:
         Per Grok Round 6: Dynamic approval cap based on actual capital instead
         of fixed $10M. Uses 2x current balance with $50M max cap.
 
+        Per Grok Round 20 CRITICAL: Capped to $50k to match auth.py pattern.
+        Unlimited approvals (uint256.max) are a security risk.
+
         Args:
             wallet: Specific wallet to approve, or None for all wallets.
-            use_specific_amount: If True, use dynamic cap instead of unlimited.
-                                 Recommended for security (py-clob-client pattern).
+            use_specific_amount: If True, use capped $50k amount (recommended).
+                                 Setting False is DEPRECATED and logs warning.
             custom_amount_usd: Optional custom approval amount in USD. If not set,
-                               uses dynamic calculation (2x balance, $50M max).
+                               uses $50k cap matching auth.py.
 
         Returns:
             True if all approvals successful.
@@ -740,21 +742,26 @@ class WalletManager:
 
         wallets_to_check = [wallet] if wallet else self._wallets
 
-        # Per Grok Round 6: Dynamic approval based on actual capital
+        # Per Grok Round 20: Always use capped approvals (security)
         if use_specific_amount:
             if custom_amount_usd is not None:
                 approval_amount = int(custom_amount_usd * 10**6)
-                logger.info(f"Using custom approval amount (${custom_amount_usd:,.0f})")
+                logger.info(f"Using custom CTF approval amount (${custom_amount_usd:,.0f})")
             else:
                 approval_amount = self._calculate_dynamic_approval()
                 approval_usd = approval_amount / 10**6
                 logger.info(
-                    f"Using dynamic approval amount (${approval_usd:,.0f}) - "
-                    f"2x current balance, capped at $50M"
+                    f"Using capped CTF approval (${approval_usd:,.0f}) - "
+                    f"matching auth.py security pattern"
                 )
         else:
-            approval_amount = 2 ** 256 - 1  # MAX_UINT256 (unlimited - not recommended)
-            logger.warning("Using UNLIMITED approval - consider use_specific_amount=True for security")
+            # Per Grok Round 20: Unlimited is DEPRECATED - still allow but warn loudly
+            approval_amount = 2 ** 256 - 1  # MAX_UINT256
+            logger.warning(
+                "SECURITY WARNING: Using UNLIMITED CTF approval (DEPRECATED). "
+                "This exposes all funds if any CTF contract is compromised. "
+                "Set use_specific_amount=True (default) for capped $50k approvals."
+            )
 
         success = True
         for w in wallets_to_check:

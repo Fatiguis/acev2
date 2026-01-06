@@ -8,6 +8,9 @@ Key advantages over HTTP polling:
 - Latency: ~50ms vs ~800ms (16x faster)
 - Fill probability: P(fill|50ms) ≈ 70% vs P(fill|800ms) ≈ 10%
 - No rate limits on websocket (vs 100 req/min HTTP)
+
+Per Grok Round 20: Added heartbeat monitor to detect silent disconnects.
+Without monitoring, WS can go stale without error → falls back to slow HTTP.
 """
 
 import asyncio
@@ -197,6 +200,13 @@ class PolymarketWebSocket:
         # Background tasks
         self._receive_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+
+        # Per Grok Round 20: Heartbeat monitoring to detect silent disconnects
+        self._last_message_time: Optional[float] = None  # Unix timestamp of last message
+        self._last_pong_time: Optional[float] = None  # Unix timestamp of last successful pong
+        self._heartbeat_failures = 0  # Consecutive heartbeat failures
+        self._max_heartbeat_failures = 3  # Trigger reconnect after this many failures
+        self._message_timeout_seconds = 60.0  # No messages for this long = stale
 
         # Stats
         self._messages_received = 0
@@ -421,21 +431,62 @@ class PolymarketWebSocket:
                 await asyncio.sleep(0.1)
 
     async def _heartbeat_loop(self):
-        """Send periodic heartbeats to keep connection alive."""
+        """
+        Per Grok Round 20: Enhanced heartbeat with monitoring to detect silent disconnects.
+
+        Monitors:
+        1. Ping/pong responses - detects network issues
+        2. Message flow - detects server-side issues (no updates coming)
+
+        Triggers reconnect if:
+        - 3+ consecutive ping failures
+        - No messages received for 60+ seconds
+        """
         while self._state == ConnectionState.CONNECTED and self._ws:
             try:
                 await asyncio.sleep(25)  # Heartbeat every 25s
 
-                if self._ws:
-                    # Send ping
-                    pong_waiter = await self._ws.ping()
-                    await asyncio.wait_for(pong_waiter, timeout=10)
+                if not self._ws:
+                    break
+
+                # Send ping and wait for pong
+                pong_waiter = await self._ws.ping()
+                await asyncio.wait_for(pong_waiter, timeout=10)
+
+                # Per Grok Round 20: Record successful pong
+                self._last_pong_time = time.time()
+                self._heartbeat_failures = 0  # Reset on success
+
+                # Per Grok Round 20: Check for message flow staleness
+                # If we got pong but no messages, server might be alive but not sending updates
+                if self._last_message_time is not None:
+                    message_age = time.time() - self._last_message_time
+                    if message_age > self._message_timeout_seconds:
+                        logger.warning(
+                            f"[WS MONITOR] No messages for {message_age:.0f}s despite healthy ping. "
+                            f"Connection may be stale - triggering reconnect."
+                        )
+                        await self._handle_disconnect()
+                        break
 
             except asyncio.TimeoutError:
-                logger.warning("Heartbeat timeout, connection may be stale")
+                # Per Grok Round 20: Track consecutive failures
+                self._heartbeat_failures += 1
+                logger.warning(
+                    f"[WS MONITOR] Heartbeat timeout ({self._heartbeat_failures}/{self._max_heartbeat_failures})"
+                )
+
+                if self._heartbeat_failures >= self._max_heartbeat_failures:
+                    logger.error(
+                        f"[WS MONITOR] {self._max_heartbeat_failures} consecutive heartbeat failures - "
+                        f"connection is dead, forcing reconnect"
+                    )
+                    await self._handle_disconnect()
+                    break
 
             except Exception as e:
-                logger.debug(f"Heartbeat error: {e}")
+                self._heartbeat_failures += 1
+                logger.warning(f"[WS MONITOR] Heartbeat error ({self._heartbeat_failures}): {e}")
 
     async def _handle_disconnect(self):
         """
@@ -487,6 +538,9 @@ class PolymarketWebSocket:
     async def _handle_message(self, raw_message: str):
         """Process incoming websocket message."""
         receive_time = time.time() * 1000  # Current time in ms
+
+        # Per Grok Round 20: Track last message time for staleness detection
+        self._last_message_time = time.time()
 
         try:
             message = json.loads(raw_message)

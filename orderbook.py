@@ -1,14 +1,20 @@
 """
 Orderbook Polling & Arbitrage Detection Module.
 Asynchronously polls orderbooks and detects arbitrage opportunities.
+
+Per Grok Round 20 CRITICAL FIX: Multi-outcome arb detection.
+Binary markets: sum(asks) < 1 or sum(bids) > 1 is sufficient.
+Multi-outcome markets (3+): Must check subset combinations where
+buying a subset of outcomes costs < $1 but guarantees $1 payout.
 """
 
 import logging
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 from enum import Enum
+from itertools import combinations
 import aiohttp
 
 from config import BotConfig, calculate_dynamic_threshold
@@ -812,6 +818,85 @@ class OrderbookPoller:
         weighted_avg = weighted_sum / total_size
         return weighted_avg, total_depth_usd
 
+    def _detect_multi_outcome_subset_arb(
+        self,
+        orderbooks: List[Orderbook],
+        market: 'Market',
+        dynamic_threshold: float
+    ) -> Optional[Tuple[List[Orderbook], float]]:
+        """
+        Per Grok Round 20 CRITICAL: Detect subset arb in multi-outcome markets.
+
+        For markets with 3+ outcomes (e.g., election with multiple candidates),
+        simple sum(asks) < 1 is insufficient. We need to find subsets where:
+        - Buying the subset of outcomes guarantees a $1 payout
+        - Sum of asks for subset < $1 - threshold
+
+        In prediction markets, buying ALL outcomes guarantees $1.
+        But in some structures (neg-risk), buying a SUBSET can also guarantee $1
+        if the subset covers all mutually exclusive outcomes.
+
+        For efficiency, we use a greedy approach:
+        1. Sort outcomes by ask price (cheapest first)
+        2. Accumulate outcomes until sum >= 1-threshold
+        3. If any prefix has sum < 1-threshold, that's our arb
+
+        Args:
+            orderbooks: List of orderbooks for all outcomes.
+            market: The market being analyzed.
+            dynamic_threshold: Minimum profit threshold.
+
+        Returns:
+            Tuple of (selected_orderbooks, profit_margin) if arb found, None otherwise.
+        """
+        n = len(orderbooks)
+        if n <= 2:
+            # Binary markets handled by simple sum check
+            return None
+
+        # For ternary+ markets, check subset combinations
+        # Polymarket's neg-risk markets: any single outcome winning pays $1
+        # So buying all outcomes is overkill - we need MINIMUM cost to cover
+
+        # Sort by ask price ascending (greedy: buy cheapest first)
+        sorted_obs = sorted(orderbooks, key=lambda ob: ob.best_ask_price)
+
+        # Strategy 1: Check if sum of N-1 cheapest outcomes < 1-threshold
+        # This is the most common profitable pattern
+        # If outcome A is expensive, buying all others (B,C,D...) cheaper
+        for exclude_count in range(1, min(n, 4)):  # Try excluding 1-3 outcomes
+            for exclude_combo in combinations(range(n), exclude_count):
+                exclude_set = set(exclude_combo)
+                selected = [ob for i, ob in enumerate(sorted_obs) if i not in exclude_set]
+
+                if not selected:
+                    continue
+
+                sum_selected_asks = sum(ob.best_ask_price for ob in selected)
+
+                # Check if this subset has arbitrage opportunity
+                # Note: This assumes market structure where any subset of outcomes
+                # can payout $1 (which is true for neg-risk/election style)
+                # For standard markets where you MUST own all outcomes, skip this
+                if hasattr(market, 'neg_risk') and not market.neg_risk:
+                    # Standard market - must buy ALL outcomes, no subset arb
+                    continue
+
+                profit_margin = 1.0 - sum_selected_asks
+                if profit_margin > dynamic_threshold:
+                    logger.debug(
+                        f"Multi-outcome subset arb: {len(selected)}/{n} outcomes, "
+                        f"sum_asks={sum_selected_asks:.4f}, margin={profit_margin*100:.2f}%"
+                    )
+                    return (selected, profit_margin)
+
+        # Strategy 2: Full market arb (standard check)
+        sum_all_asks = sum(ob.best_ask_price for ob in orderbooks)
+        if sum_all_asks < (1.0 - dynamic_threshold):
+            return (orderbooks, 1.0 - sum_all_asks)
+
+        return None
+
     def detect_arb_opportunity(
         self,
         market_orderbooks: MarketOrderbooks
@@ -822,6 +907,9 @@ class OrderbookPoller:
         For a complete market:
         - Buy arb: sum(best_asks) < 1 - dynamic_threshold
         - Sell arb: sum(best_bids) > 1 + dynamic_threshold
+
+        Per Grok Round 20: For multi-outcome markets (3+), also checks subset
+        combinations for more sophisticated arb detection.
 
         Uses dynamic threshold based on trade size and gas costs.
         Includes stale book detection, freshness check, and slippage checks.
@@ -890,6 +978,43 @@ class OrderbookPoller:
         dynamic_threshold = calculate_dynamic_threshold(
             estimated_trade_size, num_outcomes, self.config.trading
         )
+
+        # Per Grok Round 20: For multi-outcome markets (3+), check subset arbs first
+        # This catches opportunities missed by simple sum(asks) < 1 check
+        if num_outcomes >= 3:
+            subset_result = self._detect_multi_outcome_subset_arb(orderbooks, market, dynamic_threshold)
+            if subset_result is not None:
+                selected_obs, profit_margin = subset_result
+                # Create opportunity with only the selected orderbooks
+                # Build a filtered MarketOrderbooks
+                filtered_market_obs = MarketOrderbooks(market=market)
+                for ob in selected_obs:
+                    filtered_market_obs.orderbooks[ob.token_id] = ob
+
+                opportunity = ArbOpportunity(
+                    market=market,
+                    arb_type=ArbType.BUY_ARB,
+                    profit_margin=profit_margin,
+                    orderbooks=filtered_market_obs
+                )
+                self._calculate_trade_sizes(opportunity)
+
+                self._arbs_found += 1
+                logger.info(
+                    f"MULTI-OUTCOME SUBSET ARB: {market.question[:40]}... "
+                    f"| {len(selected_obs)}/{num_outcomes} outcomes | Margin: {profit_margin*100:.3f}%"
+                )
+
+                if profit_margin >= self.config.trading.big_arb_alert_threshold:
+                    self._send_big_arb_alert(
+                        arb_type=ArbType.BUY_ARB,
+                        market_question=market.question,
+                        profit_margin=profit_margin,
+                        trade_size_usd=opportunity.trade_size_usd,
+                        expected_profit_usd=opportunity.expected_profit_usd
+                    )
+
+                return opportunity
 
         # Check for buy arbitrage (buy all outcomes cheaper than $1)
         if sum_asks < (1.0 - dynamic_threshold) and min_ask_depth_usd >= min_depth:

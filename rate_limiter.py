@@ -1,9 +1,14 @@
 """
-Global Rate Limiter Module.
-Handles 429 rate-limit backoff across all HTTP clients.
+Rate Limiter Module.
+Handles 429 rate-limit backoff with per-wallet isolation.
 
 Per Grok Round 7: Added per-wallet rate limiting to prevent multi-wallet
 burst hitting global limits.
+
+Per Grok Round 20 CRITICAL FIX: Global backoff on any 429 was halting ALL wallets.
+With per-key limits (3500/10s burst per Polymarket docs), multi-wallet should isolate.
+One bad wallet was freezing entire bot → missed arbs during live events.
+Fix: Backoff is now per-wallet only; global only for non-key-specific errors (5xx).
 """
 
 import logging
@@ -27,10 +32,18 @@ class RateLimitState:
 
 class GlobalRateLimiter:
     """
-    Global rate limiter with exponential backoff for 429 responses.
+    Global rate limiter for server-side errors (5xx) only.
 
-    Shared across all HTTP clients (orderbook, market_discovery, execution).
-    When any client hits 429, all clients back off.
+    Per Grok Round 20: This is now for SERVER errors (503, 5xx) only.
+    429 errors are handled per-wallet in PerWalletRateLimiter since
+    Polymarket limits are per-API-key (3500/10s burst).
+
+    Global backoff only triggers on:
+    - 503 Service Unavailable (server overload)
+    - 5xx errors (server-side issues)
+    - Cloudflare blocks (520-529)
+
+    NOT for 429 (per-key rate limit) - use per-wallet limiter instead.
     """
 
     def __init__(
@@ -324,15 +337,21 @@ def get_wallet_limiter() -> PerWalletRateLimiter:
     return _wallet_limiter
 
 
-async def handle_response_status(status: int, endpoint: str = "") -> bool:
+async def handle_response_status(
+    status: int,
+    endpoint: str = "",
+    wallet_address: Optional[str] = None
+) -> bool:
     """
     Handle HTTP response status with rate limit detection.
 
-    Per Grok audit: Handle non-429 rate limit responses (some APIs return 503/5xx).
+    Per Grok Round 20: 429s route to per-wallet limiter (per-API-key limits).
+    Server errors (503, 5xx) route to global limiter.
 
     Args:
         status: HTTP status code.
         endpoint: Endpoint name for logging.
+        wallet_address: If provided, 429s apply to this wallet only (per-key isolation).
 
     Returns:
         True if should retry, False otherwise.
@@ -340,7 +359,7 @@ async def handle_response_status(status: int, endpoint: str = "") -> bool:
     Raises:
         GeoBlockError: If 451/403 indicates geographic restriction.
     """
-    limiter = get_global_limiter()
+    global_limiter = get_global_limiter()
 
     # Per Grok Round 17: Handle geoblocking (451/403)
     # Polymarket blocks US/restricted IPs - fatal error, no retry
@@ -358,17 +377,39 @@ async def handle_response_status(status: int, endpoint: str = "") -> bool:
         )
         # Don't raise - could be auth issue, let caller handle
 
-    # Per Grok audit: Handle various rate limit status codes
-    # 429 = Rate limited (standard)
-    # 503 = Service unavailable (often rate limit)
-    # 520-529 = Cloudflare/proxy rate limits
-    if status == 429 or status == 503 or (520 <= status <= 529):
-        await limiter.record_429(endpoint)
-        await limiter.wait_if_limited()
+    # Per Grok Round 20: Route 429 to per-wallet limiter (per-API-key isolation)
+    # Polymarket limits are per-API-key (3500/10s burst), not global
+    # One wallet hitting limit should NOT freeze other wallets
+    if status == 429:
+        if wallet_address:
+            wallet_limiter = get_wallet_limiter()
+            await wallet_limiter.record_429(wallet_address)
+            logger.warning(
+                f"429 on {endpoint} for wallet {wallet_address[:10]}... - per-wallet backoff only"
+            )
+            # Wait using wallet-specific delay (not global)
+            await wallet_limiter.acquire(wallet_address)
+        else:
+            # No wallet specified - fall back to conservative global backoff
+            logger.warning(f"429 on {endpoint} - no wallet specified, using global backoff")
+            await global_limiter.record_429(endpoint)
+            await global_limiter.wait_if_limited()
+        return True  # Should retry
+
+    # Per Grok audit: Server-side errors → global backoff (server is overloaded)
+    # 503 = Service unavailable
+    # 520-529 = Cloudflare/proxy errors
+    if status == 503 or (520 <= status <= 529):
+        logger.warning(f"Server error {status} on {endpoint} - global backoff (server overload)")
+        await global_limiter.record_429(endpoint)
+        await global_limiter.wait_if_limited()
         return True  # Should retry
 
     if status == 200:
-        await limiter.record_success()
+        await global_limiter.record_success()
+        if wallet_address:
+            wallet_limiter = get_wallet_limiter()
+            await wallet_limiter.record_success(wallet_address)
 
     return False  # No retry needed
 

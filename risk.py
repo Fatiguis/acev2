@@ -4,6 +4,10 @@ Handles position sizing, exposure limits, and safety checks.
 
 Per Grok Round 7: Integrated edge_model expectancy for smarter sizing.
 Hot markets get reduced sizing due to lower fill probability.
+
+Per Grok Round 20 CRITICAL FIX: Implement Kelly criterion for position sizing.
+Fixed percentage sizing led to ruin risk in partial fill streaks.
+Kelly fraction = edge / variance, capped at 2-5% max to be conservative.
 """
 
 import logging
@@ -129,6 +133,12 @@ class RiskManager:
         # rn1 farmed heavily (confirmed 2026 posts) - this motivates trash safely
         self._airdrop_allocation_per_1k_volume = 0.03  # $0.03 per $1k volume (mid estimate)
 
+        # Per Grok Round 20: Kelly criterion tracking for variance estimation
+        # Track recent returns for variance calculation
+        self._recent_returns: deque = deque(maxlen=100)  # Last 100 trade returns
+        self._kelly_max_fraction = 0.05  # 5% max Kelly (conservative)
+        self._kelly_min_fraction = 0.005  # 0.5% min Kelly (floor)
+
         if self._trash_mode_enabled:
             logger.warning(
                 "TRASH MODE ENABLED: Buying near-certain losers at <$0.03 for volume farming. "
@@ -163,6 +173,10 @@ class RiskManager:
         self._trade_history.append(trade)
         self._daily_trades.append(trade)
         self._daily_pnl += trade.profit_usd
+
+        # Per Grok Round 20: Track returns for Kelly variance estimation
+        if trade.trade_size_usd > 0:
+            self._recent_returns.append(trade.return_pct)
 
         # Track consecutive losses
         if trade.profit_usd < 0:
@@ -281,6 +295,58 @@ class RiskManager:
 
         return True, "Trade allowed"
 
+    def _calculate_kelly_fraction(self, edge_pct: float, fill_probability: float = 0.7) -> float:
+        """
+        Per Grok Round 20 CRITICAL: Calculate Kelly fraction for position sizing.
+
+        Kelly criterion = edge / variance = (p*b - q) / b
+        Where:
+        - p = probability of winning (fill_probability * win_rate)
+        - q = 1 - p
+        - b = win/loss ratio
+
+        For arb trading with expected edge:
+        - Simplified Kelly = edge / variance_of_returns
+        - Capped at 2-5% max to be conservative (fractional Kelly)
+
+        Args:
+            edge_pct: Expected edge as decimal (e.g., 0.01 for 1%).
+            fill_probability: Probability order will fill (0-1).
+
+        Returns:
+            Kelly fraction (0 to kelly_max_fraction).
+        """
+        # Need sufficient return history for variance estimation
+        if len(self._recent_returns) < 10:
+            # Use conservative default: 1% max until we have data
+            return min(edge_pct * 0.5, 0.01)
+
+        # Calculate variance of recent returns
+        returns = list(self._recent_returns)
+        mean_return = sum(returns) / len(returns)
+        variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
+
+        # Add small epsilon to avoid division by zero
+        variance = max(variance, 1e-6)
+
+        # Kelly fraction = expected_edge / variance
+        # Adjust edge by fill probability (unfilled orders = 0 return)
+        adjusted_edge = edge_pct * fill_probability
+        kelly = adjusted_edge / variance
+
+        # Apply fractional Kelly (50% Kelly is more conservative)
+        kelly = kelly * 0.5
+
+        # Clamp to bounds
+        kelly = max(self._kelly_min_fraction, min(kelly, self._kelly_max_fraction))
+
+        logger.debug(
+            f"Kelly sizing: edge={edge_pct*100:.2f}%, fill_prob={fill_probability:.0%}, "
+            f"variance={variance:.6f}, kelly={kelly*100:.2f}%"
+        )
+
+        return kelly
+
     def calculate_position_size(
         self,
         opportunity: ArbOpportunity,
@@ -296,6 +362,9 @@ class RiskManager:
 
         Per Grok Round 7: Integrated edge model expectancy for smarter sizing.
         Hot markets get reduced sizing due to lower fill probability.
+
+        Per Grok Round 20 CRITICAL: Kelly criterion for optimal growth sizing.
+        Fixed percentage led to ruin risk in partial fill streaks.
 
         Args:
             opportunity: The arbitrage opportunity.
@@ -313,9 +382,31 @@ class RiskManager:
         # Apply safety multiplier
         safe_size = min_depth * self.config.trading.depth_safety_multiplier
 
-        # Cap at max percentage of capital
+        # Per Grok Round 20: Kelly-based sizing instead of fixed percentage
+        # Kelly fraction determines optimal position as % of capital
+        fill_probability = 0.7  # Default estimate
+        if self._edge_model is not None:
+            # Get fill probability from edge model if available
+            try:
+                from edge_model import MarketHeat
+                heat = self._edge_model.estimate_market_heat(
+                    volume_24h=market_volume_24h,
+                    is_live_event=is_live_event,
+                    recent_price_volatility=0.0
+                )
+                fill_probability = self._edge_model.get_fill_probability(
+                    latency_ms=latency_ms,
+                    heat=heat
+                )
+            except Exception:
+                pass
+
+        kelly_fraction = self._calculate_kelly_fraction(opportunity.profit_margin, fill_probability)
+        kelly_size = self._current_capital * kelly_fraction
+
+        # Position size is minimum of: safe_size (depth), kelly_size (optimal), config max
         max_size = self._current_capital * (self.config.trading.max_size_per_trade_percent / 100)
-        position_size = min(safe_size, max_size)
+        position_size = min(safe_size, kelly_size, max_size)
 
         # ABSOLUTE cap regardless of capital (per audit: $200 max)
         absolute_max = self.config.trading.absolute_max_trade_size_usd

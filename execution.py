@@ -6,6 +6,10 @@ Per Grok Round 6: py-clob-client is synchronous (requests-based). Direct calls
 block the asyncio event loop. This module uses run_sync_in_thread() to execute
 CLOB client calls in a thread pool, keeping the event loop responsive for
 WebSocket updates and other async tasks.
+
+Per Grok Round 20 CRITICAL: Post-only MUST be primary strategy (rn1 pattern).
+rn1 dominated via maker rebates (0% taker fees now but post-only = higher fill priority).
+Strategy: Post-only primary → FOK fallback ONLY on post-only timeout.
 """
 
 import logging
@@ -28,12 +32,15 @@ from clob_client_patch import run_sync_in_thread
 logger = logging.getLogger(__name__)
 
 # Per Grok Round 17: FAK (Fill-And-Kill) removed from py-clob-client
-# Current py-clob-client (v0.34-0.36) only supports: GTC, Post-Only, FOK
-# Strategy: Post-Only primary (maker rebates) → FOK fallback (clipped to L1 depth)
-# rn1's edge came from maker rebates via post-only, not from partial fills
-HAS_FAK = hasattr(OrderType, 'FAK')  # Will be False in current py-clob-client
-if not HAS_FAK:
-    logger.info("FAK order type not available - using Post-Only + FOK strategy (rn1 pattern)")
+# Per Grok Round 20: Actually FAK EXISTS in py-clob-client 0.34.1+
+# Polymarket docs: FAK = Fill-And-Kill (partial fill + cancel rest = IOC equivalent)
+# BUT rn1's edge came from MAKER rebates, so we still prioritize post-only
+#
+# Current py-clob-client (v0.34.1) supports: GTC, FOK, FAK, GTD
+# Strategy: Post-Only primary (maker rebates) → FOK fallback (NOT FAK - we want all-or-nothing)
+# FAK allows partial fills which leaves exposure - rn1 avoided this via post-only
+HAS_FAK = hasattr(OrderType, 'FAK')
+logger.info(f"Order types available: GTC, FOK, FAK={'Yes' if HAS_FAK else 'No'} - using Post-Only + FOK strategy (rn1 pattern)")
 
 # Idempotency tracking for preventing duplicate arbs on restart
 from collections import OrderedDict

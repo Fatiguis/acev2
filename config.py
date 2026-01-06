@@ -112,9 +112,12 @@ class TradingConfig:
     )
 
     # Post-only mode: try post-only limit orders first for maker rebates
-    # Falls back to FAK (Fill-And-Kill) if post-only doesn't fill in timeout
+    # Per Grok Round 20 CRITICAL: Post-only MUST be primary strategy (rn1 pattern)
+    # rn1 dominated via maker rebates - post-only ensures maker status + higher fill priority
+    # Falls back to FOK (not FAK) if post-only doesn't fill in timeout
     # Maker rebates add ~0.1-0.3% to edge
     # Per Grok Round 7: Default True - rn1 preferred maker fills for >90% volume
+    # WARNING: Setting False significantly reduces edge vs rn1
     use_post_only: bool = field(
         default_factory=lambda: os.getenv("USE_POST_ONLY", "true").lower() == "true"
     )
