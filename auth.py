@@ -175,12 +175,15 @@ ERC20_ABI = json.loads('''
 ]
 ''')
 
-# Unlimited approval amount (max uint256)
-UNLIMITED_APPROVAL = 2**256 - 1
+# Per Grok Round 19 CRITICAL FIX: CAPPED approvals instead of unlimited
+# Unlimited (2**256-1) is a security risk - if contract is compromised, all funds at risk
+# Cap at reasonable trading amount + buffer (50% margin for batch trades)
+# For USDC (6 decimals): 50,000 USDC = 50_000 * 1e6 raw units
+CAPPED_APPROVAL_USDC = 50_000 * 10**6  # $50k cap - sufficient for rn1-style micro-arbs
 
 # Minimum allowance threshold before re-approving (in raw units)
-# For USDC (6 decimals): 100,000 USDC = 100_000 * 1e6
-MIN_ALLOWANCE_USDC = 100_000 * 10**6
+# Re-approve when we drop below 20% of cap (i.e., below $10k)
+MIN_ALLOWANCE_USDC = 10_000 * 10**6
 
 
 class AuthManager:
@@ -326,7 +329,11 @@ class AuthManager:
 
     def _ensure_eoa_approvals(self, client: ClobClient):
         """
-        Ensure EOA wallet has UNLIMITED token approvals for trading.
+        Ensure EOA wallet has CAPPED token approvals for trading.
+
+        Per Grok Round 19 CRITICAL FIX: Use capped approvals instead of unlimited.
+        Unlimited (uint256.max) is a security risk - if the exchange contract is
+        compromised, attacker can drain all approved tokens.
 
         EOA wallets (signature_type=0) require:
         1. USDC approval for the CTF Exchange (spending collateral)
@@ -335,12 +342,13 @@ class AuthManager:
         Without these, post_order() fails with "not enough balance / allowance" (400 error).
         This is py-clob-client GitHub issue #109.
 
-        Uses UNLIMITED approval (max uint256) to avoid repeated approval txs.
+        Uses CAPPED approval ($50k) - re-approves when balance drops below $10k.
+        This limits exposure while avoiding frequent approval txs.
 
         Args:
             client: The authenticated CLOB client.
         """
-        logger.info("EOA wallet detected - checking/setting UNLIMITED token approvals...")
+        logger.info("EOA wallet detected - checking/setting CAPPED token approvals...")
 
         # Initialize Web3 for approval transactions
         self._init_web3()
@@ -381,13 +389,14 @@ class AuthManager:
             logger.info(f"Current USDC allowance: {current_allowance / 1e6:,.2f} USDC")
 
             if current_allowance < MIN_ALLOWANCE_USDC:
-                logger.info("USDC allowance insufficient - setting UNLIMITED approval...")
+                # Per Grok Round 19: Use CAPPED approval, not unlimited
+                logger.info(f"USDC allowance insufficient (${current_allowance/1e6:,.2f}) - setting CAPPED approval (${CAPPED_APPROVAL_USDC/1e6:,.0f})...")
                 self._send_approval_tx(
-                    usdc_contract, exchange_address, UNLIMITED_APPROVAL,
+                    usdc_contract, exchange_address, CAPPED_APPROVAL_USDC,
                     wallet_address, private_key, "USDC"
                 )
             else:
-                logger.info("USDC allowance sufficient")
+                logger.info(f"USDC allowance sufficient: ${current_allowance/1e6:,.2f}")
 
         except Exception as e:
             logger.error(f"USDC approval check/set failed: {e}")
@@ -472,7 +481,7 @@ class AuthManager:
             receipt = self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
             if receipt.status == 1:
-                logger.info(f"{token_name} UNLIMITED approval confirmed!")
+                logger.info(f"{token_name} CAPPED approval confirmed (${CAPPED_APPROVAL_USDC/1e6:,.0f} limit)")
             else:
                 logger.error(f"{token_name} approval tx failed")
 
@@ -820,24 +829,28 @@ class AuthManager:
             # Proxy wallets don't need manual approvals
             return True, float('inf')
 
-        try:
-            self._init_web3()
-            if self._web3 is None or not self._web3.is_connected():
-                logger.warning("Cannot check allowance - Web3 not connected")
-                return True, 0.0  # Optimistic - let trade attempt
+        # Per Grok Round 19 HIGH FIX: No optimistic returns - fail safe, not fail open
+        # If we can't verify allowance, block trading to prevent 400 errors
+        self._init_web3()
+        if self._web3 is None or not self._web3.is_connected():
+            logger.error("BLOCKED: Cannot check allowance - Web3 not connected")
+            raise ConnectionError("Web3 not connected - cannot verify USDC allowance for trading")
 
+        try:
             # Get exchange address
             exchange_address = client.get_exchange_address()
             exchange_address = Web3.to_checksum_address(exchange_address)
 
-            # Get USDC allowance
+            # Get USDC allowance with retry
             wallet_address = Web3.to_checksum_address(self._wallet_address)
             usdc_address = Web3.to_checksum_address(self.config.network.usdc_address)
             usdc_contract = self._web3.eth.contract(address=usdc_address, abi=ERC20_ABI)
 
-            allowance_raw = usdc_contract.functions.allowance(
-                wallet_address, exchange_address
-            ).call()
+            allowance_raw = _retry_rpc_sync(
+                lambda: usdc_contract.functions.allowance(wallet_address, exchange_address).call(),
+                max_retries=3,
+                operation_name="check_usdc_allowance"
+            )
 
             allowance_usd = allowance_raw / 1e6  # USDC has 6 decimals
 
@@ -851,8 +864,10 @@ class AuthManager:
             return True, allowance_usd
 
         except Exception as e:
-            logger.error(f"Error checking USDC allowance: {e}")
-            return True, 0.0  # Optimistic - let trade attempt
+            # Per Grok Round 19: Raise on failure instead of optimistic True
+            # This blocks trading until allowance is confirmed - fail safe
+            logger.error(f"BLOCKED: Error checking USDC allowance after retries: {e}")
+            raise RuntimeError(f"Cannot verify USDC allowance - blocking trading: {e}")
 
     def ensure_sufficient_allowance(self, client: ClobClient, required_usd: float = 10000.0) -> bool:
         """

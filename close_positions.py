@@ -8,8 +8,18 @@ Instead of FOK market sells (taker fees), this script:
 1. Fetches current positions
 2. For each position, looks up the opposite outcome(s)
 3. Places post-only buy orders on the opposite outcome to hedge
-4. Falls back to FAK if post-only doesn't fill within timeout
+4. Falls back to FOK if post-only doesn't fill within timeout
+
+Per Grok Round 19: Added CLI-only guard and DRY_RUN block for safety.
 """
+
+# Per Grok Round 19: Guard against import into event loop
+# This script uses blocking time.sleep() - importing it would block the bot
+if __name__ != "__main__":
+    raise RuntimeError(
+        "close_positions.py is a CLI-only script. "
+        "Do not import - use execution.py async hedge methods instead."
+    )
 
 import sys
 import time
