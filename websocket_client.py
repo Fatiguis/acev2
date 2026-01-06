@@ -494,6 +494,13 @@ class PolymarketWebSocket:
             logger.debug(f"Invalid JSON message: {raw_message[:100]}")
             return
 
+        # Per Grok Round 11: Skip non-dict messages (ping/pong, arrays, etc.)
+        # Polymarket CLOB sends book/price_change as dict objects only
+        # WS protocol heartbeats can be lists like [] or ["pong"]
+        if not isinstance(message, dict):
+            logger.debug(f"Skipped non-dict WS message: {type(message).__name__}")
+            return
+
         msg_type = message.get("type") or message.get("event_type")
 
         if msg_type == "book":

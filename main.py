@@ -1129,9 +1129,10 @@ class ArbBot:
                     base_threshold_pct = self.config.trading.arb_threshold_base * 100
 
                     # Calculate depth available from orderbooks
+                    # Per Grok Round 11: Use .orderbooks (Dict[str, Orderbook]) not .books
                     depth_available = 0
-                    if ws_opp.orderbooks and ws_opp.orderbooks.books:
-                        for ob in ws_opp.orderbooks.books.values():
+                    if ws_opp.orderbooks and ws_opp.orderbooks.orderbooks:
+                        for ob in ws_opp.orderbooks.orderbooks.values():
                             if ob.asks:
                                 depth_available += sum(lvl.size for lvl in ob.asks[:3])
                             if ob.bids:
