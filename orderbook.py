@@ -1021,9 +1021,106 @@ class OrderbookPoller:
                     expected_profit_usd=opportunity.expected_profit_usd
                 )
 
+            # Per Grok Round 13: Convert SELL_ARB to BUY_ARB when buy_arb_only mode enabled
+            # RN1 pattern: never sell, instead buy the underpriced opposite
+            # SELL_ARB (sum bids > 1) means outcomes overpriced → buy the cheapest ask instead
+            if self.config.trading.buy_arb_only:
+                converted = self._convert_sell_to_buy_arb(opportunity, market, orderbooks)
+                if converted:
+                    logger.info(
+                        f"SELL_ARB converted to BUY_ARB (RN1 mode): {market.question[:50]}... "
+                        f"| Buying underpriced outcome | Margin: {converted.profit_margin*100:.3f}%"
+                    )
+                    return converted
+                else:
+                    logger.debug("SELL_ARB could not be converted to BUY_ARB, skipping")
+                    return None
+
             return opportunity
 
         return None
+
+    def _convert_sell_to_buy_arb(
+        self,
+        sell_opp: ArbOpportunity,
+        market: Market,
+        orderbooks: List['Orderbook']
+    ) -> Optional[ArbOpportunity]:
+        """
+        Per Grok Round 13: Convert SELL_ARB to equivalent BUY_ARB for RN1 alignment.
+
+        When sum(bids) > 1 (SELL_ARB), it means outcomes are overpriced on bids.
+        Instead of selling (which RN1 never does), we identify the underpriced
+        outcome (lowest ask relative to fair value) and buy it.
+
+        For binary markets:
+        - If sum(bids) = 1.01, the market is 1% overpriced
+        - One or both outcomes must have asks below fair value
+        - Buy the outcome with the best ask (cheapest)
+
+        This captures the same edge as SELL_ARB but via buy execution,
+        maintaining maker rebates and avoiding taker sell fees.
+
+        Args:
+            sell_opp: The original SELL_ARB opportunity
+            market: The market being arbitraged
+            orderbooks: List of orderbooks for all outcomes
+
+        Returns:
+            Converted BUY_ARB opportunity or None if conversion not possible
+        """
+        if not market.is_binary:
+            # For non-binary markets, conversion is complex - skip for now
+            # RN1 primarily trades binary sports markets anyway
+            logger.debug(f"SELL_ARB conversion skipped: non-binary market ({len(orderbooks)} outcomes)")
+            return None
+
+        if len(orderbooks) != 2:
+            return None
+
+        # Find the orderbook with the lowest ask (underpriced outcome)
+        # In a binary market, if bids sum > 1, at least one ask must be < fair value
+        ob_0, ob_1 = orderbooks[0], orderbooks[1]
+
+        # Fair value check: in efficient market, asks should sum to ~1
+        # If sum_bids > 1, then sum_asks should be < 1 (the arb)
+        sum_asks = ob_0.best_ask_price + ob_1.best_ask_price
+
+        if sum_asks >= 1.0:
+            # No buy-side edge exists (asks not underpriced)
+            logger.debug(f"SELL_ARB conversion failed: sum_asks={sum_asks:.4f} >= 1.0")
+            return None
+
+        # The margin on buy side = 1 - sum_asks (same as original sell margin conceptually)
+        buy_margin = 1.0 - sum_asks
+
+        # Check if this meets our threshold
+        dynamic_threshold = calculate_dynamic_threshold(
+            sell_opp.trade_size_usd,
+            2,  # binary
+            self.config.trading
+        )
+
+        if buy_margin < dynamic_threshold:
+            logger.debug(
+                f"SELL_ARB conversion: buy margin {buy_margin*100:.3f}% "
+                f"below threshold {dynamic_threshold*100:.3f}%"
+            )
+            return None
+
+        # Create equivalent BUY_ARB opportunity
+        # We'll buy BOTH outcomes at their asks (standard buy arb execution)
+        converted_opp = ArbOpportunity(
+            market=market,
+            arb_type=ArbType.BUY_ARB,
+            profit_margin=buy_margin,
+            orderbooks=sell_opp.orderbooks  # Same orderbooks, different execution
+        )
+
+        # Calculate trade sizes for buy arb
+        self._calculate_trade_sizes(converted_opp)
+
+        return converted_opp
 
     def _calculate_trade_sizes(self, opportunity: ArbOpportunity):
         """
