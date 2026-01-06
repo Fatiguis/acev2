@@ -44,8 +44,14 @@ def _retry_rpc_sync(
     """
     Retry a synchronous RPC call with exponential backoff.
 
-    Note: This uses time.sleep() which blocks the thread. For async contexts,
-    use _retry_rpc_async() instead.
+    Per Grok Round 5: Uses time.sleep() which blocks the thread.
+    Use ONLY in:
+    - CLI scripts (cancel_orders.py, close_positions.py)
+    - Initialization code (AuthManager.initialize - runs before event loop)
+    - Balance checks from CLI
+
+    For async contexts (main bot loop, execution, positions), use
+    _retry_rpc_async() instead which uses asyncio.sleep().
 
     Args:
         func: Sync function to retry.

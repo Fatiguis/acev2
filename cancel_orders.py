@@ -5,6 +5,10 @@ Per Grok audit fixes:
 - Check dry_run flag properly (don't use private _dry_run)
 - Handle KeyError on missing order fields
 - Add rate limiting between operations
+
+Per Grok Round 5: This is a standalone CLI script (not async integration).
+time.sleep is acceptable here as this is not run inside the bot's event loop.
+For bot integration, use the async cancel methods in execution.py instead.
 """
 
 import time
@@ -13,7 +17,12 @@ from auth import AuthManager
 
 
 def fetch_with_rate_limit(func, *args, delay: float = 0.5, **kwargs):
-    """Execute function with rate limiting."""
+    """
+    Execute function with rate limiting.
+
+    Note: Uses time.sleep (blocking) - acceptable for CLI scripts.
+    For async contexts, use execution.py's async cancel methods.
+    """
     time.sleep(delay)  # Pre-request delay to avoid bursts
     return func(*args, **kwargs)
 

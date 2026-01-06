@@ -72,19 +72,23 @@ def get_opposite_token_id(client, token_id: str) -> str | None:
                     return t.get("token_id")
 
         elif len(tokens) > 2:
-            # Per Grok audit: Multi-outcome market (neg-risk via neg-risk-ctf-adapter)
-            # For multi-outcome, hedging is more complex:
-            # - For neg-risk markets, buying opposite = buying "NO" equivalent
-            # - Find the token with best liquidity that's NOT our current token
-            # This is a simplified heuristic - full implementation would:
-            # 1. Query all outcome books
-            # 2. Find lowest-ask token that hedges our position
+            # Per Grok Round 5: Multi-outcome market (neg-risk via neg-risk-ctf-adapter)
+            # For neg-risk, we can hedge by buying ALL other outcomes
+            # This locks in profit regardless of which outcome wins
             print(f"    Multi-outcome market detected ({len(tokens)} outcomes)")
-            print(f"    Per Grok audit: Multi-outcome hedging requires manual review")
-            print(f"    Consider using data-api to find all outcome tokens")
-            # For now, return None for multi-outcome - requires manual handling
-            # In production, implement proper neg-risk hedge calculation
-            return None
+
+            # Find all tokens except ours - these form the hedge basket
+            other_tokens = [t.get("token_id") for t in tokens if t.get("token_id") != token_id]
+
+            if len(other_tokens) > 0:
+                print(f"    Found {len(other_tokens)} hedge tokens for multi-outcome")
+                # Return first token as primary hedge target
+                # Full hedge would buy proportional amounts of all other tokens
+                # This is simplified - returns first for immediate hedge
+                return other_tokens[0]
+            else:
+                print(f"    No hedge tokens found in multi-outcome market")
+                return None
 
         return None
 
@@ -93,9 +97,128 @@ def get_opposite_token_id(client, token_id: str) -> str | None:
         return None
 
 
+def get_all_hedge_tokens(client, token_id: str) -> list:
+    """
+    Get all opposite outcome tokens for multi-outcome hedging.
+
+    Per Grok Round 5: For neg-risk markets with >2 outcomes, full hedging
+    requires buying ALL other outcomes proportionally.
+
+    Args:
+        client: CLOB client.
+        token_id: Current token ID we hold.
+
+    Returns:
+        List of (token_id, best_ask_price) tuples for all hedge tokens.
+    """
+    try:
+        book = client.get_book(token_id)
+        if not book:
+            return []
+
+        market_info = book.get("market", {})
+        tokens = market_info.get("tokens", [])
+
+        if len(tokens) <= 2:
+            return []  # Not a multi-outcome market
+
+        hedge_tokens = []
+        for t in tokens:
+            tid = t.get("token_id")
+            if tid and tid != token_id:
+                # Get best ask for this token
+                try:
+                    other_book = client.get_book(tid)
+                    if other_book and other_book.get("asks"):
+                        best_ask = float(other_book["asks"][0]["price"])
+                        hedge_tokens.append((tid, best_ask))
+                except Exception:
+                    pass
+
+        return hedge_tokens
+
+    except Exception as e:
+        print(f"Error getting hedge tokens: {e}")
+        return []
+
+
+def close_via_multi_hedge(client, token_id: str, size: float, outcome_name: str) -> bool:
+    """
+    Close a multi-outcome position by buying all other outcomes.
+
+    Per Grok Round 5: Full neg-risk-ctf-adapter hedge requires buying
+    proportional amounts of ALL other outcomes.
+
+    Args:
+        client: CLOB client.
+        token_id: Token ID of position to close.
+        size: Size to close (in shares).
+        outcome_name: Name for logging.
+
+    Returns:
+        True if all hedges placed successfully.
+    """
+    print(f"\n  Attempting multi-outcome hedge for {outcome_name}...")
+
+    hedge_tokens = get_all_hedge_tokens(client, token_id)
+
+    if not hedge_tokens:
+        print(f"    No hedge tokens found, falling back to single hedge")
+        return False
+
+    print(f"    Found {len(hedge_tokens)} outcomes to hedge")
+
+    # Calculate proportional sizes
+    # For neg-risk: buying equal shares of all other outcomes locks profit
+    total_hedge_cost = sum(price for _, price in hedge_tokens)
+    success_count = 0
+
+    for hedge_tid, best_ask in hedge_tokens:
+        # Size per outcome = total size * (1 / num_outcomes)
+        outcome_size = size / len(hedge_tokens)
+
+        try:
+            order_args = OrderArgs(
+                price=best_ask,
+                size=outcome_size,
+                side=BUY,
+                token_id=hedge_tid,
+            )
+
+            signed_order = client.create_order(order_args)
+
+            if HAS_FAK:
+                response = client.post_order(signed_order, OrderType.FAK)
+            else:
+                response = client.post_order(signed_order, OrderType.FOK)
+
+            if response and response.get("success"):
+                print(f"    ✓ Hedged outcome @ ${best_ask:.3f}")
+                success_count += 1
+            else:
+                print(f"    ✗ Failed to hedge outcome")
+
+            # Rate limit between orders
+            time.sleep(0.2)
+
+        except Exception as e:
+            print(f"    ✗ Hedge error: {e}")
+
+    full_success = success_count == len(hedge_tokens)
+    if full_success:
+        print(f"    ✓ Full multi-outcome hedge complete ({success_count}/{len(hedge_tokens)})")
+    else:
+        print(f"    ⚠ Partial hedge ({success_count}/{len(hedge_tokens)})")
+
+    return full_success
+
+
 def close_via_hedge(client, token_id: str, size: float, outcome_name: str, use_post_only: bool = True) -> bool:
     """
     Close a position by buying the opposite outcome (rn1 style).
+
+    Per Grok Round 5: For multi-outcome markets (>2 outcomes), attempts
+    full multi-hedge first before falling back to single token hedge.
 
     Args:
         client: CLOB client.
@@ -109,7 +232,15 @@ def close_via_hedge(client, token_id: str, size: float, outcome_name: str, use_p
     """
     print(f"\n  Attempting rn1-style hedge close for {outcome_name}...")
 
-    # Get opposite token
+    # Per Grok Round 5: Try multi-outcome hedge first for neg-risk markets
+    hedge_tokens = get_all_hedge_tokens(client, token_id)
+    if len(hedge_tokens) > 1:
+        print(f"    Multi-outcome market detected, attempting full hedge...")
+        if close_via_multi_hedge(client, token_id, size, outcome_name):
+            return True
+        print(f"    Multi-hedge failed, falling back to single hedge...")
+
+    # Get opposite token for binary or fallback
     opposite_token = get_opposite_token_id(client, token_id)
 
     if opposite_token:

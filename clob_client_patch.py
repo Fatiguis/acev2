@@ -25,7 +25,13 @@ def rate_limited_sync(func: Callable[..., T]) -> Callable[..., T]:
     """
     Decorator to add rate limiting to synchronous ClobClient methods.
 
-    Use this to wrap individual client method calls instead of monkey-patching.
+    Per Grok Round 5: Uses time.sleep() which blocks.
+    This is acceptable for:
+    - CLI scripts (cancel_orders.py, close_positions.py)
+    - Initialization code (runs before event loop)
+    - ClobClientWrapper methods (py-clob-client is sync anyway)
+
+    For pure async contexts, wrap in run_in_executor or use rate_limited_async.
 
     Example:
         @rate_limited_sync
@@ -40,7 +46,7 @@ def rate_limited_sync(func: Callable[..., T]) -> Callable[..., T]:
         limiter = get_global_limiter()
         state = limiter._state
 
-        # Wait if rate limited
+        # Wait if rate limited (blocking - see docstring for appropriate use)
         if state.is_limited:
             now = time.time()
             if now < state.backoff_until:

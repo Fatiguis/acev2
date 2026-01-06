@@ -677,7 +677,11 @@ class WalletManager:
             return self._wallets[index]
         return None
 
-    async def ensure_ctf_approvals(self, wallet: Optional[WalletState] = None) -> bool:
+    async def ensure_ctf_approvals(
+        self,
+        wallet: Optional[WalletState] = None,
+        use_specific_amount: bool = True
+    ) -> bool:
         """
         Ensure CTF approvals are set for neg-risk trading.
 
@@ -686,8 +690,14 @@ class WalletManager:
         - Neg Risk CTF Adapter
         - Neg Risk Exchange
 
+        Per Grok Round 5: py-clob-client GitHub examples use specific amounts
+        instead of unlimited approvals for security. Unlimited approval means
+        if any contract is compromised, attacker can drain all USDC.
+
         Args:
             wallet: Specific wallet to approve, or None for all wallets.
+            use_specific_amount: If True, use $10M cap instead of unlimited.
+                                 Recommended for security (py-clob-client pattern).
 
         Returns:
             True if all approvals successful.
@@ -701,7 +711,16 @@ class WalletManager:
             return False
 
         wallets_to_check = [wallet] if wallet else self._wallets
-        max_approval = 2 ** 256 - 1  # MAX_UINT256
+
+        # Per Grok Round 5: Use specific amount instead of unlimited
+        # $10M cap is generous but limits exposure if contract is compromised
+        # Can be increased if hitting limits, but unlimited is risky
+        if use_specific_amount:
+            approval_amount = 10_000_000 * 10**6  # $10M in USDC (6 decimals)
+            logger.info("Using specific approval amount ($10M) per py-clob-client security pattern")
+        else:
+            approval_amount = 2 ** 256 - 1  # MAX_UINT256 (unlimited - not recommended)
+            logger.warning("Using UNLIMITED approval - consider use_specific_amount=True for security")
 
         success = True
         for w in wallets_to_check:
@@ -721,16 +740,17 @@ class WalletManager:
                     # Check current allowance
                     current_allowance = usdc_contract.functions.allowance(owner, spender).call()
 
-                    # If allowance is low, approve max
-                    min_required = 1_000_000 * 10**6  # $1M in USDC (6 decimals)
+                    # If allowance is low, approve specific amount
+                    min_required = 1_000_000 * 10**6  # $1M threshold before re-approval
                     if current_allowance < min_required:
-                        logger.info(f"Approving USDC to {name} for wallet {w.wallet_index}...")
+                        amount_str = f"${approval_amount / 10**6:,.0f}" if use_specific_amount else "UNLIMITED"
+                        logger.info(f"Approving {amount_str} USDC to {name} for wallet {w.wallet_index}...")
 
                         # Build and sign approval transaction
                         nonce = self._web3.eth.get_transaction_count(w.address, 'pending')
                         gas_price = self._web3.eth.gas_price
 
-                        tx = usdc_contract.functions.approve(spender, max_approval).build_transaction({
+                        tx = usdc_contract.functions.approve(spender, approval_amount).build_transaction({
                             'from': w.address,
                             'nonce': nonce,
                             'gas': 60000,
