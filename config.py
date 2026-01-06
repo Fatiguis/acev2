@@ -455,9 +455,6 @@ class SportsConfig:
         "dota2": 10309,    # Dota 2
         "lol": 10311,      # League of Legends
         "val": 10369,      # Valorant
-
-        # MMA/UFC
-        "mma": 10500,      # MMA/UFC
     })
 
     # Tag ID for game bets filtering
