@@ -13,6 +13,9 @@ E[profit] = edge% × P(fill|latency) × P(not_frontrun) × size - fees
 Where:
 - P(fill|latency) ≈ e^(-λt), λ = arb decay rate (~5-10 for hot markets)
 - P(not_frontrun) = f(depth_rank, competitor_count)
+
+Per Final Audit: Explicit HTTP fallback penalty when WS disconnects.
+HTTP polling has ~800ms latency vs ~50ms WS - dramatically lower fill prob.
 """
 
 import math
@@ -105,6 +108,42 @@ class EdgeExpectancyModel:
         self._successful_fills = 0
         self._fill_history: List[Tuple[float, float, bool]] = []  # (latency, edge, filled)
 
+        # Per Final Audit: Track WS vs HTTP mode for latency penalty
+        self._using_websocket = True  # Default to WS
+        self._http_fallback_penalty = 0.85  # Reduce fill prob by 85% in HTTP mode
+
+    def set_connection_mode(self, using_websocket: bool):
+        """
+        Per Final Audit: Set connection mode for latency-aware fill probability.
+
+        When WS disconnects and falls back to HTTP, fill probability drops
+        dramatically (~800ms vs ~50ms latency). This affects sizing decisions.
+
+        Args:
+            using_websocket: True if using WebSocket, False if HTTP fallback.
+        """
+        if self._using_websocket != using_websocket:
+            mode = "WebSocket" if using_websocket else "HTTP fallback"
+            logger.info(f"[EdgeModel] Connection mode changed to {mode}")
+            if not using_websocket:
+                logger.warning(
+                    f"[EdgeModel] HTTP fallback active - fill probability reduced by "
+                    f"{self._http_fallback_penalty*100:.0f}% due to latency (~800ms vs ~50ms WS)"
+                )
+        self._using_websocket = using_websocket
+
+    def get_effective_latency_ms(self) -> float:
+        """
+        Per Final Audit: Get effective latency based on connection mode.
+
+        Returns:
+            Latency in milliseconds (WS: ~80ms, HTTP: ~800ms).
+        """
+        if self._using_websocket:
+            return self.config.our_latency_ms_ws  # ~80ms
+        else:
+            return self.config.our_latency_ms_http  # ~800ms
+
     def get_decay_rate(self, heat: MarketHeat) -> float:
         """Get arb decay rate for market heat level."""
         rates = {
@@ -160,6 +199,9 @@ class EdgeExpectancyModel:
 
         Uses exponential decay model: P(fill) = e^(-λt)
 
+        Per Final Audit: Applies HTTP fallback penalty when not using WebSocket.
+        HTTP latency (~800ms) vs WS (~50ms) dramatically reduces fill probability.
+
         Args:
             latency_seconds: Total latency (detection + execution) in seconds.
             heat: Market heat level.
@@ -168,7 +210,38 @@ class EdgeExpectancyModel:
             Fill probability between 0 and 1.
         """
         decay_rate = self.get_decay_rate(heat)
-        return math.exp(-decay_rate * latency_seconds)
+        fill_prob = math.exp(-decay_rate * latency_seconds)
+
+        # Per Final Audit: Apply HTTP fallback penalty
+        if not self._using_websocket:
+            # HTTP mode: much worse fill probability due to 16x higher latency
+            fill_prob *= (1.0 - self._http_fallback_penalty)
+            logger.debug(
+                f"[EdgeModel] HTTP fallback penalty applied: fill_prob reduced to {fill_prob:.2%}"
+            )
+
+        return fill_prob
+
+    def get_fill_probability(
+        self,
+        latency_ms: float,
+        heat: MarketHeat
+    ) -> float:
+        """
+        Per Final Audit: Convenience method for getting fill probability.
+
+        Wrapper around calculate_fill_probability that:
+        1. Converts ms to seconds
+        2. Automatically applies HTTP fallback penalty if not using WS
+
+        Args:
+            latency_ms: Latency in milliseconds.
+            heat: Market heat level.
+
+        Returns:
+            Fill probability (0-1).
+        """
+        return self.calculate_fill_probability(latency_ms / 1000.0, heat)
 
     def calculate_frontrun_probability(
         self,

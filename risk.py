@@ -138,6 +138,9 @@ class RiskManager:
         self._recent_returns: deque = deque(maxlen=100)  # Last 100 trade returns
         self._kelly_max_fraction = 0.05  # 5% max Kelly (conservative)
         self._kelly_min_fraction = 0.005  # 0.5% min Kelly (floor)
+        # Per Final Audit: Require minimum trades before full Kelly (avoids over-aggressive early)
+        self._kelly_min_trades = 100  # Need 100+ trades for reliable variance estimate
+        self._total_trades_for_kelly = 0  # Track total trades for Kelly eligibility
 
         if self._trash_mode_enabled:
             logger.warning(
@@ -177,6 +180,7 @@ class RiskManager:
         # Per Grok Round 20: Track returns for Kelly variance estimation
         if trade.trade_size_usd > 0:
             self._recent_returns.append(trade.return_pct)
+            self._total_trades_for_kelly += 1  # Per Final Audit: Track total trades
 
         # Track consecutive losses
         if trade.profit_usd < 0:
@@ -309,6 +313,9 @@ class RiskManager:
         - Simplified Kelly = edge / variance_of_returns
         - Capped at 2-5% max to be conservative (fractional Kelly)
 
+        Per Final Audit: Require 100+ trades before full Kelly to avoid
+        over-aggressive sizing with unreliable variance estimates.
+
         Args:
             edge_pct: Expected edge as decimal (e.g., 0.01 for 1%).
             fill_probability: Probability order will fill (0-1).
@@ -316,7 +323,18 @@ class RiskManager:
         Returns:
             Kelly fraction (0 to kelly_max_fraction).
         """
-        # Need sufficient return history for variance estimation
+        # Per Final Audit: Need minimum trades for reliable variance
+        # Early trades use ultra-conservative 0.5% max
+        if self._total_trades_for_kelly < self._kelly_min_trades:
+            conservative_kelly = min(edge_pct * 0.25, 0.005)  # 0.5% max early
+            if self._total_trades_for_kelly % 25 == 0 and self._total_trades_for_kelly > 0:
+                logger.info(
+                    f"Kelly warmup: {self._total_trades_for_kelly}/{self._kelly_min_trades} trades, "
+                    f"using conservative {conservative_kelly*100:.2f}% sizing"
+                )
+            return conservative_kelly
+
+        # Need sufficient recent returns for variance estimation
         if len(self._recent_returns) < 10:
             # Use conservative default: 1% max until we have data
             return min(edge_pct * 0.5, 0.01)
