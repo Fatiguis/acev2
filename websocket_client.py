@@ -187,11 +187,12 @@ class PolymarketWebSocket:
         self._on_book_update: Optional[Callable[[str, Orderbook], None]] = None
         self._on_arb_detected: Optional[Callable[[ArbOpportunity], None]] = None
 
-        # Reconnection
+        # Reconnection with exponential backoff (per Grok Round 4: HF reliability)
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 10
         self._reconnect_base_delay = 1.0
         self._reconnect_max_delay = 60.0
+        self._reconnect_jitter_pct = 0.2  # Add 20% jitter to prevent thundering herd
 
         # Background tasks
         self._receive_task: Optional[asyncio.Task] = None
@@ -459,14 +460,19 @@ class PolymarketWebSocket:
 
         while self._reconnect_attempts < self._max_reconnect_attempts:
             self._reconnect_attempts += 1
-            delay = min(
+            # Exponential backoff with jitter (per Grok Round 4: prevents thundering herd)
+            base_delay = min(
                 self._reconnect_base_delay * (2 ** (self._reconnect_attempts - 1)),
                 self._reconnect_max_delay
             )
+            # Add random jitter (±20%) to prevent all clients reconnecting simultaneously
+            import random
+            jitter = base_delay * self._reconnect_jitter_pct * (2 * random.random() - 1)
+            delay = max(0.1, base_delay + jitter)
 
             logger.info(
                 f"Reconnecting in {delay:.1f}s "
-                f"(attempt {self._reconnect_attempts}/{self._max_reconnect_attempts})"
+                f"(attempt {self._reconnect_attempts}/{self._max_reconnect_attempts}, exponential backoff)"
             )
             await asyncio.sleep(delay)
 

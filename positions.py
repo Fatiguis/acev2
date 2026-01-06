@@ -193,6 +193,28 @@ ACTION FOR BOT:
 - Exit positions BEFORE 6h from resolution to avoid lock risk
 """
 
+# Per Grok Round 4: UMA DVM Subgraph endpoint for voting status
+# Used to check if a market is in DVM voting phase
+UMA_DVM_SUBGRAPH = "https://api.thegraph.com/subgraphs/name/umaprotocol/uma-voting"
+
+# Query to check DVM voting status for a price request
+DVM_VOTING_QUERY = """
+query GetPriceRequest($identifier: String!, $timestamp: BigInt!) {
+  priceRequests(where: {identifier: $identifier, time: $timestamp}) {
+    id
+    identifier
+    time
+    resolvedPrice
+    isResolved
+    votingRound {
+      roundId
+      startTime
+      endTime
+    }
+  }
+}
+"""
+
 
 @dataclass
 class Position:
@@ -562,6 +584,73 @@ class PositionMonitor:
             "claims_count": self._claims_count,
             "total_claimed_usd": self._total_claimed_usd
         }
+
+    async def check_dvm_voting_status(self, condition_id: str) -> Optional[PositionStatus]:
+        """
+        Check if a market is in DVM voting phase.
+
+        Per Grok Round 4: Integration placeholder for UMA DVM subgraph query.
+        When a market is disputed, it escalates to DVM voting which takes ~48h.
+        During this period, positions are LOCKED and should not be traded.
+
+        Args:
+            condition_id: The condition ID of the market to check.
+
+        Returns:
+            PositionStatus.DVM_VOTING if in voting, None if not disputed or error.
+
+        Note:
+            This is a placeholder implementation. Full integration requires:
+            1. Mapping condition_id to UMA identifier/timestamp
+            2. Querying UMA DVM subgraph with DVM_VOTING_QUERY
+            3. Checking if votingRound is active
+        """
+        # Placeholder: Full implementation would query UMA subgraph
+        # Example implementation outline:
+        #
+        # session = await self._get_session()
+        # try:
+        #     payload = {
+        #         "query": DVM_VOTING_QUERY,
+        #         "variables": {
+        #             "identifier": self._condition_to_identifier(condition_id),
+        #             "timestamp": self._get_request_timestamp(condition_id)
+        #         }
+        #     }
+        #     async with session.post(UMA_DVM_SUBGRAPH, json=payload) as response:
+        #         if response.status == 200:
+        #             data = await response.json()
+        #             price_requests = data.get("data", {}).get("priceRequests", [])
+        #             if price_requests:
+        #                 req = price_requests[0]
+        #                 if req.get("votingRound") and not req.get("isResolved"):
+        #                     return PositionStatus.DVM_VOTING
+        # except Exception as e:
+        #     logger.debug(f"DVM voting check failed: {e}")
+        #
+        # return None
+
+        logger.debug(f"DVM voting check placeholder for {condition_id[:16]}...")
+        return None
+
+    def is_position_locked(self, position: Position) -> bool:
+        """
+        Check if a position is locked due to dispute/DVM voting.
+
+        Per Grok Round 4: Locked positions should not be traded or hedged.
+
+        Args:
+            position: The position to check.
+
+        Returns:
+            True if position is locked (dispute pending or DVM voting).
+        """
+        locked_statuses = {
+            PositionStatus.DISPUTED,
+            PositionStatus.DISPUTE_PENDING,
+            PositionStatus.DVM_VOTING
+        }
+        return position.status in locked_statuses
 
 
 class ProfitLocker:

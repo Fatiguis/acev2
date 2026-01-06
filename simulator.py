@@ -353,8 +353,9 @@ class Simulator:
 
         # Fee modeling (Polymarket implied from POST_ONLY vs taker)
         # Maker rebate: +0.1%, Taker fee: ~0.2%
-        # Assume 70% maker (post-only), 30% taker (fallback)
-        maker_ratio = 0.70
+        # Per Grok Round 4: rn1 uses >90% maker (POST_ONLY_GTC default)
+        # Previous 70/30 was underestimating maker usage
+        maker_ratio = 0.90
         maker_rebate_pct = 0.001  # 0.1%
         taker_fee_pct = 0.002     # 0.2%
 

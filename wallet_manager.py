@@ -23,16 +23,42 @@ from config import BotConfig, ProxyApiCreds
 
 logger = logging.getLogger(__name__)
 
-# Minimal ERC20 ABI for balance check
-ERC20_BALANCE_ABI = [
+# Minimal ERC20 ABI for balance check and approve
+ERC20_ABI = [
     {
         "constant": True,
         "inputs": [{"name": "_owner", "type": "address"}],
         "name": "balanceOf",
         "outputs": [{"name": "balance", "type": "uint256"}],
         "type": "function"
+    },
+    {
+        "constant": False,
+        "inputs": [{"name": "_spender", "type": "address"}, {"name": "_value", "type": "uint256"}],
+        "name": "approve",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function"
+    },
+    {
+        "constant": True,
+        "inputs": [{"name": "_owner", "type": "address"}, {"name": "_spender", "type": "address"}],
+        "name": "allowance",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function"
     }
 ]
+
+# Per Grok Round 4: CTF approval addresses for neg-risk trading
+# These are required for the neg-risk-ctf-adapter to work
+CTF_APPROVAL_ADDRESSES = {
+    # Polygon mainnet addresses
+    "ctf_exchange": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
+    "neg_risk_ctf_adapter": "0xC5d563A36AE78145C45a50134d48A1215220f80a",
+    "neg_risk_exchange": "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+}
+
+# Backwards compatibility
+ERC20_BALANCE_ABI = ERC20_ABI
 
 
 @dataclass
@@ -650,3 +676,84 @@ class WalletManager:
         if 0 <= index < len(self._wallets):
             return self._wallets[index]
         return None
+
+    async def ensure_ctf_approvals(self, wallet: Optional[WalletState] = None) -> bool:
+        """
+        Ensure CTF approvals are set for neg-risk trading.
+
+        Per Grok Round 4: neg-risk-ctf-adapter requires approvals to 3 addresses:
+        - CTF Exchange
+        - Neg Risk CTF Adapter
+        - Neg Risk Exchange
+
+        Args:
+            wallet: Specific wallet to approve, or None for all wallets.
+
+        Returns:
+            True if all approvals successful.
+        """
+        if self.config.dry_run:
+            logger.info("[DRY RUN] Would ensure CTF approvals")
+            return True
+
+        if not self._init_web3():
+            logger.warning("Cannot ensure CTF approvals: Web3 not initialized")
+            return False
+
+        wallets_to_check = [wallet] if wallet else self._wallets
+        max_approval = 2 ** 256 - 1  # MAX_UINT256
+
+        success = True
+        for w in wallets_to_check:
+            if not w.is_initialized or w.is_proxy_only:
+                continue  # Skip uninitialized or proxy-only wallets
+
+            try:
+                usdc_contract = self._web3.eth.contract(
+                    address=Web3.to_checksum_address(self.config.network.usdc_address),
+                    abi=ERC20_ABI
+                )
+
+                for name, spender_address in CTF_APPROVAL_ADDRESSES.items():
+                    spender = Web3.to_checksum_address(spender_address)
+                    owner = Web3.to_checksum_address(w.effective_address)
+
+                    # Check current allowance
+                    current_allowance = usdc_contract.functions.allowance(owner, spender).call()
+
+                    # If allowance is low, approve max
+                    min_required = 1_000_000 * 10**6  # $1M in USDC (6 decimals)
+                    if current_allowance < min_required:
+                        logger.info(f"Approving USDC to {name} for wallet {w.wallet_index}...")
+
+                        # Build and sign approval transaction
+                        nonce = self._web3.eth.get_transaction_count(w.address, 'pending')
+                        gas_price = self._web3.eth.gas_price
+
+                        tx = usdc_contract.functions.approve(spender, max_approval).build_transaction({
+                            'from': w.address,
+                            'nonce': nonce,
+                            'gas': 60000,
+                            'gasPrice': gas_price,
+                            'chainId': self.config.network.chain_id
+                        })
+
+                        account = Account.from_key(w.private_key)
+                        signed_tx = account.sign_transaction(tx)
+                        tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+                        # Wait for confirmation
+                        receipt = self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                        if receipt.status == 1:
+                            logger.info(f"CTF approval to {name} successful: {tx_hash.hex()}")
+                        else:
+                            logger.error(f"CTF approval to {name} failed: {tx_hash.hex()}")
+                            success = False
+                    else:
+                        logger.debug(f"CTF approval to {name} already set for wallet {w.wallet_index}")
+
+            except Exception as e:
+                logger.error(f"Error ensuring CTF approvals for wallet {w.wallet_index}: {e}")
+                success = False
+
+        return success

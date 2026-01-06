@@ -631,6 +631,15 @@ class ArbBot:
                 else:
                     logger.warning(f"USDC approval: {max_msg}")
 
+                # Per Grok Round 4: Ensure CTF approvals for neg-risk trading
+                # Required for neg-risk-ctf-adapter to work with multi-outcome markets
+                if use_multi_wallet:
+                    ctf_ok = await self.wallet_manager.ensure_ctf_approvals()
+                    if ctf_ok:
+                        logger.info("CTF approvals verified for neg-risk trading")
+                    else:
+                        logger.warning("Some CTF approvals may be missing - neg-risk markets may fail")
+
             except Exception as e:
                 logger.error(f"Authentication failed: {e}")
                 raise

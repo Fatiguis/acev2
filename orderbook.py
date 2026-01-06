@@ -179,7 +179,9 @@ class OrderbookPoller:
         self._burst_depth_multiplier = 1.8  # Depth spike threshold (1.8x = 80% increase)
         self._burst_price_jump_pct = 0.03  # Price jump threshold (3% = potential news event)
         self._burst_volume_spike_mult = 2.0  # Volume spike threshold (2x = unusual activity)
-        self._burst_poll_interval = 0.4  # Fast polling during bursts (400ms)
+        # Per Grok Round 4: Configurable burst interval from config
+        # Tunable for different market conditions (default 0.4s in config)
+        self._burst_poll_interval = config.trading.burst_poll_interval_seconds
 
         # Slippage prediction with EMA (addresses 22% partial fill rate)
         self._spread_ema: Dict[str, float] = {}  # token_id -> EMA of spread
