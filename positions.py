@@ -219,7 +219,20 @@ query GetPriceRequest($identifier: String!, $timestamp: BigInt!) {
 }
 """
 
-# UMA Voting ABI (minimal for commitVote and revealVote)
+# Per Grok Round 6: Query to get current voting phase timing
+DVM_PHASE_QUERY = """
+query GetCurrentVotingPhase {
+  votingRounds(first: 1, orderBy: roundId, orderDirection: desc) {
+    roundId
+    startTime
+    endTime
+    commitEndTime
+    revealEndTime
+  }
+}
+"""
+
+# UMA Voting ABI (extended for commit-reveal with phase monitoring - Grok Round 6)
 UMA_VOTING_ABI = json.loads('''
 [
     {
@@ -264,6 +277,20 @@ UMA_VOTING_ABI = json.loads('''
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getCurrentTime",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getVotePhase",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "stateMutability": "view",
+        "type": "function"
     }
 ]
 ''')
@@ -287,6 +314,29 @@ class Position:
     is_winner: bool = False
     claimable_amount_usd: float = 0.0
     last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class PendingDVMReveal:
+    """
+    Per Grok Round 6: Track pending DVM vote commits awaiting reveal phase.
+
+    UMA DVM uses commit-reveal voting:
+    1. Commit phase: Submit hash(price + salt) - keeps vote secret
+    2. Reveal phase: Submit actual price + salt - verifies commit
+
+    Missing reveal = vote doesn't count = funds stay locked!
+    This dataclass tracks commits so we can auto-reveal in reveal phase.
+    """
+    identifier: bytes
+    timestamp: int
+    ancillary_data: bytes
+    vote_price: int
+    salt: int
+    commit_tx_hash: str
+    commit_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    revealed: bool = False
+    reveal_tx_hash: Optional[str] = None
 
 
 @dataclass
@@ -320,6 +370,10 @@ class PositionMonitor:
         # Stats
         self._claims_count = 0
         self._total_claimed_usd = 0.0
+
+        # Per Grok Round 6: Track pending DVM reveals for auto-reveal scheduler
+        self._pending_reveals: List[PendingDVMReveal] = []
+        self._voting_contract: Optional[Any] = None
 
     def initialize(self):
         """Initialize web3 connection and contract."""
@@ -789,9 +843,19 @@ class PositionMonitor:
 
             if receipt.status == 1:
                 logger.info(f"DVM vote commit confirmed! TX: {tx_hash.hex()}")
-                logger.warning(
-                    "IMPORTANT: You must call revealVote during reveal phase "
-                    "to finalize your vote and unlock funds"
+
+                # Per Grok Round 6: Track for auto-reveal in reveal phase
+                pending = PendingDVMReveal(
+                    identifier=identifier,
+                    timestamp=timestamp,
+                    ancillary_data=ancillary_data,
+                    vote_price=vote_price,
+                    salt=salt,
+                    commit_tx_hash=tx_hash.hex()
+                )
+                self._pending_reveals.append(pending)
+                logger.info(
+                    f"Commit tracked for auto-reveal. Pending reveals: {len(self._pending_reveals)}"
                 )
                 return tx_hash.hex()
             else:
@@ -801,6 +865,178 @@ class PositionMonitor:
         except Exception as e:
             logger.error(f"DVM vote submission failed: {e}")
             return None
+
+    async def get_current_vote_phase(self) -> Optional[int]:
+        """
+        Per Grok Round 6: Get current UMA voting phase.
+
+        Returns:
+            0 = Commit phase (submit hash)
+            1 = Reveal phase (submit actual vote)
+            None = Error or not in voting round
+        """
+        if not self._web3:
+            return None
+
+        try:
+            if not self._voting_contract:
+                self._voting_contract = self._web3.eth.contract(
+                    address=Web3.to_checksum_address(UMA_VOTING_CONTRACT),
+                    abi=UMA_VOTING_ABI
+                )
+
+            phase = self._voting_contract.functions.getVotePhase().call()
+            return phase
+
+        except Exception as e:
+            logger.debug(f"Failed to get vote phase: {e}")
+            return None
+
+    async def reveal_dvm_vote(self, pending: PendingDVMReveal) -> Optional[str]:
+        """
+        Per Grok Round 6: Reveal a committed DVM vote.
+
+        Must be called during reveal phase to finalize vote.
+        If not revealed, commit is wasted and funds stay locked!
+
+        Args:
+            pending: The pending reveal with commit data.
+
+        Returns:
+            Transaction hash if successful, None otherwise.
+        """
+        if self.config.dry_run:
+            logger.info(f"[DRY RUN] Would reveal DVM vote for {pending.identifier.hex()[:16]}...")
+            pending.revealed = True
+            return "0xdryrun_reveal"
+
+        if not self._web3 or not self._account:
+            logger.error("Web3 not initialized for DVM reveal")
+            return None
+
+        try:
+            if not self._voting_contract:
+                self._voting_contract = self._web3.eth.contract(
+                    address=Web3.to_checksum_address(UMA_VOTING_CONTRACT),
+                    abi=UMA_VOTING_ABI
+                )
+
+            # Check we're in reveal phase
+            phase = await self.get_current_vote_phase()
+            if phase != 1:  # 1 = reveal phase
+                logger.warning(f"Not in reveal phase (current: {phase}), cannot reveal yet")
+                return None
+
+            # Get nonce
+            nonce = await _retry_rpc_with_backoff(
+                lambda: self._web3.eth.get_transaction_count(
+                    self._wallet_address, 'pending'
+                ),
+                operation_name="get_nonce_for_reveal"
+            )
+
+            gas_price = await _retry_rpc_with_backoff(
+                lambda: self._web3.eth.gas_price,
+                operation_name="get_gas_price_for_reveal"
+            )
+
+            # Build reveal transaction
+            tx = self._voting_contract.functions.revealVote(
+                pending.identifier,
+                pending.timestamp,
+                pending.ancillary_data,
+                pending.vote_price,
+                pending.salt
+            ).build_transaction({
+                'from': self._wallet_address,
+                'nonce': nonce,
+                'gas': 150000,
+                'gasPrice': gas_price,
+                'chainId': self.config.network.chain_id
+            })
+
+            # Sign and send
+            signed_tx = self._account.sign_transaction(tx)
+            tx_hash = self._web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+            logger.info(f"DVM vote reveal submitted: {tx_hash.hex()}")
+
+            # Wait for confirmation
+            receipt = await _retry_rpc_with_backoff(
+                lambda: self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout=120),
+                operation_name="wait_for_reveal_receipt"
+            )
+
+            if receipt.status == 1:
+                pending.revealed = True
+                pending.reveal_tx_hash = tx_hash.hex()
+                logger.info(f"DVM vote reveal confirmed! TX: {tx_hash.hex()}")
+                logger.info("Vote finalized - funds will unlock after resolution")
+                return tx_hash.hex()
+            else:
+                logger.error(f"DVM vote reveal failed: {tx_hash.hex()}")
+                return None
+
+        except Exception as e:
+            logger.error(f"DVM reveal failed: {e}")
+            return None
+
+    async def run_reveal_scheduler(self) -> int:
+        """
+        Per Grok Round 6: Automated DVM reveal scheduler.
+
+        Checks for pending commits that need revealing and submits reveals
+        when in reveal phase. Should be called periodically (e.g., every 5 min).
+
+        Returns:
+            Number of successful reveals.
+        """
+        if not self._pending_reveals:
+            return 0
+
+        # Check current phase
+        phase = await self.get_current_vote_phase()
+        if phase != 1:  # Not in reveal phase
+            unrevealed = [p for p in self._pending_reveals if not p.revealed]
+            if unrevealed:
+                logger.debug(
+                    f"{len(unrevealed)} commits awaiting reveal phase (current phase: {phase})"
+                )
+            return 0
+
+        # In reveal phase - process pending reveals
+        reveals_done = 0
+        for pending in self._pending_reveals:
+            if pending.revealed:
+                continue
+
+            logger.info(f"Auto-revealing commit from {pending.commit_time}")
+            tx_hash = await self.reveal_dvm_vote(pending)
+
+            if tx_hash:
+                reveals_done += 1
+                logger.info(f"Auto-reveal successful: {tx_hash}")
+            else:
+                logger.warning(f"Auto-reveal failed for commit {pending.commit_tx_hash[:16]}...")
+
+            # Rate limit between reveals
+            await asyncio.sleep(2)
+
+        # Clean up old revealed entries (keep for 24h)
+        cutoff = datetime.now(timezone.utc).timestamp() - (24 * 3600)
+        self._pending_reveals = [
+            p for p in self._pending_reveals
+            if not p.revealed or p.commit_time.timestamp() > cutoff
+        ]
+
+        if reveals_done > 0:
+            logger.info(f"Reveal scheduler completed: {reveals_done} reveals")
+
+        return reveals_done
+
+    def get_pending_reveals_count(self) -> int:
+        """Get count of pending reveals awaiting reveal phase."""
+        return len([p for p in self._pending_reveals if not p.revealed])
 
     def is_position_locked(self, position: Position) -> bool:
         """

@@ -1,6 +1,11 @@
 """
 Execution Module.
 Handles order placement and execution for arbitrage opportunities.
+
+Per Grok Round 6: py-clob-client is synchronous (requests-based). Direct calls
+block the asyncio event loop. This module uses run_sync_in_thread() to execute
+CLOB client calls in a thread pool, keeping the event loop responsive for
+WebSocket updates and other async tasks.
 """
 
 import logging
@@ -18,6 +23,7 @@ from web3.middleware import ExtraDataToPOAMiddleware
 
 from config import BotConfig
 from orderbook import ArbOpportunity, ArbType
+from clob_client_patch import run_sync_in_thread
 
 logger = logging.getLogger(__name__)
 
@@ -1386,9 +1392,10 @@ class ExecutionEngine:
                     all_terminal = False
 
                     # Try to get order status from CLOB
+                    # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
                     if order.order_id:
                         try:
-                            order_status = self.client.get_order(order.order_id)
+                            order_status = await run_sync_in_thread(self.client.get_order, order.order_id)
                             if order_status:
                                 filled = float(order_status.get("sizeFilled", 0))
                                 if filled > 0:
@@ -1618,10 +1625,11 @@ class ExecutionEngine:
                 side=side,
             )
 
-            signed_order = execution_client.create_order(order_args)
+            # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
+            signed_order = await run_sync_in_thread(execution_client.create_order, order_args)
 
             # Submit as GTC (Good Till Cancelled)
-            response = execution_client.post_order(signed_order, OrderType.GTC)
+            response = await run_sync_in_thread(execution_client.post_order, signed_order, OrderType.GTC)
 
             if response and response.get("success"):
                 order_id = response.get("orderID")
@@ -1641,7 +1649,8 @@ class ExecutionEngine:
                 else:
                     # Cancel unfilled order - will fall back to FAK in caller
                     try:
-                        execution_client.cancel(order_id)
+                        # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
+                        await run_sync_in_thread(execution_client.cancel, order_id)
                         logger.debug(f"Hedge post-only timed out after {timeout_seconds}s, cancelled {order_id}")
                     except Exception:
                         pass
@@ -2218,10 +2227,11 @@ class ExecutionEngine:
                 )
 
                 # Create and sign the order
-                signed_order = execution_client.create_market_order(order_args)
+                # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
+                signed_order = await run_sync_in_thread(execution_client.create_market_order, order_args)
 
                 # Submit the order
-                response = execution_client.post_order(signed_order, order_type_to_use)
+                response = await run_sync_in_thread(execution_client.post_order, signed_order, order_type_to_use)
 
                 # Parse response
                 if response and response.get("success"):
@@ -2234,7 +2244,8 @@ class ExecutionEngine:
                         await asyncio.sleep(0.05)  # 50ms for fills to process
 
                         try:
-                            order_status = execution_client.get_order(order_id)
+                            # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
+                            order_status = await run_sync_in_thread(execution_client.get_order, order_id)
                             if order_status:
                                 filled_size = float(order_status.get("sizeFilled", 0))
                                 total_size = float(order_status.get("size", size_usd))
@@ -2397,10 +2408,11 @@ class ExecutionEngine:
             )
 
             # Create order with post-only option
-            signed_order = execution_client.create_order(order_args)
+            # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
+            signed_order = await run_sync_in_thread(execution_client.create_order, order_args)
 
             # Submit as GTC (Good Till Cancelled) - will act as post-only
-            response = execution_client.post_order(signed_order, OrderType.GTC)
+            response = await run_sync_in_thread(execution_client.post_order, signed_order, OrderType.GTC)
 
             if response and response.get("success"):
                 order_id = response.get("orderID")
@@ -2420,7 +2432,8 @@ class ExecutionEngine:
                 else:
                     # Cancel unfilled order and fall back to FOK at reduced size
                     try:
-                        execution_client.cancel(order_id)
+                        # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
+                        await run_sync_in_thread(execution_client.cancel, order_id)
                         logger.debug(f"Post-only timed out, cancelled {order_id}, falling back to FOK at 80% size")
                     except Exception:
                         pass
@@ -2492,7 +2505,8 @@ class ExecutionEngine:
 
         while (datetime.now(timezone.utc) - start).total_seconds() < timeout_seconds:
             try:
-                order = client.get_order(order_id)
+                # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
+                order = await run_sync_in_thread(client.get_order, order_id)
                 if order:
                     status = order.get("status", "").lower()
                     if status in ("matched", "filled"):

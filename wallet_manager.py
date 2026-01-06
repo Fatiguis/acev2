@@ -677,10 +677,33 @@ class WalletManager:
             return self._wallets[index]
         return None
 
+    def _calculate_dynamic_approval(self) -> int:
+        """
+        Per Grok Round 6: Calculate dynamic approval cap based on actual capital.
+
+        Fixed $10M was arbitrary - should scale with actual trading capital.
+        Uses 2x total wallet balance as approval cap (headroom for profits/deposits).
+
+        Returns:
+            Approval amount in USDC atomic units (6 decimals).
+        """
+        total_balance = sum(w.usdc_balance for w in self._wallets if w.is_initialized)
+
+        # Minimum $100k approval (avoid re-approving for small amounts)
+        min_approval = 100_000
+
+        # 2x current balance gives headroom for deposits/profits
+        # Capped at $50M as reasonable maximum
+        dynamic_cap = max(total_balance * 2, min_approval)
+        dynamic_cap = min(dynamic_cap, 50_000_000)  # Cap at $50M
+
+        return int(dynamic_cap * 10**6)  # Convert to USDC atomic units
+
     async def ensure_ctf_approvals(
         self,
         wallet: Optional[WalletState] = None,
-        use_specific_amount: bool = True
+        use_specific_amount: bool = True,
+        custom_amount_usd: Optional[float] = None
     ) -> bool:
         """
         Ensure CTF approvals are set for neg-risk trading.
@@ -694,10 +717,15 @@ class WalletManager:
         instead of unlimited approvals for security. Unlimited approval means
         if any contract is compromised, attacker can drain all USDC.
 
+        Per Grok Round 6: Dynamic approval cap based on actual capital instead
+        of fixed $10M. Uses 2x current balance with $50M max cap.
+
         Args:
             wallet: Specific wallet to approve, or None for all wallets.
-            use_specific_amount: If True, use $10M cap instead of unlimited.
+            use_specific_amount: If True, use dynamic cap instead of unlimited.
                                  Recommended for security (py-clob-client pattern).
+            custom_amount_usd: Optional custom approval amount in USD. If not set,
+                               uses dynamic calculation (2x balance, $50M max).
 
         Returns:
             True if all approvals successful.
@@ -712,12 +740,18 @@ class WalletManager:
 
         wallets_to_check = [wallet] if wallet else self._wallets
 
-        # Per Grok Round 5: Use specific amount instead of unlimited
-        # $10M cap is generous but limits exposure if contract is compromised
-        # Can be increased if hitting limits, but unlimited is risky
+        # Per Grok Round 6: Dynamic approval based on actual capital
         if use_specific_amount:
-            approval_amount = 10_000_000 * 10**6  # $10M in USDC (6 decimals)
-            logger.info("Using specific approval amount ($10M) per py-clob-client security pattern")
+            if custom_amount_usd is not None:
+                approval_amount = int(custom_amount_usd * 10**6)
+                logger.info(f"Using custom approval amount (${custom_amount_usd:,.0f})")
+            else:
+                approval_amount = self._calculate_dynamic_approval()
+                approval_usd = approval_amount / 10**6
+                logger.info(
+                    f"Using dynamic approval amount (${approval_usd:,.0f}) - "
+                    f"2x current balance, capped at $50M"
+                )
         else:
             approval_amount = 2 ** 256 - 1  # MAX_UINT256 (unlimited - not recommended)
             logger.warning("Using UNLIMITED approval - consider use_specific_amount=True for security")
@@ -741,7 +775,8 @@ class WalletManager:
                     current_allowance = usdc_contract.functions.allowance(owner, spender).call()
 
                     # If allowance is low, approve specific amount
-                    min_required = 1_000_000 * 10**6  # $1M threshold before re-approval
+                    # Per Grok Round 6: Use 10% of approval amount as re-approval threshold
+                    min_required = max(approval_amount // 10, 100_000 * 10**6)  # 10% or $100k min
                     if current_allowance < min_required:
                         amount_str = f"${approval_amount / 10**6:,.0f}" if use_specific_amount else "UNLIMITED"
                         logger.info(f"Approving {amount_str} USDC to {name} for wallet {w.wallet_index}...")
