@@ -9,7 +9,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Optional, Callable, Awaitable, Any
+from typing import Optional, Callable, Awaitable, Any, List
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -39,10 +39,10 @@ class Supervisor:
 
     def __init__(
         self,
-        max_restarts: int = 10,
+        max_restarts: int = 5,  # Per Grok Round 18: Hard cap at 5 without manual intervention
         restart_delay_base: float = 5.0,
         restart_delay_max: float = 300.0,
-        heartbeat_timeout: float = 30.0,  # Per Grok audit: 120s is too long for HF trading
+        heartbeat_timeout: float = 10.0,  # Per Grok Round 18: 10s for HF (rn1 cycles <1s)
         cooldown_after_success: float = 300.0,
     ):
         """
@@ -50,12 +50,14 @@ class Supervisor:
 
         Args:
             max_restarts: Maximum restarts before giving up.
+                         Per Grok Round 18: Reduced to 5 - restart loop on persistent
+                         failure (bad creds, geoblock) drains gas/fees.
             restart_delay_base: Base delay between restarts (exponential backoff).
             restart_delay_max: Maximum delay between restarts.
             heartbeat_timeout: Seconds without heartbeat before force restart.
-                              Per Grok audit: Reduced from 120s to 30s for HF trading.
-                              rn1-style bots should cycle every ~1s, so 30s timeout
-                              catches stuck processes much faster than 2 minutes.
+                              Per Grok Round 18: Reduced to 10s for HF trading.
+                              rn1-style bots cycle <1s, so 10s catches stuck processes
+                              much faster. 30s was still too slow for live sports.
             cooldown_after_success: Seconds of successful running before resetting restart count.
         """
         self.max_restarts = max_restarts
@@ -70,6 +72,7 @@ class Supervisor:
         self._main_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._last_heartbeat = time.time()
+        self._restarts_this_hour: List[float] = []  # Track restart times for alerting
 
     def heartbeat(self):
         """
@@ -190,13 +193,26 @@ class Supervisor:
                 self._stats.restarts += 1
                 self._stats.last_restart = datetime.now(timezone.utc)
 
+                # Per Grok Round 18: Track restarts per hour for alerting
+                now = time.time()
+                self._restarts_this_hour = [t for t in self._restarts_this_hour if now - t < 3600]
+                self._restarts_this_hour.append(now)
+
+                if len(self._restarts_this_hour) > 3:
+                    logger.critical(
+                        f"ALERT: {len(self._restarts_this_hour)} restarts in last hour! "
+                        f"Possible persistent failure (bad creds, geoblock, API down). "
+                        f"Manual intervention recommended."
+                    )
+
                 if self._shutdown_requested:
                     logger.info("Shutdown requested, not restarting")
                     break
 
                 logger.warning(
                     f"Restarting in {delay:.1f}s "
-                    f"(restart {self._stats.restarts}/{self.max_restarts})..."
+                    f"(restart {self._stats.restarts}/{self.max_restarts}, "
+                    f"{len(self._restarts_this_hour)} this hour)..."
                 )
                 await asyncio.sleep(delay)
 

@@ -13,7 +13,17 @@ For bot integration, use the async cancel methods in execution.py instead.
 Per Grok Round 7 CRITICAL FIX: Removed dangerous dry_run override that could
 cancel real orders when DRY_RUN=True in config. Now requires explicit
 --confirm flag to execute any real orders.
+
+Per Grok Round 18: CLI-only guard - prevents import into async event loop.
 """
+
+# Per Grok Round 18: Guard against import into event loop
+# This script uses blocking time.sleep() - importing it would block the bot
+if __name__ != "__main__":
+    raise RuntimeError(
+        "cancel_orders.py is a CLI-only script. "
+        "Do not import - use execution.py async cancel methods instead."
+    )
 
 import sys
 import time

@@ -114,8 +114,9 @@ def setup_logging(config: LoggingConfig, use_async: bool = True) -> logging.Logg
             )
             _queue_listener.start()
 
-            # Ensure cleanup on exit
-            atexit.register(_cleanup_queue_listener)
+            # Per Grok Round 18: Removed atexit - unreliable in forked/multithreaded apps
+            # Cleanup should be called explicitly via supervisor shutdown using cleanup_logging()
+            # atexit may not fire on supervisor kill, orphaning listener thread
 
             root_logger.info(
                 f"Async logging enabled: queue-based file I/O, "
@@ -143,6 +144,18 @@ def _cleanup_queue_listener():
     if _queue_listener is not None:
         _queue_listener.stop()
         _queue_listener = None
+
+
+def cleanup_logging():
+    """
+    Per Grok Round 18: Explicit cleanup for supervisor shutdown.
+
+    Call this in supervisor cleanup_coro to ensure log flush before exit.
+    atexit is unreliable in forked/multithreaded apps and may not fire
+    on supervisor kill, orphaning listener thread and losing forensic data.
+    """
+    _cleanup_queue_listener()
+    logging.shutdown()
 
 
 def get_logger(name: str) -> logging.Logger:
