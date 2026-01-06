@@ -997,7 +997,8 @@ class ArbBot:
                 "content": (
                     f"**⛽ LOW GAS ALERT**\n"
                     f"MATIC Balance: {matic_balance:.4f}\n"
-                    f"Warning Threshold: 1.0 MATIC\n"
+                    f"Warning Threshold: 2.0 MATIC\n"
+                    f"Minimum Required: 1.0 MATIC\n"
                     f"Action: Fund wallet with MATIC for gas!\n"
                     f"Wallet: {self.config.wallet.wallet_address[:10]}..."
                 )
@@ -1374,10 +1375,11 @@ class ArbBot:
                 else:
                     logger.info(f"USDC allowance OK: ${allowance_usd:,.2f}")
 
-            # Per Grok Round 15: MATIC gas balance check with webhook alert
+            # Per Grok Round 15/16: MATIC gas balance check with webhook alert
+            # Warning threshold raised to 2.0 MATIC for HF burst trading safety
             matic_balance = self.auth_manager.get_matic_balance()
             if matic_balance is not None:
-                if matic_balance < 1.0:  # Warning threshold
+                if matic_balance < 2.0:  # Warning threshold (MIN_MATIC_FOR_GAS=1.0)
                     logger.warning(f"MATIC balance LOW: {matic_balance:.4f} - fund wallet for gas!")
                     # Send webhook alert if configured
                     webhook_url = self.config.trading.big_arb_webhook_url

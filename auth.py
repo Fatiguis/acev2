@@ -18,13 +18,13 @@ from config import BotConfig
 logger = logging.getLogger(__name__)
 
 # Minimum MATIC balance required for gas (in MATIC)
-# Raised to 0.5 MATIC for rn1-style burst trading (100+ tx/day)
-# Polygon gas spikes during high network activity can eat 0.2+ MATIC in hours
-# Per Grok audit: 0.2 MATIC is too low for sustained HF trading
-MIN_MATIC_FOR_GAS = 0.5
+# Per Grok Round 16: Raised to 1.0 MATIC for rn1-style burst trading
+# Math: 100+ tx/day * 0.01 MATIC spike avg = 1.0+ MATIC/day buffer needed
+# Polygon gas spikes during high network activity can drain wallet fast
+MIN_MATIC_FOR_GAS = 1.0
 
-# Warning threshold - alert when approaching minimum
-MATIC_WARNING_THRESHOLD = 1.0
+# Warning threshold - alert when approaching minimum (triggers webhook)
+MATIC_WARNING_THRESHOLD = 2.0
 
 T = TypeVar('T')
 

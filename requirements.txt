@@ -1,5 +1,6 @@
 # Polymarket Official Client
-py-clob-client>=0.34.0
+# Per Grok Round 16: Updated to latest for async improvements
+py-clob-client>=0.36.0
 
 # Async HTTP
 aiohttp>=3.9.0
