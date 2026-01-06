@@ -560,9 +560,10 @@ class ExecutionEngine:
         self._market_exposure: Dict[str, float] = {}  # market_id -> net exposure in USD
         self._max_exposure_pct = 0.05  # 5% of capital max directional exposure per market
 
-        # Idempotency tracker (per Grok Round 4: 600s TTL for resolution scenarios)
-        # Markets near resolution can have extended arb windows, need longer dedup
-        self._idempotency_tracker = IdempotencyTracker(ttl_seconds=600)
+        # Idempotency tracker (per Grok Round 15: 900s TTL for WS reconnect scenarios)
+        # WS reconnects during sports bursts can re-detect same arb within minutes
+        # Extended to 900s (15 min) to safely cover reconnect + market resolution windows
+        self._idempotency_tracker = IdempotencyTracker(ttl_seconds=900)
 
         # Enhanced circuit breaker: >5 consecutive partials/fails OR >3% drawdown = 30min pause
         self._circuit_breaker_active = False

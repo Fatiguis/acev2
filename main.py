@@ -985,6 +985,36 @@ class ArbBot:
         except Exception as e:
             logger.debug(f"Webhook notification failed: {e}")
 
+    def _send_low_gas_alert(self, webhook_url: str, matic_balance: float):
+        """
+        Per Grok Round 15: Send webhook alert when MATIC balance is low.
+
+        Polygon gas can spike during high network activity, draining MATIC fast.
+        Alert operators to top up before trades start failing.
+        """
+        try:
+            payload = {
+                "content": (
+                    f"**⛽ LOW GAS ALERT**\n"
+                    f"MATIC Balance: {matic_balance:.4f}\n"
+                    f"Warning Threshold: 1.0 MATIC\n"
+                    f"Action: Fund wallet with MATIC for gas!\n"
+                    f"Wallet: {self.config.wallet.wallet_address[:10]}..."
+                )
+            }
+
+            if "telegram" in webhook_url.lower():
+                payload = {"text": payload["content"]}
+
+            response = requests.post(webhook_url, json=payload, timeout=5)
+            if response.status_code in (200, 204):
+                logger.info("Low gas webhook alert sent")
+            else:
+                logger.debug(f"Low gas webhook returned {response.status_code}")
+
+        except Exception as e:
+            logger.debug(f"Low gas webhook failed: {e}")
+
     async def _verify_post_execution_book(self, opportunity: ArbOpportunity):
         """
         Verify orderbook normalized after successful arb execution.
@@ -1343,6 +1373,18 @@ class ArbBot:
                     logger.warning(f"USDC allowance LOW: ${allowance_usd:,.2f} - may cause 400 errors!")
                 else:
                     logger.info(f"USDC allowance OK: ${allowance_usd:,.2f}")
+
+            # Per Grok Round 15: MATIC gas balance check with webhook alert
+            matic_balance = self.auth_manager.get_matic_balance()
+            if matic_balance is not None:
+                if matic_balance < 1.0:  # Warning threshold
+                    logger.warning(f"MATIC balance LOW: {matic_balance:.4f} - fund wallet for gas!")
+                    # Send webhook alert if configured
+                    webhook_url = self.config.trading.big_arb_webhook_url
+                    if webhook_url and HAS_REQUESTS:
+                        self._send_low_gas_alert(webhook_url, matic_balance)
+                else:
+                    logger.info(f"MATIC balance OK: {matic_balance:.4f}")
 
         # WebSocket stats if enabled
         if self._use_websocket and self.hybrid_manager:
