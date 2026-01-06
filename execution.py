@@ -2342,11 +2342,15 @@ class ExecutionEngine:
         wallet_state: Optional[Any] = None
     ) -> OrderResult:
         """
-        Place a post-only limit order for maker rebates, with sized-down FOK fallback.
+        Place a post-only limit order for maker rebates, with FAK fallback.
 
+        Per Grok Round 7: rn1 achieved >90% maker fills by using post-only primary.
         Post-only orders earn maker rebates (~0.1-0.3% on Polymarket).
-        If not filled within timeout, falls back to FOK at 80% size to capture
-        most of the edge in race conditions.
+        If not filled within 500ms timeout, falls back to FAK (Fill-And-Kill) to
+        capture remaining edge before other traders take it.
+
+        FAK vs FOK: FAK allows partial fills (better than nothing), FOK is all-or-nothing.
+        rn1 minimized taker fees via this post-only + FAK fallback pattern.
 
         Dynamic price improvement formula: improvement = base + (edge_pct * 0.5)
         - Scales linearly with edge: bigger edges get bolder pricing for fill probability
@@ -2424,63 +2428,68 @@ class ExecutionEngine:
                 if filled:
                     result.status = OrderStatus.FILLED
                     result.executed_size_usd = size_usd
+                    # Track maker fill
+                    self._maker_fills += 1
+                    self._maker_volume_usd += size_usd
                     logger.debug(
-                        f"Post-only filled: {side} {outcome_name} @ {post_price:.4f} "
-                        f"for ${size_usd:.2f} (maker rebate earned!)"
+                        f"Post-only filled (MAKER): {side} {outcome_name} @ {post_price:.4f} "
+                        f"for ${size_usd:.2f} (rebate earned!)"
                     )
                     return result
                 else:
-                    # Cancel unfilled order and fall back to FOK at reduced size
+                    # Cancel unfilled order and fall back to FAK
+                    # Per Grok Round 7: FAK allows partial fills (better than nothing)
                     try:
                         # Per Grok Round 6: Use run_sync_in_thread to avoid blocking event loop
                         await run_sync_in_thread(execution_client.cancel, order_id)
-                        logger.debug(f"Post-only timed out, cancelled {order_id}, falling back to FOK at 80% size")
+                        logger.debug(f"Post-only timed out after {timeout}s, cancelled {order_id}, falling back to FAK")
                     except Exception:
                         pass
 
-                    # Fall back to FOK at 80% size (captures most edge in races)
-                    reduced_size = size_usd * 0.80
+                    # Fall back to FAK (Fill-And-Kill) - allows partial fills
+                    # Per Grok Round 7: Don't reduce size - FAK handles partial liquidity
                     return await self._place_market_order(
                         token_id=token_id,
                         outcome_name=outcome_name,
                         side=side,
-                        size_usd=reduced_size,
+                        size_usd=size_usd,
                         limit_price=limit_price,
                         retry_on_no_match=True,
                         client=client,
-                        wallet_state=wallet_state
+                        wallet_state=wallet_state,
+                        use_ioc=True  # FAK mode explicitly
                     )
             else:
                 error_msg = response.get("errorMsg", "Unknown error") if response else "No response"
-                logger.debug(f"Post-only submission failed: {error_msg}, falling back to FOK at 80% size")
+                logger.debug(f"Post-only submission failed: {error_msg}, falling back to FAK")
 
-                # Fall back to FOK at reduced size
-                reduced_size = size_usd * 0.80
+                # Fall back to FAK on submission error
                 return await self._place_market_order(
                     token_id=token_id,
                     outcome_name=outcome_name,
                     side=side,
-                    size_usd=reduced_size,
+                    size_usd=size_usd,
                     limit_price=limit_price,
                     retry_on_no_match=True,
                     client=client,
-                    wallet_state=wallet_state
+                    wallet_state=wallet_state,
+                    use_ioc=True  # FAK mode explicitly
                 )
 
         except Exception as e:
-            logger.debug(f"Post-only exception: {e}, falling back to FOK at 80% size")
+            logger.debug(f"Post-only exception: {e}, falling back to FAK")
 
-            # Fall back to FOK at reduced size on any error
-            reduced_size = size_usd * 0.80
+            # Fall back to FAK on any error
             return await self._place_market_order(
                 token_id=token_id,
                 outcome_name=outcome_name,
                 side=side,
-                size_usd=reduced_size,
+                size_usd=size_usd,
                 limit_price=limit_price,
                 retry_on_no_match=True,
                 client=client,
-                wallet_state=wallet_state
+                wallet_state=wallet_state,
+                use_ioc=True  # FAK mode explicitly
             )
 
     async def _wait_for_fill(

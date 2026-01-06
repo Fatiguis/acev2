@@ -110,9 +110,9 @@ class TradingConfig:
     )
 
     # Post-only mode: try post-only limit orders first for maker rebates
-    # Falls back to FOK market orders if post-only doesn't fill in timeout
+    # Falls back to FAK (Fill-And-Kill) if post-only doesn't fill in timeout
     # Maker rebates add ~0.1-0.3% to edge
-    # Per Grok audit: Changed default to true - rn1 preferred maker fills
+    # Per Grok Round 7: Default True - rn1 preferred maker fills for >90% volume
     use_post_only: bool = field(
         default_factory=lambda: os.getenv("USE_POST_ONLY", "true").lower() == "true"
     )
@@ -125,8 +125,9 @@ class TradingConfig:
     )
 
     # Post-only timeout in seconds before falling back to FAK
-    # Per Grok audit: Increased from 0.5s to 1.0s for better maker fill chance
-    post_only_timeout_seconds: float = 1.0
+    # Per Grok Round 7: 500ms for arb legs - balance between maker fills and speed
+    # Too short = miss maker rebates, too long = lose arb edge to other traders
+    post_only_timeout_seconds: float = 0.5
 
     # Post-only timeout for HEDGE orders (longer - hedges are less time-sensitive)
     post_only_hedge_timeout_seconds: float = 30.0

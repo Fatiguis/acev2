@@ -250,8 +250,8 @@ def close_via_hedge(client, token_id: str, size: float, outcome_name: str, use_p
             # Get current book to find best ask price
             book = client.get_book(opposite_token)
             if not book or not book.get("asks"):
-                print(f"    No asks available for opposite token")
-                return close_via_sell(client, token_id, size, outcome_name)
+                print(f"    ✗ No asks available for opposite token - cannot hedge")
+                return False
 
             best_ask = float(book["asks"][0]["price"])
 
@@ -307,9 +307,11 @@ def close_via_hedge(client, token_id: str, size: float, outcome_name: str, use_p
         except Exception as e:
             print(f"    Hedge via opposite failed: {e}")
 
-    # No opposite token found - fall back to direct sell
-    print(f"    No opposite token found, using direct sell...")
-    return close_via_sell(client, token_id, size, outcome_name)
+    # No opposite token found - cannot hedge
+    # Per Grok Round 7: Do NOT fall back to direct sell (deprecated)
+    print(f"    ✗ No opposite token found - cannot hedge position")
+    print(f"    This may indicate a data API issue or unusual market structure")
+    return False
 
 
 def close_via_fak_buy(client, token_id: str, size: float, name: str) -> bool:
@@ -350,50 +352,36 @@ def close_via_fak_buy(client, token_id: str, size: float, name: str) -> bool:
 
 def close_via_sell(client, token_id: str, size: float, name: str) -> bool:
     """
-    Close by selling (legacy fallback).
+    DEPRECATED: Legacy sell method - DO NOT USE.
 
-    Note: Per audit, this should be avoided as it incurs taker fees
-    and is not the rn1 pattern. Use only as last resort.
+    Per Grok Round 7: This method is deprecated and should not be used.
+    rn1 never sold directly - always hedged by buying the opposite outcome.
+    Direct sells incur taker fees and are not the proper hedging pattern.
+
+    This function now prints a warning and returns False.
+    Use close_via_hedge() instead.
     """
-    from py_clob_client.clob_types import MarketOrderArgs
-
-    print(f"    WARNING: Using direct sell (not rn1 pattern)...")
-
-    try:
-        order_args = MarketOrderArgs(
-            token_id=str(token_id),
-            amount=size,
-            side=SELL,
-        )
-
-        signed_order = client.create_market_order(order_args)
-
-        if HAS_FAK:
-            response = client.post_order(signed_order, OrderType.FAK)
-        else:
-            response = client.post_order(signed_order, OrderType.FOK)
-
-        if response and response.get("success"):
-            print(f"    ✓ Sold")
-            return True
-
-        error = response.get("errorMsg", "Unknown") if response else "No response"
-        print(f"    ✗ Sell failed: {error}")
-        return False
-
-    except Exception as e:
-        print(f"    ✗ Sell error: {e}")
-        return False
+    print(f"    ✗ ERROR: Direct sell is deprecated (not rn1 pattern)")
+    print(f"    Use close_via_hedge() to buy opposite outcome instead")
+    print(f"    Per Grok Round 7: rn1 never sold - always bought opposite")
+    return False
 
 
 def main():
     # Check for --confirm flag
     auto_confirm = "--confirm" in sys.argv
-    # Check for --legacy flag (uses old sell method)
-    use_legacy = "--legacy" in sys.argv
 
-    if use_legacy:
-        print("WARNING: Using legacy sell method (not recommended)")
+    # Per Grok Round 7: Legacy sell method removed - always use rn1-style hedge
+    # Check for deprecated --legacy flag and warn
+    if "--legacy" in sys.argv:
+        print("=" * 60)
+        print("ERROR: --legacy flag is deprecated and no longer supported")
+        print("=" * 60)
+        print("Per Grok Round 7: Direct sell is not the rn1 pattern.")
+        print("rn1 always hedged by buying opposite outcomes.")
+        print("\nTo close positions, use: python3 close_positions.py --confirm")
+        print("=" * 60)
+        return
 
     config = load_config()
     auth = AuthManager(config)
@@ -449,11 +437,10 @@ def main():
         if not auto_confirm:
             print("\nTo close all positions, run:")
             print("  python3 close_positions.py --confirm")
-            print("\nTo use legacy sell method (not recommended):")
-            print("  python3 close_positions.py --confirm --legacy")
             return
 
-        print("\nClosing positions using " + ("LEGACY SELL" if use_legacy else "RN1-STYLE HEDGE") + "...")
+        # Per Grok Round 7: Always use rn1-style hedge (legacy sell removed)
+        print("\nClosing positions using RN1-STYLE HEDGE (buy opposite outcome)...")
 
         success_count = 0
         fail_count = 0
@@ -466,10 +453,8 @@ def main():
             if size <= 0 or not token_id:
                 continue
 
-            if use_legacy:
-                success = close_via_sell(client, token_id, size, outcome)
-            else:
-                success = close_via_hedge(client, token_id, size, outcome)
+            # Always use hedge (rn1 pattern)
+            success = close_via_hedge(client, token_id, size, outcome)
 
             if success:
                 success_count += 1

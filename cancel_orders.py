@@ -9,8 +9,13 @@ Per Grok audit fixes:
 Per Grok Round 5: This is a standalone CLI script (not async integration).
 time.sleep is acceptable here as this is not run inside the bot's event loop.
 For bot integration, use the async cancel methods in execution.py instead.
+
+Per Grok Round 7 CRITICAL FIX: Removed dangerous dry_run override that could
+cancel real orders when DRY_RUN=True in config. Now requires explicit
+--confirm flag to execute any real orders.
 """
 
+import sys
 import time
 from config import load_config
 from auth import AuthManager
@@ -28,18 +33,35 @@ def fetch_with_rate_limit(func, *args, delay: float = 0.5, **kwargs):
 
 
 def main():
+    # Per Grok Round 7 CRITICAL FIX: Require explicit --confirm flag
+    # This prevents accidental capital loss from running the script
+    has_confirm = "--confirm" in sys.argv
+
     config = load_config()
 
-    # Check if dry_run is set - warn user but allow override
+    # CRITICAL: Block execution if dry_run is set (safety first)
     if config.dry_run:
-        print("WARNING: DRY_RUN is enabled in config.")
-        print("This script will cancel real orders regardless.")
-        print("Press Ctrl+C to abort, or wait 3 seconds to continue...")
-        try:
-            time.sleep(3)
-        except KeyboardInterrupt:
-            print("\nAborted.")
-            return
+        print("=" * 60)
+        print("BLOCKED: DRY_RUN is enabled in config")
+        print("=" * 60)
+        print("\nThis script cancels REAL orders on the live exchange.")
+        print("Running with DRY_RUN=True is blocked for safety.")
+        print("\nTo cancel orders:")
+        print("  1. Set DRY_RUN=false in your .env file")
+        print("  2. Run: python3 cancel_orders.py --confirm")
+        print("=" * 60)
+        return
+
+    # Require --confirm flag for safety
+    if not has_confirm:
+        print("=" * 60)
+        print("CANCEL ALL ORDERS")
+        print("=" * 60)
+        print("\nThis will cancel ALL open orders on your Polymarket account.")
+        print("\nTo proceed, run:")
+        print("  python3 cancel_orders.py --confirm")
+        print("=" * 60)
+        return
 
     auth = AuthManager(config)
     client = auth.initialize()
