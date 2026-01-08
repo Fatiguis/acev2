@@ -765,8 +765,9 @@ class WalletManager:
 
         success = True
         for w in wallets_to_check:
-            if not w.is_initialized or w.is_proxy_only:
-                continue  # Skip uninitialized or proxy-only wallets
+            # FIX: Also check for empty private key to avoid Account.from_key("") crash
+            if not w.is_initialized or w.is_proxy_only or not w.private_key:
+                continue  # Skip uninitialized, proxy-only, or no-private-key wallets
 
             try:
                 usdc_contract = self._web3.eth.contract(

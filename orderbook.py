@@ -1024,20 +1024,26 @@ class OrderbookPoller:
             min_depth_across_levels = min(min_depth_across_levels, ask_depth, bid_depth)
 
         # Check minimum depth at best levels
-        min_ask_depth_usd = min(
+        # FIX: Use list comprehension first to avoid min() on empty sequence
+        ask_depths = [
             ob.best_ask_size * ob.best_ask_price for ob in orderbooks
             if ob.best_ask
-        ) if all(ob.best_ask for ob in orderbooks) else 0
+        ]
+        min_ask_depth_usd = min(ask_depths) if ask_depths else 0
 
-        min_bid_depth_usd = min(
+        bid_depths = [
             ob.best_bid_size * ob.best_bid_price for ob in orderbooks
             if ob.best_bid
-        ) if all(ob.best_bid for ob in orderbooks) else 0
+        ]
+        min_bid_depth_usd = min(bid_depths) if bid_depths else 0
 
         # Calculate dynamic threshold based on expected trade size
+        # Per Grok Round 26: Proxy wallets have ZERO gas costs
         estimated_trade_size = min(min_ask_depth_usd, min_bid_depth_usd)
+        is_proxy = self.config.wallet.signature_type == 1
         dynamic_threshold = calculate_dynamic_threshold(
-            estimated_trade_size, num_outcomes, self.config.trading
+            estimated_trade_size, num_outcomes, self.config.trading,
+            is_proxy_wallet=is_proxy
         )
 
         # Per Grok Round 20: For multi-outcome markets (3+), check subset arbs first
@@ -1115,7 +1121,8 @@ class OrderbookPoller:
 
             # Re-check with actual trade size
             final_threshold = calculate_dynamic_threshold(
-                opportunity.trade_size_usd, num_outcomes, self.config.trading
+                opportunity.trade_size_usd, num_outcomes, self.config.trading,
+                is_proxy_wallet=is_proxy
             )
             if profit_margin < final_threshold:
                 logger.debug(
@@ -1181,7 +1188,8 @@ class OrderbookPoller:
 
             # Re-check with actual trade size
             final_threshold = calculate_dynamic_threshold(
-                opportunity.trade_size_usd, num_outcomes, self.config.trading
+                opportunity.trade_size_usd, num_outcomes, self.config.trading,
+                is_proxy_wallet=is_proxy
             )
             if profit_margin < final_threshold:
                 logger.debug(
@@ -1285,10 +1293,13 @@ class OrderbookPoller:
         buy_margin = 1.0 - sum_asks
 
         # Check threshold
+        # Per Grok Round 26: Proxy wallets have ZERO gas costs
+        is_proxy = self.config.wallet.signature_type == 1
         dynamic_threshold = calculate_dynamic_threshold(
             sell_opp.trade_size_usd,
             2,  # binary
-            self.config.trading
+            self.config.trading,
+            is_proxy_wallet=is_proxy
         )
 
         if buy_margin < dynamic_threshold:
@@ -1336,68 +1347,131 @@ class OrderbookPoller:
         """
         Calculate optimal trade sizes for an arbitrage opportunity.
 
+        RN1 CORE STRATEGY (Jan 2026 Heavy Analysis):
+        =============================================
+        RN1 does NOT match shares between outcomes!
+        Each outcome is sized based on ITS OWN depth independently.
+
+        Example from RN1 data:
+        - Washington: 350.11 shares at $0.62 (Washington's depth)
+        - CSDIILIT: 219.85 shares at $0.32 (CSDIILIT's depth)
+
+        The 8.1, 5.3, 350.11 decimals come from taking EACH outcome's
+        available orderbook depth, NOT from proportional distribution.
+
+        This creates UNMATCHED positions which:
+        1. Captures more total profit (takes all available liquidity)
+        2. Leaves excess shares as a directional position
+        3. Matched pairs guarantee $1, excess is a bet
+
         Args:
             opportunity: The opportunity to calculate sizes for.
         """
         orderbooks = opportunity.orderbooks
         market = opportunity.market
-        safety_mult = self.config.trading.depth_safety_multiplier
         max_pct = self.config.trading.max_size_per_trade_percent / 100
 
+        # Per Grok Round 27: Polymarket minimum order size is 5 shares
+        MIN_SHARES_PER_ORDER = 5.0
+
         if opportunity.arb_type == ArbType.BUY_ARB:
-            # For buy arb, we buy all outcomes at their ask prices
-            # Size limited by minimum available depth across all outcomes
-            min_depth_shares = float('inf')
+            # =================================================================
+            # RN1 STRATEGY: Each outcome gets its OWN depth, not min(all)
+            # =================================================================
+            # This creates decimal shares like 8.1, 350.11 from exact depth
+
+            outcome_sizes = {}
+            total_usd = 0.0
+
             for ob in orderbooks.all_orderbooks:
                 if ob.best_ask:
+                    # Take this outcome's FULL available depth
                     depth_shares = ob.best_ask_size
-                    min_depth_shares = min(min_depth_shares, depth_shares)
+                    depth_usd = depth_shares * ob.best_ask_price
 
-            # Convert to USD using average ask price
-            avg_ask = sum(ob.best_ask_price for ob in orderbooks.all_orderbooks) / len(orderbooks.all_orderbooks)
-            trade_size_usd = min_depth_shares * avg_ask * safety_mult
+                    # Cap at max percentage of capital (per outcome)
+                    max_per_outcome = self.config.starting_capital_usd * max_pct
 
-            # Cap at max percentage of capital
-            max_size = self.config.starting_capital_usd * max_pct
-            trade_size_usd = min(trade_size_usd, max_size)
+                    if depth_usd > max_per_outcome:
+                        # Budget-limited: calculate shares from max USD
+                        outcome_usd = max_per_outcome
+                    else:
+                        # Depth-limited: use exact depth (preserves decimals!)
+                        outcome_usd = depth_usd
 
-            # Calculate per-outcome sizes
-            outcome_sizes = {}
-            for ob in orderbooks.all_orderbooks:
-                # Each outcome gets proportional share based on its price
-                outcome_usd = trade_size_usd * ob.best_ask_price / sum(
-                    o.best_ask_price for o in orderbooks.all_orderbooks
-                )
-                outcome_sizes[ob.token_id] = outcome_usd
+                    # Ensure minimum shares (5)
+                    min_usd = MIN_SHARES_PER_ORDER * ob.best_ask_price
+                    if outcome_usd < min_usd:
+                        outcome_usd = min_usd
 
-            opportunity.trade_size_usd = trade_size_usd
+                    outcome_sizes[ob.token_id] = outcome_usd
+                    total_usd += outcome_usd
+
+            opportunity.trade_size_usd = total_usd
             opportunity.outcome_sizes = outcome_sizes
-            opportunity.expected_profit_usd = trade_size_usd * opportunity.profit_margin
+
+            # Expected profit = edge * matched_pairs_value
+            # Matched pairs = min shares across outcomes * $1 payout
+            min_shares_across = float('inf')
+            for ob in orderbooks.all_orderbooks:
+                if ob.token_id in outcome_sizes:
+                    shares = outcome_sizes[ob.token_id] / ob.best_ask_price
+                    min_shares_across = min(min_shares_across, shares)
+
+            if min_shares_across < float('inf'):
+                # Guaranteed profit from matched pairs
+                matched_payout = min_shares_across  # $1 per matched pair
+                matched_cost = sum(
+                    min_shares_across * ob.best_ask_price
+                    for ob in orderbooks.all_orderbooks
+                )
+                opportunity.expected_profit_usd = matched_payout - matched_cost
+            else:
+                opportunity.expected_profit_usd = total_usd * opportunity.profit_margin
 
         else:  # SELL_ARB
-            # For sell arb, we sell all outcomes at their bid prices
-            min_depth_shares = float('inf')
+            # Same logic for sell arb - each outcome sized independently
+            outcome_sizes = {}
+            total_usd = 0.0
+
             for ob in orderbooks.all_orderbooks:
                 if ob.best_bid:
                     depth_shares = ob.best_bid_size
-                    min_depth_shares = min(min_depth_shares, depth_shares)
+                    depth_usd = depth_shares * ob.best_bid_price
 
-            avg_bid = sum(ob.best_bid_price for ob in orderbooks.all_orderbooks) / len(orderbooks.all_orderbooks)
-            trade_size_usd = min_depth_shares * avg_bid * safety_mult
+                    max_per_outcome = self.config.starting_capital_usd * max_pct
 
-            max_size = self.config.starting_capital_usd * max_pct
-            trade_size_usd = min(trade_size_usd, max_size)
+                    if depth_usd > max_per_outcome:
+                        outcome_usd = max_per_outcome
+                    else:
+                        outcome_usd = depth_usd
 
-            outcome_sizes = {}
-            for ob in orderbooks.all_orderbooks:
-                outcome_usd = trade_size_usd * ob.best_bid_price / sum(
-                    o.best_bid_price for o in orderbooks.all_orderbooks
-                )
-                outcome_sizes[ob.token_id] = outcome_usd
+                    min_usd = MIN_SHARES_PER_ORDER * ob.best_bid_price
+                    if outcome_usd < min_usd:
+                        outcome_usd = min_usd
 
-            opportunity.trade_size_usd = trade_size_usd
+                    outcome_sizes[ob.token_id] = outcome_usd
+                    total_usd += outcome_usd
+
+            opportunity.trade_size_usd = total_usd
             opportunity.outcome_sizes = outcome_sizes
-            opportunity.expected_profit_usd = trade_size_usd * opportunity.profit_margin
+
+            # Expected profit from matched pairs
+            min_shares_across = float('inf')
+            for ob in orderbooks.all_orderbooks:
+                if ob.token_id in outcome_sizes:
+                    shares = outcome_sizes[ob.token_id] / ob.best_bid_price
+                    min_shares_across = min(min_shares_across, shares)
+
+            if min_shares_across < float('inf'):
+                matched_revenue = sum(
+                    min_shares_across * ob.best_bid_price
+                    for ob in orderbooks.all_orderbooks
+                )
+                matched_cost = min_shares_across  # $1 per pair
+                opportunity.expected_profit_usd = matched_revenue - matched_cost
+            else:
+                opportunity.expected_profit_usd = total_usd * opportunity.profit_margin
 
     async def poll_markets_for_arbs(
         self,
@@ -1736,13 +1810,14 @@ class OrderbookPoller:
 
     def reset_arb_frequency(self):
         """Reset arb frequency tracking (call periodically, e.g., every 5 minutes)."""
-        self._market_arb_frequency.clear()
-        # Keep some burst markets active for a bit longer
-        # Remove markets that had low frequency
+        # FIX: Check frequency BEFORE clearing, not after
+        # Keep markets that had at least 1 arb in the period
         self._burst_markets = {
             m for m in self._burst_markets
             if self._market_arb_frequency.get(m, 0) >= 1
         }
+        # Now clear for next period
+        self._market_arb_frequency.clear()
 
     def get_stats(self) -> Dict:
         """Get polling statistics."""

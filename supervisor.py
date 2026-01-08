@@ -42,7 +42,7 @@ class Supervisor:
         max_restarts: int = 5,  # Per Grok Round 18: Hard cap at 5 without manual intervention
         restart_delay_base: float = 5.0,
         restart_delay_max: float = 300.0,
-        heartbeat_timeout: float = 10.0,  # Per Grok Round 18: 10s for HF (rn1 cycles <1s)
+        heartbeat_timeout: float = 30.0,  # Raised: 10s too aggressive during WS connect
         cooldown_after_success: float = 300.0,
     ):
         """
@@ -55,9 +55,7 @@ class Supervisor:
             restart_delay_base: Base delay between restarts (exponential backoff).
             restart_delay_max: Maximum delay between restarts.
             heartbeat_timeout: Seconds without heartbeat before force restart.
-                              Per Grok Round 18: Reduced to 10s for HF trading.
-                              rn1-style bots cycle <1s, so 10s catches stuck processes
-                              much faster. 30s was still too slow for live sports.
+                              Set to 30s to allow for WS connection during startup.
             cooldown_after_success: Seconds of successful running before resetting restart count.
         """
         self.max_restarts = max_restarts

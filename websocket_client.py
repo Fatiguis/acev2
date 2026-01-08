@@ -30,7 +30,7 @@ except ImportError:
     HAS_WEBSOCKETS = False
     WebSocketClientProtocol = None
 
-from config import BotConfig
+from config import BotConfig, calculate_share_based_size
 from orderbook import Orderbook, OrderbookLevel, MarketOrderbooks, ArbOpportunity, ArbType
 from market_discovery import Market
 
@@ -108,22 +108,38 @@ class OrderbookCache:
     In-memory cache of live orderbooks from websocket updates.
 
     Maintains latest state for all subscribed tokens with sub-100ms freshness.
+    Per Grok Round 26: Added asyncio.Lock for thread safety during concurrent access.
     """
 
     def __init__(self):
         self._books: Dict[str, Orderbook] = {}
         self._last_update: Dict[str, datetime] = {}
         self._update_count: Dict[str, int] = {}
+        self._lock = asyncio.Lock()  # Per Grok Round 26: Thread safety for cache ops
 
     def update(self, token_id: str, book: Orderbook):
-        """Update cached orderbook."""
+        """Update cached orderbook (synchronous for WS handler)."""
+        # Note: WS handler is single-threaded, so sync update is safe
+        # Lock is for async readers that might interleave
         self._books[token_id] = book
         self._last_update[token_id] = datetime.now(timezone.utc)
         self._update_count[token_id] = self._update_count.get(token_id, 0) + 1
 
+    async def update_async(self, token_id: str, book: Orderbook):
+        """Thread-safe async update."""
+        async with self._lock:
+            self._books[token_id] = book
+            self._last_update[token_id] = datetime.now(timezone.utc)
+            self._update_count[token_id] = self._update_count.get(token_id, 0) + 1
+
     def get(self, token_id: str) -> Optional[Orderbook]:
         """Get cached orderbook."""
         return self._books.get(token_id)
+
+    async def get_async(self, token_id: str) -> Optional[Orderbook]:
+        """Thread-safe async get."""
+        async with self._lock:
+            return self._books.get(token_id)
 
     def get_age_ms(self, token_id: str) -> float:
         """Get age of cached book in milliseconds."""
@@ -145,6 +161,17 @@ class OrderbookCache:
                 if book:
                     result[tid] = book
         return result
+
+    async def get_all_fresh_async(self, token_ids: List[str], max_age_ms: float = 500) -> Dict[str, Orderbook]:
+        """Thread-safe async get all fresh orderbooks."""
+        async with self._lock:
+            result = {}
+            for tid in token_ids:
+                if self.is_fresh(tid, max_age_ms):
+                    book = self._books.get(tid)
+                    if book:
+                        result[tid] = book
+            return result
 
     def clear(self):
         """Clear all cached books."""
@@ -189,6 +216,12 @@ class PolymarketWebSocket:
         # Callbacks
         self._on_book_update: Optional[Callable[[str, Orderbook], None]] = None
         self._on_arb_detected: Optional[Callable[[ArbOpportunity], None]] = None
+
+        # Per RN1 Round 28: Reduced cooldown for rapid re-entry like RN1
+        # RN1 trades every 1.7s average, 90.2% of trades in SAME SECOND
+        # Previous 1.0s cooldown was blocking valid rapid arb opportunities
+        self._market_last_arb: Dict[str, float] = {}  # market_id -> timestamp
+        self._arb_cooldown_seconds = 0.2  # 200ms cooldown - RN1-style rapid fire
 
         # Reconnection with exponential backoff (per Grok Round 4: HF reliability)
         self._reconnect_attempts = 0
@@ -324,11 +357,14 @@ class PolymarketWebSocket:
             return
 
         # Build subscription message
-        # Polymarket uses asset_id for subscriptions
+        # Per Grok Round 26: Use correct field names and enable best bid/ask messages
+        # Polymarket docs show both asset_ids and assets_ids work, using assets_ids
+        # custom_feature_enabled provides tighter spread data via best_bid_ask messages
         subscribe_msg = {
             "type": "subscribe",
             "channel": "market",
             "assets_ids": token_ids,
+            "custom_feature_enabled": True,  # Per Grok Round 26: Enable best bid/ask messages
         }
 
         try:
@@ -389,6 +425,7 @@ class PolymarketWebSocket:
                 "type": "subscribe",
                 "channel": "market",
                 "assets_ids": batch,
+                "custom_feature_enabled": True,  # Per Grok Round 26: Enable best bid/ask
             }
 
             try:
@@ -548,9 +585,20 @@ class PolymarketWebSocket:
             logger.debug(f"Invalid JSON message: {raw_message[:100]}")
             return
 
-        # Per Grok Round 11: Skip non-dict messages (ping/pong, arrays, etc.)
-        # Polymarket CLOB sends book/price_change as dict objects only
-        # WS protocol heartbeats can be lists like [] or ["pong"]
+        # Handle both dict messages and list of orderbook snapshots
+        # Polymarket sends initial subscription response as a list of orderbook dicts
+        if isinstance(message, list):
+            # Initial orderbook snapshots come as a list of dicts
+            if message and isinstance(message[0], dict) and 'bids' in message[0]:
+                logger.info(f"[WS] Processing {len(message)} initial orderbook snapshots")
+                for book_data in message:
+                    if isinstance(book_data, dict):
+                        await self._handle_book_update(book_data, receive_time)
+            else:
+                # Empty list or heartbeat - skip
+                logger.debug(f"Skipped list WS message: {len(message)} items")
+            return
+
         if not isinstance(message, dict):
             logger.debug(f"Skipped non-dict WS message: {type(message).__name__}")
             return
@@ -564,6 +612,20 @@ class PolymarketWebSocket:
         elif msg_type == "price_change":
             # Price change event
             await self._handle_price_change(message, receive_time)
+
+        elif msg_type == "best_bid_ask":
+            # Per Grok Round 26: Best bid/ask update (requires custom_feature_enabled)
+            # Provides tighter spread data than price_change messages
+            await self._handle_best_bid_ask(message, receive_time)
+
+        elif msg_type == "last_trade_price":
+            # Per Grok Round 26: Trade execution notification
+            # Can be used for market heat detection
+            await self._handle_last_trade(message)
+
+        elif msg_type == "tick_size_change":
+            # Per Grok Round 26: Tick size change at price extremes
+            logger.debug(f"Tick size change: {message}")
 
         elif msg_type == "subscribed":
             logger.debug(f"Subscription confirmed: {message.get('assets_ids', [])[:3]}...")
@@ -761,16 +823,122 @@ class PolymarketWebSocket:
 
         self._cache.update(token_id, cached)
 
+        # CRITICAL FIX: Check for arb after price change (was missing!)
+        # Most WS updates are price_change, not full book updates
+        market = self._token_to_market.get(token_id)
+        if market:
+            await self._check_for_arb(market)
+
+    async def _handle_best_bid_ask(self, message: Dict, receive_time_ms: float):
+        """
+        Per Grok Round 26: Handle best bid/ask messages.
+
+        These provide tighter spread data than price_change messages when
+        custom_feature_enabled is set in subscription.
+
+        Message format:
+        {
+            "type": "best_bid_ask",
+            "asset_id": "token_id",
+            "best_bid": "0.50",
+            "best_ask": "0.52",
+            "best_bid_size": "100.0",
+            "best_ask_size": "50.0"
+        }
+        """
+        token_id = message.get("asset_id")
+        if not token_id:
+            return
+
+        cached = self._cache.get(token_id)
+        if not cached:
+            # No existing book - need full book update first
+            return
+
+        try:
+            best_bid = float(message.get("best_bid", 0))
+            best_ask = float(message.get("best_ask", 0))
+            best_bid_size = float(message.get("best_bid_size", 0))
+            best_ask_size = float(message.get("best_ask_size", 0))
+
+            # Update top of book with best bid/ask
+            if best_bid > 0 and best_bid_size > 0:
+                if cached.bids:
+                    cached.bids[0] = OrderbookLevel(price=best_bid, size=best_bid_size)
+                else:
+                    cached.bids = [OrderbookLevel(price=best_bid, size=best_bid_size)]
+
+            if best_ask > 0 and best_ask_size > 0:
+                if cached.asks:
+                    cached.asks[0] = OrderbookLevel(price=best_ask, size=best_ask_size)
+                else:
+                    cached.asks = [OrderbookLevel(price=best_ask, size=best_ask_size)]
+
+            self._cache.update(token_id, cached)
+
+            # Check for arb
+            market = self._token_to_market.get(token_id)
+            if market:
+                await self._check_for_arb(market)
+
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Error parsing best_bid_ask: {e}")
+
+    async def _handle_last_trade(self, message: Dict):
+        """
+        Per Grok Round 26: Handle last trade price messages.
+
+        Used for market heat detection - high trade frequency indicates
+        active markets where arbs appear and disappear quickly.
+
+        Message format:
+        {
+            "type": "last_trade_price",
+            "asset_id": "token_id",
+            "price": "0.51",
+            "size": "25.0",
+            "side": "BUY"
+        }
+        """
+        token_id = message.get("asset_id")
+        if not token_id:
+            return
+
+        # Track trade activity for heat detection
+        # This could be used to adjust execution strategy for hot markets
+        market = self._token_to_market.get(token_id)
+        if market:
+            # Could implement trade frequency tracking here for heat model
+            # For now, just log for diagnostics
+            logger.debug(f"Trade on {market.question[:30]}...: {message.get('size')} @ {message.get('price')}")
+
     async def _check_for_arb(self, market: Market):
         """
         Check if market has arb opportunity using cached books.
 
         This is called on every book update for real-time detection.
         """
+        # Per Grok Round 24: Cooldown check to prevent duplicate arb detections
+        import time
+        market_id = market.condition_id
+        now = time.time()
+        last_arb_time = self._market_last_arb.get(market_id, 0)
+        if now - last_arb_time < self._arb_cooldown_seconds:
+            return  # Still in cooldown for this market
+
+        # FIX: Cleanup old entries to prevent memory leak (keep last 10 minutes)
+        if len(self._market_last_arb) > 500:
+            cutoff = now - 600  # 10 minutes
+            self._market_last_arb = {
+                k: v for k, v in self._market_last_arb.items() if v > cutoff
+            }
+
         token_ids = [o.token_id for o in market.outcomes]
 
         # Get all fresh books for this market
-        books = self._cache.get_all_fresh(token_ids, max_age_ms=200)
+        # Increased from 200ms to 2000ms - WS updates are sparse during low activity
+        # 200ms was too strict and caused most arb checks to fail silently
+        books = self._cache.get_all_fresh(token_ids, max_age_ms=2000)
 
         # Need all outcomes
         if len(books) != len(market.outcomes):
@@ -793,11 +961,64 @@ class PolymarketWebSocket:
             for tid, book in books.items():
                 market_orderbooks.orderbooks[tid] = book
 
+            # =================================================================
+            # SHARE-BASED SIZING (Per RN1 Analysis - Jan 2026)
+            # =================================================================
+            # Key insight: Profit = Shares × Edge
+            # RN1 trades MORE shares on low prices, scales with edge confidence
+            # =================================================================
+
+            # Calculate average price and minimum depth in shares
+            prices = [b.best_ask_price for b in books.values() if b.best_ask_price > 0]
+            depth_shares = [b.best_ask_size for b in books.values() if b.best_ask_size > 0]
+            avg_price = sum(prices) / len(prices) if prices else 0.50
+            min_depth_shares = min(depth_shares) if depth_shares else 0
+
+            # Use share-based sizing function
+            # Capital estimate: use config default or $100 for WS quick sizing
+            capital_estimate = getattr(self, '_capital_estimate', 100.0)
+            target_shares, trade_size = calculate_share_based_size(
+                config=self.config.trading,
+                edge_pct=profit_margin,
+                avg_price=avg_price,
+                capital=capital_estimate,
+                depth_shares=min_depth_shares
+            )
+
+            # Log share-based calculation
+            logger.debug(
+                f"[WS-SIZE] BUY: edge={profit_margin*100:.1f}%, avg_price=${avg_price:.2f}, "
+                f"depth={min_depth_shares:.0f} shares → target={target_shares:.0f} shares (${trade_size:.2f})"
+            )
+
+            # Ensure minimum 5 shares per leg (Polymarket requirement)
+            MIN_SHARES_PER_ORDER = self.config.trading.min_shares_per_order
+            min_usd_for_min_shares = sum(
+                MIN_SHARES_PER_ORDER * b.best_ask_price
+                for b in books.values()
+                if b.best_ask_price > 0
+            )
+            if trade_size < min_usd_for_min_shares:
+                logger.info(f"[WS-SIZE] Scaling BUY for min shares: ${trade_size:.2f} -> ${min_usd_for_min_shares:.2f}")
+                trade_size = min_usd_for_min_shares
+
+            expected_profit = trade_size * profit_margin
+
+            # Calculate per-outcome sizes (CRITICAL: execution engine needs this!)
+            outcome_sizes = {}
+            total_ask = sum(b.best_ask_price for b in books.values())
+            for tid, book in books.items():
+                # Proportional allocation based on ask price
+                outcome_sizes[tid] = trade_size * (book.best_ask_price / total_ask) if total_ask > 0 else 0
+
             opportunity = ArbOpportunity(
                 market=market,
                 arb_type=ArbType.BUY_ARB,
                 profit_margin=profit_margin,
                 orderbooks=market_orderbooks,
+                trade_size_usd=trade_size,
+                expected_profit_usd=expected_profit,
+                outcome_sizes=outcome_sizes,
             )
 
             logger.info(
@@ -805,6 +1026,9 @@ class PolymarketWebSocket:
                 f"Sum: {sum_asks:.4f} | Edge: {profit_margin*100:.2f}% | "
                 f"Latency: {self._latency_stats.avg_latency_ms:.0f}ms"
             )
+
+            # Update cooldown timestamp for this market
+            self._market_last_arb[market_id] = now
 
             if self._on_arb_detected:
                 self._on_arb_detected(opportunity)
@@ -818,11 +1042,63 @@ class PolymarketWebSocket:
             for tid, book in books.items():
                 market_orderbooks.orderbooks[tid] = book
 
+            # =================================================================
+            # SHARE-BASED SIZING (Per RN1 Analysis - Jan 2026)
+            # =================================================================
+            # Key insight: Profit = Shares × Edge
+            # RN1 trades MORE shares on low prices, scales with edge confidence
+            # =================================================================
+
+            # Calculate average price and minimum depth in shares
+            prices = [b.best_bid_price for b in books.values() if b.best_bid_price > 0]
+            depth_shares = [b.best_bid_size for b in books.values() if b.best_bid_size > 0]
+            avg_price = sum(prices) / len(prices) if prices else 0.50
+            min_depth_shares = min(depth_shares) if depth_shares else 0
+
+            # Use share-based sizing function
+            capital_estimate = getattr(self, '_capital_estimate', 100.0)
+            target_shares, trade_size = calculate_share_based_size(
+                config=self.config.trading,
+                edge_pct=profit_margin,
+                avg_price=avg_price,
+                capital=capital_estimate,
+                depth_shares=min_depth_shares
+            )
+
+            # Log share-based calculation
+            logger.debug(
+                f"[WS-SIZE] SELL: edge={profit_margin*100:.1f}%, avg_price=${avg_price:.2f}, "
+                f"depth={min_depth_shares:.0f} shares → target={target_shares:.0f} shares (${trade_size:.2f})"
+            )
+
+            # Ensure minimum 5 shares per leg (Polymarket requirement)
+            MIN_SHARES_PER_ORDER = self.config.trading.min_shares_per_order
+            min_usd_for_min_shares = sum(
+                MIN_SHARES_PER_ORDER * b.best_bid_price
+                for b in books.values()
+                if b.best_bid_price > 0
+            )
+            if trade_size < min_usd_for_min_shares:
+                logger.info(f"[WS-SIZE] Scaling SELL for min shares: ${trade_size:.2f} -> ${min_usd_for_min_shares:.2f}")
+                trade_size = min_usd_for_min_shares
+
+            expected_profit = trade_size * profit_margin
+
+            # Calculate per-outcome sizes (CRITICAL: execution engine needs this!)
+            outcome_sizes = {}
+            total_bid = sum(b.best_bid_price for b in books.values())
+            for tid, book in books.items():
+                # Proportional allocation based on bid price
+                outcome_sizes[tid] = trade_size * (book.best_bid_price / total_bid) if total_bid > 0 else 0
+
             opportunity = ArbOpportunity(
                 market=market,
                 arb_type=ArbType.SELL_ARB,
                 profit_margin=profit_margin,
                 orderbooks=market_orderbooks,
+                trade_size_usd=trade_size,
+                expected_profit_usd=expected_profit,
+                outcome_sizes=outcome_sizes,
             )
 
             logger.info(
@@ -830,6 +1106,9 @@ class PolymarketWebSocket:
                 f"Sum: {sum_bids:.4f} | Edge: {profit_margin*100:.2f}% | "
                 f"Latency: {self._latency_stats.avg_latency_ms:.0f}ms"
             )
+
+            # Update cooldown timestamp for this market
+            self._market_last_arb[market_id] = now
 
             if self._on_arb_detected:
                 self._on_arb_detected(opportunity)
@@ -918,7 +1197,8 @@ class HybridOrderbookManager:
         """
         try:
             # Disconnect first if needed
-            if self._ws_client._connection:
+            # FIX: Use correct attribute _ws instead of _connection
+            if self._ws_client._ws:
                 await self._ws_client.disconnect()
 
             # Small delay before reconnecting

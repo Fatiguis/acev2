@@ -15,12 +15,12 @@ Strategy: Post-only primary → FOK fallback ONLY on post-only timeout.
 import logging
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Any, Tuple
 from enum import Enum
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions
+from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions, PostOrdersArgs
 from py_clob_client.order_builder.constants import BUY, SELL
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
@@ -50,13 +50,13 @@ import time
 class IdempotencyTracker:
     """Track recent arb IDs to prevent duplicates on restart/reconnect."""
 
-    def __init__(self, ttl_seconds: int = 1800):
-        # Per Grok Round 21: TTL increased to 1800s (30 min) from 300s
-        # Supervisor restarts or WS reconnects can re-detect slow-decaying arbs
-        # Sports events can have arbs persist for 10+ minutes in low-liquidity windows
+    def __init__(self, ttl_seconds: int = 30):
+        # Per RN1 Round 28: TTL reduced to 30s (from 1800s) for rapid trading
+        # RN1 trades same market multiple times per SECOND - old 30min TTL was blocking valid trades
+        # 30s is enough to prevent WS reconnect duplicates while allowing rapid re-entry
         self.ttl_seconds = ttl_seconds
         self._recent_arbs: OrderedDict[str, float] = OrderedDict()  # arb_id -> timestamp
-        self._max_entries = 10000  # Per Grok Round 21: Increased from 1000 for 100+ arbs/day
+        self._max_entries = 10000  # Keep for high-volume trading
 
     def _generate_arb_id(self, market_id: str, profit_margin: float, trade_size: float) -> str:
         """Generate unique arb ID from market + margin + size."""
@@ -571,10 +571,10 @@ class ExecutionEngine:
         self._market_exposure: Dict[str, float] = {}  # market_id -> net exposure in USD
         self._max_exposure_pct = 0.05  # 5% of capital max directional exposure per market
 
-        # Idempotency tracker (per Grok Round 15: 900s TTL for WS reconnect scenarios)
-        # WS reconnects during sports bursts can re-detect same arb within minutes
-        # Extended to 900s (15 min) to safely cover reconnect + market resolution windows
-        self._idempotency_tracker = IdempotencyTracker(ttl_seconds=900)
+        # Idempotency tracker - Per RN1 Round 28: Reduced TTL for rapid trading
+        # RN1 trades same market every few seconds - 900s TTL was blocking valid re-entries
+        # Reduced to 30s - enough to prevent WS reconnect duplicates but allows rapid trading
+        self._idempotency_tracker = IdempotencyTracker(ttl_seconds=30)
 
         # Enhanced circuit breaker: >5 consecutive partials/fails OR >3% drawdown = 30min pause
         self._circuit_breaker_active = False
@@ -627,9 +627,49 @@ class ExecutionEngine:
         # rn1's ~0.8% avg edge filter - don't trade if expected value too low
         self._min_ev_threshold = 0.001  # 0.1% minimum expected value
 
+        # Per Grok Round 25: Fill rate metrics for diagnostics
+        # Track "no match" errors which indicate stale price execution
+        self._no_match_errors = 0
+        self._successful_fills = 0
+        self._total_orders_attempted = 0
+
     def set_client(self, client: ClobClient):
         """Set the CLOB client."""
         self.client = client
+
+    def _get_tick_size(self, price: float) -> float:
+        """
+        Per Grok Round 26: Get correct tick size for price level.
+
+        Polymarket uses different tick sizes at price extremes:
+        - Standard: 0.01 (1 cent) for prices 0.04 - 0.96
+        - Fine: 0.001 (0.1 cent) for prices <0.04 or >0.96
+
+        Args:
+            price: The price to get tick size for.
+
+        Returns:
+            Appropriate tick size for the price level.
+        """
+        if price < self.config.trading.tick_boundary_low or price > self.config.trading.tick_boundary_high:
+            return self.config.trading.tick_size_fine
+        return self.config.trading.tick_size_standard
+
+    def _round_to_tick(self, price: float, round_up: bool = False) -> float:
+        """
+        Per Grok Round 26: Round price to nearest valid tick.
+
+        Args:
+            price: Price to round.
+            round_up: If True, round up; otherwise round down.
+
+        Returns:
+            Price rounded to valid tick size.
+        """
+        tick = self._get_tick_size(price)
+        if round_up:
+            return min(0.99, max(0.01, ((price // tick) + 1) * tick))
+        return min(0.99, max(0.01, (price // tick) * tick))
 
     def set_wallet_manager(self, wallet_manager):
         """
@@ -942,13 +982,19 @@ class ExecutionEngine:
         if balance is None:
             return False, "Failed to check USDC balance (RPC issue) - fix RPC connection"
 
-        # Hard block on insufficient capital (rn1 pattern: $1k min start)
-        min_capital = self.config.min_capital_required
+        # Per Grok Round 26: Dynamic capital - only block if below minimum trade size
+        min_capital = self.config.min_capital_required  # $10 minimum
         if balance < min_capital:
             return False, (
-                f"Insufficient capital: ${balance:.2f} < ${min_capital:.2f} required. "
-                f"rn1 started with $1k - deposit USDC to wallet {display_wallet}"
+                f"Insufficient capital: ${balance:.2f} < ${min_capital:.2f} minimum. "
+                f"Need at least ${min_capital:.0f} to execute one trade. "
+                f"Deposit USDC to wallet {display_wallet}"
             )
+
+        # Per Grok Round 26: Update starting_capital to actual balance if not set
+        if self.config.starting_capital_usd <= 0:
+            self.config.starting_capital_usd = balance
+            logger.info(f"Dynamic capital set: ${balance:.2f}")
 
         # Check allowance - HARD ERROR on RPC failure
         allowance = self.check_allowance()
@@ -1508,7 +1554,8 @@ class ExecutionEngine:
                 )
 
                 # Auto-hedge if exposure exceeds threshold
-                if partial_exposure > 0 and (partial_exposure / opportunity.trade_size_usd) >= hedge_threshold:
+                # FIX: Guard against division by zero
+                if partial_exposure > 0 and opportunity.trade_size_usd > 0 and (partial_exposure / opportunity.trade_size_usd) >= hedge_threshold:
                     hedge_orders = await self._hedge_partial_fills(result, opportunity)
                     result.hedge_orders = hedge_orders
                     result.was_hedged = len(hedge_orders) > 0
@@ -2117,57 +2164,90 @@ class ExecutionEngine:
                     )
                     return orders  # Abort - insufficient depth
 
-        # Phase 1: Place ALL legs as post-only limits simultaneously
-        # Per Grok Round 21: Use _place_atomic_leg for strict post-only (no FAK fallback)
-        placement_tasks = []
+        # Phase 1: Place ALL legs - batch API for speed or individual for debugging
+        # Per RN1 Round 28: Batch orders reduce latency ~50-80% vs sequential
         leg_info = []  # Track order info for cancel/hedge
+        base_improvement = self.config.trading.post_only_price_improvement
 
         for outcome in opportunity.market.outcomes:
             size_usd = opportunity.outcome_sizes.get(outcome.token_id, 0)
             if size_usd > 0:
                 ob = orderbooks.get_orderbook(outcome.token_id)
-                price = ob.best_ask_price if ob and ob.best_ask else 0
+                raw_price = ob.best_ask_price if ob and ob.best_ask else 0
+
+                # Per Grok Round 25: Dynamic price improvement scaled by edge
+                edge_scaled_improvement = opportunity.profit_margin * 0.5
+                price_improvement = base_improvement + edge_scaled_improvement
+                max_improvement = opportunity.profit_margin * 0.8 if opportunity.profit_margin > 0 else 0.05
+                price_improvement = min(price_improvement, max_improvement, 0.05)
+
+                # Apply price improvement for buys (round UP for aggressive fills)
+                improved_price = min(raw_price + price_improvement, 0.99)
+                post_price = self._round_to_tick(improved_price, round_up=True)
+
+                size_shares = size_usd / post_price if post_price > 0 else 0
+
+                # Per Grok Round 27: Polymarket minimum 5 shares per order
+                # Per RN1 analysis Jan 2026: RN1 submits decimal shares like 5.32, 8.1, 350.11
+                # Scale up USD to meet minimum, then recalculate shares naturally (preserves decimals)
+                MIN_SHARES = 5.0
+                if size_shares < MIN_SHARES:
+                    old_size = size_shares
+                    # Scale up USD to hit minimum shares, keep natural decimal precision
+                    size_usd = MIN_SHARES * post_price
+                    size_shares = size_usd / post_price  # Natural calculation preserves precision
+                    logger.info(f"Order SIZE UP: {outcome.name} {old_size:.2f} -> {size_shares:.2f} shares (${old_size * post_price:.2f} -> ${size_usd:.2f})")
 
                 leg_info.append({
                     "token_id": outcome.token_id,
                     "outcome_name": outcome.name,
                     "size_usd": size_usd,
-                    "price": price
+                    "size_shares": size_shares,
+                    "price": post_price,
+                    "side": BUY
                 })
 
+        placement_start = time.time()
+
+        # Per RN1 Round 28: Use batch orders for arb legs when enabled
+        if self.config.trading.use_batch_orders and len(leg_info) > 1:
+            # Single batch API call for all legs - much faster
+            orders = await self._place_batch_orders(leg_info, OrderType.GTC, exec_client)
+            logger.debug(f"Batch placed {len(leg_info)} orders in single API call")
+        else:
+            # Fallback: Individual async placement (legacy behavior)
+            placement_tasks = []
+            for info in leg_info:
                 placement_tasks.append(
                     self._place_atomic_leg(
-                        token_id=outcome.token_id,
-                        outcome_name=outcome.name,
+                        token_id=info["token_id"],
+                        outcome_name=info["outcome_name"],
                         side=BUY,
-                        size_usd=size_usd,
-                        limit_price=price,
+                        size_usd=info["size_usd"],
+                        limit_price=info["price"],
                         edge_pct=opportunity.profit_margin,
                         client=exec_client
                     )
                 )
 
-        # Execute all placements simultaneously
-        placement_start = time.time()
-        placement_results = await asyncio.gather(*placement_tasks, return_exceptions=True)
+            placement_results = await asyncio.gather(*placement_tasks, return_exceptions=True)
 
-        # Collect order IDs and initial results
-        order_ids = []
-        for i, result in enumerate(placement_results):
-            if isinstance(result, OrderResult):
-                orders.append(result)
-                if result.order_id:
-                    order_ids.append((result.order_id, leg_info[i]))
-            elif isinstance(result, Exception):
-                logger.error(f"Atomic leg placement failed: {result}")
-                orders.append(OrderResult(
-                    token_id=leg_info[i]["token_id"] if i < len(leg_info) else "unknown",
-                    outcome_name=leg_info[i]["outcome_name"] if i < len(leg_info) else "unknown",
-                    side="BUY",
-                    requested_size_usd=leg_info[i]["size_usd"] if i < len(leg_info) else 0,
-                    status=OrderStatus.FAILED,
-                    error=str(result)
-                ))
+            for i, result in enumerate(placement_results):
+                if isinstance(result, OrderResult):
+                    orders.append(result)
+                elif isinstance(result, Exception):
+                    logger.error(f"Atomic leg placement failed: {result}")
+                    orders.append(OrderResult(
+                        token_id=leg_info[i]["token_id"] if i < len(leg_info) else "unknown",
+                        outcome_name=leg_info[i]["outcome_name"] if i < len(leg_info) else "unknown",
+                        side="BUY",
+                        requested_size_usd=leg_info[i]["size_usd"] if i < len(leg_info) else 0,
+                        status=OrderStatus.FAILED,
+                        error=str(result)
+                    ))
+
+        # Collect order IDs for status checking
+        order_ids = [(o.order_id, leg_info[i]) for i, o in enumerate(orders) if o.order_id and i < len(leg_info)]
 
         # Phase 2: Wait strict timeout then check fills
         elapsed_ms = (time.time() - placement_start) * 1000
@@ -2295,17 +2375,44 @@ class ExecutionEngine:
             price=limit_price
         )
 
-        # Dynamic price improvement for maker fills
-        price_improvement = base_improvement + (edge_pct * 0.5)
-        price_improvement = min(price_improvement, 0.03)
+        # Per Grok Round 25: Dynamic price improvement scaled by edge
+        # Larger edge = more room to improve price aggressively
+        # "no match" errors indicate stale prices - need to beat competition
+        # Formula: improvement = base + (edge * 0.5), capped at edge * 0.8 to preserve profit
+        edge_scaled_improvement = edge_pct * 0.5
+        price_improvement = base_improvement + edge_scaled_improvement
+        # Cap at 80% of edge to preserve some profit margin
+        max_improvement = edge_pct * 0.8 if edge_pct > 0 else 0.05
+        price_improvement = min(price_improvement, max_improvement, 0.05)  # Hard cap 5 cents
 
         if side == BUY:
-            post_price = min(limit_price + price_improvement, 0.99)
+            raw_price = min(limit_price + price_improvement, 0.99)
+            # Per Grok Round 26: Round UP for buys (more aggressive to get filled)
+            post_price = self._round_to_tick(raw_price, round_up=True)
         else:
-            post_price = max(limit_price - price_improvement, 0.01)
+            raw_price = max(limit_price - price_improvement, 0.01)
+            # Per Grok Round 26: Round DOWN for sells (more aggressive to get filled)
+            post_price = self._round_to_tick(raw_price, round_up=False)
 
         try:
             size_shares = size_usd / post_price if post_price > 0 else 0
+
+            # Per Grok Round 27: Polymarket has MINIMUM 5 shares per order
+            # Per RN1 analysis Jan 2026: RN1 submits decimal shares like 5.32, 8.1
+            # Scale up USD to meet minimum, preserving natural decimal precision
+            MIN_SHARES = 5.0
+            if size_shares < MIN_SHARES:
+                # If we're close (within 20%), scale up to minimum
+                if size_shares >= MIN_SHARES * 0.8:
+                    logger.debug(f"Scaling up {size_shares:.2f} shares to minimum {MIN_SHARES:.2f}")
+                    size_usd = MIN_SHARES * post_price
+                    size_shares = size_usd / post_price  # Natural decimal precision
+                else:
+                    # Too small - reject before sending to API
+                    result.status = OrderStatus.FAILED
+                    result.error = f"Order size {size_shares:.2f} shares below minimum {MIN_SHARES}"
+                    logger.warning(f"Order SKIPPED: {outcome_name} {side} ${size_usd:.2f} @ {post_price} ({size_shares:.2f} shares) - below {MIN_SHARES} min")
+                    return result
 
             order_args = OrderArgs(
                 token_id=token_id,
@@ -2328,7 +2435,14 @@ class ExecutionEngine:
 
         except Exception as e:
             result.status = OrderStatus.FAILED
-            result.error = str(e)
+            # Per Grok Round 27: Extract detailed error from PolyApiException for debugging
+            error_detail = str(e)
+            if hasattr(e, 'error_msg'):
+                error_detail = f"{e.error_msg}"
+            if hasattr(e, 'status_code'):
+                error_detail = f"HTTP {e.status_code}: {error_detail}"
+            result.error = error_detail
+            logger.warning(f"Order REJECTED: {outcome_name} {side} ${size_usd:.2f} @ {post_price} ({size_shares:.4f} shares) | Error: {error_detail}")
 
         return result
 
@@ -2362,6 +2476,19 @@ class ExecutionEngine:
         try:
             size_shares = size_usd / hedge_price if hedge_price > 0 else 0
 
+            # Per Grok Round 27: Polymarket has MINIMUM 5 shares per order
+            # Per RN1 analysis: preserve natural decimal precision
+            MIN_SHARES = 5.0
+            if size_shares < MIN_SHARES:
+                if size_shares >= MIN_SHARES * 0.8:
+                    size_usd = MIN_SHARES * hedge_price
+                    size_shares = size_usd / hedge_price  # Natural decimal precision
+                else:
+                    result.status = OrderStatus.FAILED
+                    result.error = f"Hedge size {size_shares:.2f} shares below minimum {MIN_SHARES}"
+                    logger.warning(f"Hedge SKIPPED: {outcome_name} ${size_usd:.2f} - below {MIN_SHARES} min shares")
+                    return result
+
             order_args = OrderArgs(
                 token_id=token_id,
                 price=hedge_price,
@@ -2386,8 +2513,14 @@ class ExecutionEngine:
 
         except Exception as e:
             result.status = OrderStatus.FAILED
-            result.error = str(e)
-            logger.error(f"Atomic hedge exception: {e}")
+            # Per Grok Round 27: Extract detailed error from PolyApiException for debugging
+            error_detail = str(e)
+            if hasattr(e, 'error_msg'):
+                error_detail = f"{e.error_msg}"
+            if hasattr(e, 'status_code'):
+                error_detail = f"HTTP {e.status_code}: {error_detail}"
+            result.error = error_detail
+            logger.error(f"Atomic hedge exception: {error_detail}")
 
         return result
 
@@ -2398,6 +2531,152 @@ class ExecutionEngine:
             return True
         except Exception:
             return False  # Already filled or cancelled
+
+    async def _place_batch_orders(
+        self,
+        orders_to_place: List[Dict],
+        order_type: OrderType,
+        client: Optional[ClobClient] = None
+    ) -> List[OrderResult]:
+        """
+        Place multiple orders in a single batch API call.
+
+        Per RN1 Round 28: Polymarket batch endpoint (POST /orders) allows up to 15 orders
+        per request, reducing latency by ~50-80% vs sequential placement.
+
+        RN1 analysis: 18+ trades/second during bursts - batch placement is essential.
+
+        Args:
+            orders_to_place: List of dicts with {token_id, side, size_shares, price, outcome_name}
+            order_type: OrderType (GTC, FOK, FAK)
+            client: Optional ClobClient to use
+
+        Returns:
+            List of OrderResult for each order
+        """
+        execution_client = client or self.client
+        results = []
+
+        if not orders_to_place:
+            return results
+
+        # Polymarket limit: max 15 orders per batch
+        MAX_BATCH_SIZE = 15
+
+        # Split into batches if needed
+        for batch_start in range(0, len(orders_to_place), MAX_BATCH_SIZE):
+            batch = orders_to_place[batch_start:batch_start + MAX_BATCH_SIZE]
+            batch_results = await self._execute_single_batch(batch, order_type, execution_client)
+            results.extend(batch_results)
+
+        return results
+
+    async def _execute_single_batch(
+        self,
+        batch: List[Dict],
+        order_type: OrderType,
+        client: ClobClient
+    ) -> List[OrderResult]:
+        """Execute a single batch of orders (max 15)."""
+        results = []
+        signed_orders = []
+        order_infos = []
+
+        # Phase 1: Create and sign all orders
+        for order_info in batch:
+            try:
+                order_args = OrderArgs(
+                    token_id=order_info["token_id"],
+                    price=order_info["price"],
+                    size=order_info["size_shares"],
+                    side=order_info["side"],
+                )
+
+                signed_order = await run_sync_in_thread(client.create_order, order_args)
+                signed_orders.append(PostOrdersArgs(order=signed_order, orderType=order_type))
+                order_infos.append(order_info)
+
+            except Exception as e:
+                logger.warning(f"Failed to create order for {order_info.get('outcome_name', 'unknown')}: {e}")
+                results.append(OrderResult(
+                    token_id=order_info.get("token_id", "unknown"),
+                    outcome_name=order_info.get("outcome_name", "unknown"),
+                    side=order_info.get("side", "BUY"),
+                    requested_size_usd=order_info.get("size_usd", 0),
+                    status=OrderStatus.FAILED,
+                    error=str(e)
+                ))
+
+        if not signed_orders:
+            return results
+
+        # Phase 2: Submit batch
+        try:
+            response = await run_sync_in_thread(client.post_orders, signed_orders)
+
+            # Response is list of individual order responses
+            if isinstance(response, list):
+                for i, order_resp in enumerate(response):
+                    if i < len(order_infos):
+                        info = order_infos[i]
+                        result = OrderResult(
+                            token_id=info["token_id"],
+                            outcome_name=info.get("outcome_name", "unknown"),
+                            side="BUY" if info["side"] == BUY else "SELL",
+                            requested_size_usd=info.get("size_usd", 0),
+                            price=info["price"]
+                        )
+
+                        if order_resp and order_resp.get("success"):
+                            result.order_id = order_resp.get("orderID")
+                            result.status = OrderStatus.SUBMITTED
+
+                            # Handle matched amount for FAK orders
+                            matched = order_resp.get("matchedAmount", 0)
+                            if isinstance(matched, str):
+                                try:
+                                    matched = float(matched)
+                                except (ValueError, TypeError):
+                                    matched = 0
+
+                            if matched > 0:
+                                result.executed_size_usd = matched
+                                result.status = OrderStatus.FILLED if matched >= info.get("size_usd", 0) * 0.99 else OrderStatus.PARTIAL
+                        else:
+                            result.status = OrderStatus.FAILED
+                            result.error = order_resp.get("errorMsg", "Unknown error") if order_resp else "No response"
+
+                        results.append(result)
+            else:
+                # Single response for batch - shouldn't happen but handle it
+                logger.warning(f"Unexpected batch response format: {type(response)}")
+                for info in order_infos:
+                    results.append(OrderResult(
+                        token_id=info["token_id"],
+                        outcome_name=info.get("outcome_name", "unknown"),
+                        side="BUY" if info["side"] == BUY else "SELL",
+                        requested_size_usd=info.get("size_usd", 0),
+                        status=OrderStatus.FAILED,
+                        error="Unexpected batch response format"
+                    ))
+
+            logger.info(f"Batch submitted: {len(signed_orders)} orders, {sum(1 for r in results if r.status in [OrderStatus.FILLED, OrderStatus.SUBMITTED])} successful")
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Batch submission failed: {error_msg}")
+            # Mark all pending orders as failed
+            for info in order_infos:
+                results.append(OrderResult(
+                    token_id=info["token_id"],
+                    outcome_name=info.get("outcome_name", "unknown"),
+                    side="BUY" if info["side"] == BUY else "SELL",
+                    requested_size_usd=info.get("size_usd", 0),
+                    status=OrderStatus.FAILED,
+                    error=error_msg
+                ))
+
+        return results
 
     async def _execute_sell_arb(
         self,
@@ -2433,6 +2712,15 @@ class ExecutionEngine:
             if size_usd > 0:
                 ob = orderbooks.get_orderbook(outcome.token_id)
                 price = ob.best_bid_price if ob and ob.best_bid else 0
+
+                # Per Grok Round 27: Ensure minimum 5 shares per order
+                MIN_SHARES = 5.0
+                if price > 0:
+                    size_shares = size_usd / price
+                    if size_shares < MIN_SHARES:
+                        old_size_usd = size_usd
+                        size_usd = MIN_SHARES * price
+                        logger.info(f"SELL SIZE UP: {outcome.name} ${old_size_usd:.2f} -> ${size_usd:.2f} ({MIN_SHARES:.0f} shares)")
 
                 if use_post_only:
                     tasks.append(
@@ -2644,18 +2932,23 @@ class ExecutionEngine:
             price=limit_price
         )
 
+        # Per Grok Round 25: Track order attempts for fill rate metrics
+        self._total_orders_attempted += 1
+
         max_attempts = 2 if retry_on_no_match else 1
 
         # Per Grok Round 17: FAK removed from py-clob-client - use FOK only
         # FOK = Fill or Kill (all or nothing) - clip size to L1 depth for higher fill rate
-        # rn1 pattern: Post-Only primary → FOK fallback (clipped)
-        # Note: use_ioc parameter kept for API compatibility but FAK path removed
+        # Per RN1 Round 28: Use FAK (Fill-And-Kill) for aggressive taker fills
+        # RN1 analysis shows 22.7% partial fills - FAK allows this, FOK would reject
+        # FAK = fill what's available immediately, cancel rest (Polymarket's IOC equivalent)
+        # FOK = all-or-nothing (fails if full size not available)
 
         for attempt in range(max_attempts):
             try:
-                # Per Grok Round 17: Always use FOK (FAK not available)
-                # FOK requires full fill - clip to available depth for success
-                order_type_to_use = OrderType.FOK
+                # Per RN1 Round 28: Use FAK for partial fill capability
+                # FAK added to py-clob-client in May 2025 (changelog)
+                order_type_to_use = OrderType.FAK if hasattr(OrderType, 'FAK') else OrderType.FOK
                 order_args = MarketOrderArgs(
                     token_id=token_id,
                     amount=size_usd,
@@ -2675,15 +2968,38 @@ class ExecutionEngine:
                     order_id = response.get("orderID")
                     result.order_id = order_id
 
-                    # Per Grok Round 17: FOK mode only - all or nothing
-                    # Success means full fill (FOK rejects if can't fill entirely)
-                    result.status = OrderStatus.FILLED
-                    result.executed_size_usd = size_usd
+                    # Per RN1 Round 28: FAK may return partial fills
+                    # Check matchedAmount for actual executed size
+                    matched_amount = response.get("matchedAmount", size_usd)
+                    if isinstance(matched_amount, str):
+                        try:
+                            matched_amount = float(matched_amount)
+                        except (ValueError, TypeError):
+                            matched_amount = size_usd
+
+                    result.executed_size_usd = matched_amount
+                    result.unfilled_size_usd = max(0, size_usd - matched_amount)
+
+                    # Determine if full fill or partial
+                    if matched_amount >= size_usd * 0.99:  # 99% threshold for "full"
+                        result.status = OrderStatus.FILLED
+                    elif matched_amount > 0:
+                        result.status = OrderStatus.PARTIAL
+                        logger.info(
+                            f"Partial fill: ${matched_amount:.2f}/${size_usd:.2f} "
+                            f"({matched_amount/size_usd*100:.1f}%) on {outcome_name}"
+                        )
+                    else:
+                        result.status = OrderStatus.FAILED
+                        result.error = "Zero fill amount"
+                        return result
+
                     self._taker_fills += 1
-                    self._taker_volume_usd += size_usd
+                    self._taker_volume_usd += matched_amount
+                    self._successful_fills += 1  # Per Grok Round 25: Track fill rate
                     logger.debug(
-                        f"FOK filled: {side} {outcome_name} @ {limit_price:.4f} "
-                        f"for ${size_usd:.2f}"
+                        f"FAK filled: {side} {outcome_name} @ {limit_price:.4f} "
+                        f"for ${matched_amount:.2f}/{size_usd:.2f}"
                     )
 
                     return result
@@ -2692,13 +3008,15 @@ class ExecutionEngine:
                     error_msg = response.get("errorMsg", "Unknown error") if response else "No response"
 
                     # Check for "no match" error - orderbook moved, retry once
-                    if "no match" in error_msg.lower() and attempt < max_attempts - 1:
-                        logger.warning(
-                            f"Order got 'no match' on {outcome_name}, "
-                            f"retrying (attempt {attempt + 2}/{max_attempts})..."
-                        )
-                        await asyncio.sleep(0.2)  # Brief pause before retry
-                        continue
+                    if "no match" in error_msg.lower():
+                        self._no_match_errors += 1  # Per Grok Round 25: Track no match errors
+                        if attempt < max_attempts - 1:
+                            logger.warning(
+                                f"Order got 'no match' on {outcome_name}, "
+                                f"retrying (attempt {attempt + 2}/{max_attempts})..."
+                            )
+                            await asyncio.sleep(0.2)  # Brief pause before retry
+                            continue
 
                     result.status = OrderStatus.FAILED
                     result.error = error_msg
@@ -2710,13 +3028,15 @@ class ExecutionEngine:
                 error_str = str(e)
 
                 # Retry on "no match" exception as well
-                if "no match" in error_str.lower() and attempt < max_attempts - 1:
-                    logger.warning(
-                        f"Order exception 'no match' on {outcome_name}, "
-                        f"retrying (attempt {attempt + 2}/{max_attempts})..."
-                    )
-                    await asyncio.sleep(0.2)
-                    continue
+                if "no match" in error_str.lower():
+                    self._no_match_errors += 1  # Per Grok Round 25: Track no match errors
+                    if attempt < max_attempts - 1:
+                        logger.warning(
+                            f"Order exception 'no match' on {outcome_name}, "
+                            f"retrying (attempt {attempt + 2}/{max_attempts})..."
+                        )
+                        await asyncio.sleep(0.2)
+                        continue
 
                 result.status = OrderStatus.FAILED
                 result.error = error_str
@@ -2784,9 +3104,14 @@ class ExecutionEngine:
             price=limit_price
         )
 
-        # Dynamic price improvement: improvement = base + (edge_pct * 0.5)
-        price_improvement = base_improvement + (edge_pct * 0.5)
-        price_improvement = min(price_improvement, 0.03)  # Cap at 3 cents
+        # Per Grok Round 25: Dynamic price improvement scaled by edge
+        # Larger edge = more room to improve price aggressively
+        # "no match" errors indicate stale prices - need to beat competition
+        edge_scaled_improvement = edge_pct * 0.5
+        price_improvement = base_improvement + edge_scaled_improvement
+        # Cap at 80% of edge to preserve some profit margin
+        max_improvement = edge_pct * 0.8 if edge_pct > 0 else 0.05
+        price_improvement = min(price_improvement, max_improvement, 0.05)  # Hard cap 5 cents
 
         # Calculate improved price for post-only
         if side == BUY:
@@ -3326,6 +3651,169 @@ class ExecutionEngine:
             logger.error(f"Failed to add negative exposure: {e}")
             return None
 
+    async def execute_single_leg(
+        self,
+        token_id: str,
+        outcome_name: str,
+        size_usd: float,
+        limit_price: float,
+        market_condition_id: str,
+        market_question: str,
+        reason: str = ""
+    ) -> Optional[OrderResult]:
+        """
+        Execute a SINGLE LEG trade for volatility harvesting.
+
+        This is the RN1 strategy: buy ONE side at a time, no atomic requirement.
+
+        Key differences from atomic arb:
+        - Only buys ONE outcome
+        - Accepts any fill (no all-or-nothing)
+        - Uses FAK for partial fills (like RN1)
+        - Records fill in position tracker
+
+        Args:
+            token_id: Token ID to buy
+            outcome_name: Name of outcome (YES/NO/team name)
+            size_usd: Size in USD
+            limit_price: Maximum price to pay
+            market_condition_id: Market condition ID for tracking
+            market_question: Market question for logging
+            reason: Reason for trade (logging)
+
+        Returns:
+            OrderResult with fill details, or None if failed
+        """
+        if self.config.dry_run:
+            logger.info(f"[DRY RUN] HARVEST: {outcome_name} ${size_usd:.2f} @ ${limit_price:.4f} | {reason}")
+            # Return simulated fill
+            return OrderResult(
+                token_id=token_id,
+                outcome_name=outcome_name,
+                side="BUY",
+                requested_size_usd=size_usd,
+                executed_size_usd=size_usd,
+                price=limit_price,
+                status=OrderStatus.FILLED,
+                order_id=f"dry_run_{token_id[:8]}"
+            )
+
+        # Get execution client
+        exec_client, exec_wallet = await self.get_execution_client(min_balance=size_usd)
+        if exec_client is None:
+            logger.warning(f"No wallet available for harvest trade ${size_usd:.2f}")
+            return None
+
+        result = OrderResult(
+            token_id=token_id,
+            outcome_name=outcome_name,
+            side="BUY",
+            requested_size_usd=size_usd,
+            price=limit_price
+        )
+
+        try:
+            import math
+
+            # CRITICAL: Polymarket API requires maker_amount (USD for BUY) to have max 2 decimals
+            # First, round the USD amount to exactly 2 decimals
+            target_usd = round(size_usd, 2)
+
+            # Calculate shares from the clean USD amount
+            size_shares = target_usd / limit_price if limit_price > 0 else 0
+
+            # Minimum 5 shares (Polymarket minimum)
+            MIN_SHARES = 5.0
+            if size_shares < MIN_SHARES:
+                old_size = size_shares
+                size_shares = MIN_SHARES
+                target_usd = round(MIN_SHARES * limit_price, 2)  # Keep USD clean
+                logger.info(f"HARVEST SIZE UP: {old_size:.2f} -> {size_shares:.2f} shares (${target_usd:.2f})")
+
+            # Round shares to 2 decimal places (API requirement for size)
+            size_shares = round(size_shares, 2)
+
+            # VALIDATION: Verify the final USD amount has ≤2 decimal places
+            final_usd = size_shares * limit_price
+            final_usd_str = f"{final_usd:.10f}".rstrip('0').rstrip('.')
+            if '.' in final_usd_str:
+                decimal_places = len(final_usd_str.split('.')[1])
+                if decimal_places > 2:
+                    # Adjust shares down to get clean USD
+                    old_shares = size_shares
+                    size_shares = math.floor(size_shares)
+                    if size_shares < MIN_SHARES:
+                        size_shares = MIN_SHARES
+                    logger.info(f"HARVEST PRECISION FIX: {old_shares:.2f} -> {size_shares:.0f} shares (${size_shares * limit_price:.2f})")
+
+            # Use FAK (Fill-And-Kill) for partial fills - this is what RN1 uses
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=limit_price,
+                size=size_shares,
+                side=BUY,
+            )
+
+            logger.info(
+                f"HARVEST ORDER: {outcome_name} | {size_shares:.2f} shares @ ${limit_price:.4f} | "
+                f"${size_usd:.2f} | {reason}"
+            )
+
+            signed_order = await run_sync_in_thread(exec_client.create_order, order_args)
+
+            # Use FAK if available (allows partial fills), else GTC
+            order_type = OrderType.FAK if HAS_FAK else OrderType.GTC
+            response = await run_sync_in_thread(exec_client.post_order, signed_order, order_type)
+
+            if response and response.get("success"):
+                result.order_id = response.get("orderID")
+                result.status = OrderStatus.SUBMITTED
+
+                # Wait briefly for fill
+                await asyncio.sleep(0.3)
+
+                # Check fill status
+                try:
+                    order_status = await run_sync_in_thread(exec_client.get_order, result.order_id)
+                    if order_status:
+                        filled_size = float(order_status.get("sizeFilled", 0))
+                        if filled_size > 0:
+                            result.executed_size_usd = filled_size * limit_price
+                            result.status = OrderStatus.FILLED if filled_size >= size_shares * 0.95 else OrderStatus.PARTIAL
+
+                            # Log success
+                            logger.info(
+                                f"HARVEST FILL: {outcome_name} | {filled_size:.2f} shares @ ${limit_price:.4f} | "
+                                f"${result.executed_size_usd:.2f}"
+                            )
+
+                            # Track stats
+                            self._execution_count += 1
+                            self._total_volume += result.executed_size_usd
+                            self._successful_fills += 1
+                        else:
+                            result.status = OrderStatus.PENDING
+                            # Cancel unfilled order
+                            await self._cancel_order_safe(exec_client, result.order_id)
+                except Exception as e:
+                    logger.debug(f"Error checking harvest order: {e}")
+
+            else:
+                error_msg = response.get("errorMsg", "Unknown") if response else "No response"
+                result.status = OrderStatus.FAILED
+                result.error = error_msg
+                logger.warning(f"HARVEST REJECTED: {outcome_name} | {error_msg}")
+
+        except Exception as e:
+            result.status = OrderStatus.FAILED
+            result.error = str(e)
+            logger.error(f"HARVEST ERROR: {outcome_name} | {e}")
+
+        # Track total orders
+        self._total_orders_attempted += 1
+
+        return result
+
     def get_stats(self) -> Dict[str, Any]:
         """Get execution statistics."""
         total_exposure = self.get_total_exposure()
@@ -3367,4 +3855,9 @@ class ExecutionEngine:
             "maker_ratio_pct": maker_taker["maker_ratio"] * 100,
             "maker_volume_usd": maker_taker["maker_volume_usd"],
             "taker_volume_usd": maker_taker["taker_volume_usd"],
+            # Per Grok Round 25: Fill rate metrics
+            "no_match_errors": self._no_match_errors,
+            "successful_fills": self._successful_fills,
+            "total_orders": self._total_orders_attempted,
+            "fill_rate_pct": (self._successful_fills / self._total_orders_attempted * 100) if self._total_orders_attempted > 0 else 0,
         }

@@ -301,10 +301,17 @@ class AuthManager:
             logger.info("API credentials derived successfully")
 
             # Log credential details (redacted) for debugging
+            # FIX: Check for None/empty strings before slicing to avoid crashes
             if self._api_creds:
-                logger.debug(f"API Key: {self._api_creds.api_key[:8]}...{self._api_creds.api_key[-4:]}")
-                logger.debug(f"API Secret: {self._api_creds.api_secret[:4]}...{self._api_creds.api_secret[-4:]}")
-                logger.debug(f"API Passphrase: {self._api_creds.api_passphrase[:4]}...")
+                key = self._api_creds.api_key or ""
+                secret = self._api_creds.api_secret or ""
+                passphrase = self._api_creds.api_passphrase or ""
+                if len(key) >= 12:
+                    logger.debug(f"API Key: {key[:8]}...{key[-4:]}")
+                if len(secret) >= 8:
+                    logger.debug(f"API Secret: {secret[:4]}...{secret[-4:]}")
+                if len(passphrase) >= 4:
+                    logger.debug(f"API Passphrase: {passphrase[:4]}...")
 
         except Exception as e:
             logger.error(f"Failed to derive API credentials: {e}")

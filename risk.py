@@ -18,7 +18,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Any, TYPE_CHECKING
 from collections import deque
 
-from config import BotConfig, calculate_dynamic_threshold
+from config import BotConfig, calculate_dynamic_threshold, calculate_share_based_size
 from orderbook import ArbOpportunity, ArbType
 from positions import Position
 
@@ -149,10 +149,13 @@ class RiskManager:
         # Per Grok Round 20: Kelly criterion tracking for variance estimation
         # Track recent returns for variance calculation
         self._recent_returns: deque = deque(maxlen=100)  # Last 100 trade returns
-        self._kelly_max_fraction = 0.05  # 5% max Kelly (conservative)
+        # Per RN1 7-Day Analysis: RN1 is more aggressive - increase max Kelly
+        # RN1's edge multiplier goes up to 3x on high-edge trades
+        self._kelly_max_fraction = 0.08  # 8% max Kelly (increased from 5%)
         self._kelly_min_fraction = 0.005  # 0.5% min Kelly (floor)
         # Per Final Audit: Require minimum trades before full Kelly (avoids over-aggressive early)
-        self._kelly_min_trades = 100  # Need 100+ trades for reliable variance estimate
+        # Reduced from 100 to 50 for faster warmup (RN1 trades aggressively)
+        self._kelly_min_trades = 50  # Need 50+ trades for reliable variance estimate
         self._total_trades_for_kelly = 0  # Track total trades for Kelly eligibility
 
         if self._trash_mode_enabled:
@@ -180,9 +183,11 @@ class RiskManager:
 
     def update_capital(self, new_capital: float):
         """Update current capital."""
+        old_capital = self._current_capital
         self._current_capital = new_capital
         if new_capital > self._peak_capital:
             self._peak_capital = new_capital
+        logger.info(f"RiskManager capital updated: ${old_capital:.2f} → ${new_capital:.2f}")
 
     def record_trade(self, trade: TradeRecord):
         """Record a completed trade."""
@@ -258,11 +263,14 @@ class RiskManager:
             logger.debug(f"Maker ratio low: {maker_msg}")
 
         # Calculate dynamic threshold based on trade size and outcomes
+        # Per Grok Round 26: Proxy wallets have ZERO gas costs - Polymarket relayer pays
         num_outcomes = len(opportunity.market.outcomes)
+        is_proxy = self.config.wallet.signature_type == 1  # POLY_PROXY
         dynamic_threshold = calculate_dynamic_threshold(
             opportunity.trade_size_usd,
             num_outcomes,
-            self.config.trading
+            self.config.trading,
+            is_proxy_wallet=is_proxy
         )
 
         # Check minimum profit margin against dynamic threshold
@@ -274,6 +282,7 @@ class RiskManager:
 
         # Check trade size limits
         max_trade_size = self._current_capital * (self.config.trading.max_size_per_trade_percent / 100)
+        logger.debug(f"Risk check: capital=${self._current_capital:.2f}, max_pct={self.config.trading.max_size_per_trade_percent}%, max_trade=${max_trade_size:.2f}, request=${opportunity.trade_size_usd:.2f}")
         if opportunity.trade_size_usd > max_trade_size:
             return False, f"Trade size ${opportunity.trade_size_usd:.2f} exceeds max ${max_trade_size:.2f}"
 
@@ -307,8 +316,11 @@ class RiskManager:
             return False, self._halt_reason
 
         # Check minimum capital
-        if self._current_capital < 100:  # Minimum $100 to trade
-            return False, f"Insufficient capital: ${self._current_capital:.2f}"
+        # Per RN1 Round 28: Lowered to $5 (Polymarket minimum = 5 shares ≈ $2.50-5)
+        # RN1 trades 33.6% of orders at $0-5 - allow minimum viable trades
+        min_capital = max(5.0, self.config.min_capital_required)  # Floor at $5
+        if self._current_capital < min_capital:
+            return False, f"Insufficient capital: ${self._current_capital:.2f} < ${min_capital:.2f} required"
 
         return True, "Trade allowed"
 
@@ -357,10 +369,11 @@ class RiskManager:
             # Legacy fixed-percentage mode
             return min(edge_pct * 0.5, self._kelly_max_fraction)
 
-        # Per Final Audit: Need minimum trades for reliable variance
-        # Early trades use ultra-conservative 0.5% max
+        # Per Final Audit + RN1 7-Day Analysis: Need minimum trades for reliable variance
+        # Early trades use conservative sizing, but RN1 was more aggressive
+        # Increased early multiplier from 0.25 to 0.4, max from 0.5% to 1%
         if self._total_trades_for_kelly < self._kelly_min_trades:
-            conservative_kelly = min(edge_pct * 0.25, 0.005)  # 0.5% max early
+            conservative_kelly = min(edge_pct * 0.4, 0.01)  # 1% max early (was 0.5%)
             if self._total_trades_for_kelly % 25 == 0 and self._total_trades_for_kelly > 0:
                 logger.info(
                     f"Kelly warmup: {self._total_trades_for_kelly}/{self._kelly_min_trades} trades, "
@@ -377,13 +390,18 @@ class RiskManager:
         # f* = max(0, (edge - fees) / variance)
         # Calculate variance of recent returns
         returns = list(self._recent_returns)
+        # FIX: Guard against division by zero when returns list is empty
+        if len(returns) == 0:
+            return min(edge_pct * 0.5, 0.01)  # Conservative default
         mean_return = sum(returns) / len(returns)
         variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
 
         # Per Grok Round 23: Include partial fill variance in calculation
         # Partial fills add variance (50% win rate vs 95% for full fills)
         # Adjust variance upward if we've had many partials
-        partial_count = sum(1 for t in self._trade_history[-100:] if getattr(t, 'was_partial', False))
+        # Note: deque doesn't support slicing, convert to list for last 100
+        recent_trades = list(self._trade_history)[-100:] if self._trade_history else []
+        partial_count = sum(1 for t in recent_trades if getattr(t, 'was_partial', False))
         if partial_count > 0:
             partial_ratio = partial_count / min(len(self._trade_history), 100)
             # Partials have higher variance - adjust
@@ -426,6 +444,16 @@ class RiskManager:
         """
         Calculate optimal position size for an opportunity.
 
+        SHARE-BASED SIZING (Per RN1 Analysis - Jan 2026):
+        =================================================
+        Key insight: Arbitrage profit = Shares × Edge
+
+        RN1 Pattern Analysis:
+        - 38,209 shares @ $0.05 = $1,764 cost → $26,854 profit (1,523% ROI)
+        - 5,479 shares @ $0.20 = $1,120 cost → $42,618 profit (3,806% ROI)
+        - More shares on low prices, fewer on high prices
+        - Scale with edge confidence
+
         Uses gas-aware sizing: only trade sizes where expected profit > gas cost.
 
         Per Grok Round 7: Integrated edge model expectancy for smarter sizing.
@@ -436,7 +464,7 @@ class RiskManager:
 
         Args:
             opportunity: The arbitrage opportunity.
-            orderbooks_depth: Available depth at best prices by token_id.
+            orderbooks_depth: Available depth at best prices by token_id (in USD).
             market_volume_24h: 24-hour volume for market heat estimation.
             is_live_event: True if this is a live sports event.
             latency_ms: Our estimated latency in milliseconds.
@@ -444,17 +472,50 @@ class RiskManager:
         Returns:
             Recommended position size in USD.
         """
-        # Start with the minimum available depth across all outcomes
-        min_depth = min(orderbooks_depth.values()) if orderbooks_depth else 0
+        # =======================================================================
+        # STEP 1: Calculate average price across legs (for share-based sizing)
+        # =======================================================================
+        orderbooks = opportunity.orderbooks
+        prices = []
+        depth_shares_list = []
 
-        # Apply safety multiplier
-        safe_size = min_depth * self.config.trading.depth_safety_multiplier
+        for ob in orderbooks.all_orderbooks:
+            if opportunity.arb_type == ArbType.BUY_ARB and ob.best_ask:
+                prices.append(ob.best_ask_price)
+                depth_shares_list.append(ob.best_ask_size)  # Size is in shares
+            elif opportunity.arb_type == ArbType.SELL_ARB and ob.best_bid:
+                prices.append(ob.best_bid_price)
+                depth_shares_list.append(ob.best_bid_size)
 
-        # Per Grok Round 20: Kelly-based sizing instead of fixed percentage
-        # Kelly fraction determines optimal position as % of capital
+        if not prices:
+            return 0
+
+        avg_price = sum(prices) / len(prices)
+        min_depth_shares = min(depth_shares_list) if depth_shares_list else 0
+
+        # =======================================================================
+        # STEP 2: Calculate share-based target size
+        # =======================================================================
+        # Use new share-based sizing function
+        target_shares, share_based_usd = calculate_share_based_size(
+            config=self.config.trading,
+            edge_pct=opportunity.profit_margin,
+            avg_price=avg_price,
+            capital=self._current_capital,
+            depth_shares=min_depth_shares
+        )
+
+        logger.debug(
+            f"Share-based sizing: edge={opportunity.profit_margin*100:.2f}%, "
+            f"avg_price=${avg_price:.2f}, depth={min_depth_shares:.0f} shares → "
+            f"target={target_shares:.0f} shares (${share_based_usd:.2f})"
+        )
+
+        # =======================================================================
+        # STEP 3: Apply Kelly criterion for risk-adjusted sizing
+        # =======================================================================
         fill_probability = 0.7  # Default estimate
         if self._edge_model is not None:
-            # Get fill probability from edge model if available
             try:
                 from edge_model import MarketHeat
                 heat = self._edge_model.estimate_market_heat(
@@ -472,20 +533,28 @@ class RiskManager:
         kelly_fraction = self._calculate_kelly_fraction(opportunity.profit_margin, fill_probability)
         kelly_size = self._current_capital * kelly_fraction
 
-        # Position size is minimum of: safe_size (depth), kelly_size (optimal), config max
-        max_size = self._current_capital * (self.config.trading.max_size_per_trade_percent / 100)
-        position_size = min(safe_size, kelly_size, max_size)
+        # =======================================================================
+        # STEP 4: Combine share-based and Kelly sizing
+        # =======================================================================
+        # Use the SMALLER of share-based or Kelly (conservative)
+        # But ensure we meet minimum shares requirement
+        min_depth_usd = min(orderbooks_depth.values()) if orderbooks_depth else 0
+        safe_size = min_depth_usd * self.config.trading.depth_safety_multiplier
 
-        # ABSOLUTE cap regardless of capital (per audit: $200 max)
+        # Position size is minimum of: share_based, kelly, safe_size, config max
+        max_size = self._current_capital * (self.config.trading.max_size_per_trade_percent / 100)
+        position_size = min(share_based_usd, kelly_size, safe_size, max_size)
+
+        # ABSOLUTE cap regardless of capital
         absolute_max = self.config.trading.absolute_max_trade_size_usd
         position_size = min(position_size, absolute_max)
 
-        # Per Grok Round 22: rn1-accurate early-stage hard cap
-        # Until capital > $10k, use $30 max per trade (ultra-conservative ramp)
-        # This prevents oversized early trades from depleting small accounts
-        RN1_EARLY_STAGE_CAPITAL_THRESHOLD = 10000.0  # $10k
-        RN1_EARLY_STAGE_MAX_TRADE = 30.0  # $30 max
+        # =======================================================================
+        # STEP 5: Early-stage capital protection
+        # =======================================================================
+        RN1_EARLY_STAGE_CAPITAL_THRESHOLD = 1000.0  # $1k
         if self._current_capital < RN1_EARLY_STAGE_CAPITAL_THRESHOLD:
+            RN1_EARLY_STAGE_MAX_TRADE = max(10.0, self._current_capital * 0.5)
             if position_size > RN1_EARLY_STAGE_MAX_TRADE:
                 logger.debug(
                     f"Early-stage cap: ${position_size:.2f} → ${RN1_EARLY_STAGE_MAX_TRADE:.2f} "
@@ -493,32 +562,52 @@ class RiskManager:
                 )
                 position_size = RN1_EARLY_STAGE_MAX_TRADE
 
-        # Per Grok Round 7: Apply edge model expectancy adjustment
-        # Reduce size in hot markets where fill probability is lower
+        # =======================================================================
+        # STEP 6: Apply edge model expectancy adjustment
+        # =======================================================================
         if self._edge_model is not None:
             position_size = self._apply_expectancy_sizing(
                 position_size,
                 opportunity.profit_margin,
-                min_depth,
+                min_depth_usd,
                 market_volume_24h,
                 is_live_event,
                 latency_ms
             )
 
-        # Reduce size based on consecutive losses (risk scaling)
+        # =======================================================================
+        # STEP 7: Risk scaling (consecutive losses/partials)
+        # =======================================================================
         if self._consecutive_losses > 0:
             scale_factor = 1.0 / (1 + self._consecutive_losses * 0.2)
             position_size *= scale_factor
             logger.debug(f"Scaled position by {scale_factor:.2f} due to {self._consecutive_losses} consecutive losses")
 
-        # Reduce size based on consecutive partials
         if self._consecutive_partials > 0:
             scale_factor = 1.0 / (1 + self._consecutive_partials * 0.3)
             position_size *= scale_factor
             logger.debug(f"Scaled position by {scale_factor:.2f} due to {self._consecutive_partials} consecutive partials")
 
+        # =======================================================================
+        # STEP 8: Ensure minimum shares requirement (5 shares per leg)
+        # =======================================================================
+        MIN_SHARES = self.config.trading.min_shares_per_order
+        min_usd_for_min_shares = sum(
+            MIN_SHARES * p for p in prices
+        ) if prices else 0
+
+        # Scale up to minimum if position is too small for 5 shares per leg
+        if position_size < min_usd_for_min_shares and min_usd_for_min_shares <= max_size:
+            logger.debug(
+                f"Scaling up for min shares: ${position_size:.2f} → ${min_usd_for_min_shares:.2f} "
+                f"({MIN_SHARES:.0f} shares × {len(prices)} legs)"
+            )
+            position_size = min_usd_for_min_shares
+
+        # =======================================================================
+        # STEP 9: Final validation
+        # =======================================================================
         # Gas-aware minimum sizing
-        # Ensure expected profit > total gas cost
         num_outcomes = len(opportunity.market.outcomes)
         total_gas = self.config.trading.gas_buffer_usd * num_outcomes
         min_profitable_size = total_gas / opportunity.profit_margin if opportunity.profit_margin > 0 else float('inf')
@@ -529,9 +618,15 @@ class RiskManager:
             )
             return 0
 
-        # Minimum viable trade size ($10)
-        if position_size < 10:
+        # Minimum viable trade size
+        if position_size < self.config.trading.min_trade_size_usd:
             return 0
+
+        # Calculate final shares for logging
+        final_shares = position_size / avg_price if avg_price > 0 else 0
+        logger.debug(
+            f"Final position: ${position_size:.2f} = {final_shares:.0f} shares @ ${avg_price:.2f} avg"
+        )
 
         return position_size
 
@@ -1036,9 +1131,10 @@ class RiskManager:
         self._trash_mode_trades += 1
         self._trash_mode_volume_usd += size_usd
 
-        # Per Grok Round 21: Track cost (expected loss = size * price since outcome ~0% probability)
-        # At $0.01, cost ≈ 1% of volume → 100:1 volume:cost ratio
-        cost = size_usd * price  # Shares * price = total cost to buy shares
+        # Per Grok Round 21: Track cost (expected loss since outcome ~0% probability)
+        # FIX: size_usd is already in USD, cost is just size_usd (not size_usd * price)
+        # At $0.01 price: $10 USD buys 1000 shares, if outcome loses, we lose $10
+        cost = size_usd  # Cost is the USD we spent
         self._trash_mode_cost_usd += cost
 
         # Update running average price
@@ -1261,23 +1357,35 @@ class DepthValidator:
         """
         Validate that an opportunity has sufficient depth.
 
+        Per Grok Round 24: Changed from flat min_depth check to trade-size-aware.
+        Tennis/small markets have $0.04-$10 depths per outcome - flat $20 blocked all.
+        Now checks: depth >= min(config.min_depth, trade_size * 1.2)
+
         Args:
             opportunity: The opportunity to validate.
 
         Returns:
             Tuple of (valid, reason).
         """
-        min_depth = self.config.trading.min_depth_usd
+        config_min_depth = self.config.trading.min_depth_usd
         orderbooks = opportunity.orderbooks
 
-        # Check each outcome has sufficient depth
+        # Per Grok Round 24: Use trade-size-aware depth check
+        # Need enough depth to fill the trade, not arbitrary flat minimum
+        # Tennis markets have $0.04-$10 depths - be permissive, cap at config minimum
+        trade_size = opportunity.trade_size_usd if opportunity.trade_size_usd > 0 else config_min_depth
+        # Per Grok Round 24 fix: depth just needs to cover trade, not 1.2x
+        # Atomic failsafe handles partial fills anyway
+        required_depth = min(config_min_depth, max(1.0, trade_size * 0.5))
+
+        # Check each outcome has sufficient depth for our trade
         for ob in orderbooks.all_orderbooks:
             if opportunity.arb_type == ArbType.BUY_ARB:
                 if not ob.best_ask:
                     return False, f"No ask for {ob.outcome_name}"
 
                 depth_usd = ob.best_ask_size * ob.best_ask_price
-                if depth_usd < min_depth:
+                if depth_usd < required_depth:
                     return False, f"Insufficient ask depth for {ob.outcome_name}: ${depth_usd:.2f}"
 
             else:  # SELL_ARB
@@ -1285,7 +1393,7 @@ class DepthValidator:
                     return False, f"No bid for {ob.outcome_name}"
 
                 depth_usd = ob.best_bid_size * ob.best_bid_price
-                if depth_usd < min_depth:
+                if depth_usd < required_depth:
                     return False, f"Insufficient bid depth for {ob.outcome_name}: ${depth_usd:.2f}"
 
         # Check spread is reasonable (not a stale/manipulated book)
@@ -1301,6 +1409,8 @@ class DepthValidator:
         """
         Calculate the safe trade size based on available depth.
 
+        CRITICAL: Must ensure Polymarket minimum 5 shares per leg.
+
         Args:
             opportunity: The opportunity.
 
@@ -1309,18 +1419,39 @@ class DepthValidator:
         """
         min_depth = float('inf')
 
+        # Calculate minimum USD needed for 5 shares per leg (Polymarket minimum)
+        MIN_SHARES = 5.0
+        min_usd_for_5_shares = 0.0
+
         for ob in opportunity.orderbooks.all_orderbooks:
             if opportunity.arb_type == ArbType.BUY_ARB:
                 if ob.best_ask:
                     depth = ob.best_ask_size * ob.best_ask_price
                     min_depth = min(min_depth, depth)
+                    # Calculate USD needed for 5 shares at this price
+                    min_usd_for_5_shares += MIN_SHARES * ob.best_ask_price
             else:
                 if ob.best_bid:
                     depth = ob.best_bid_size * ob.best_bid_price
                     min_depth = min(min_depth, depth)
+                    min_usd_for_5_shares += MIN_SHARES * ob.best_bid_price
 
         if min_depth == float('inf'):
             return 0
 
-        # Apply safety multiplier
-        return min_depth * self.config.trading.depth_safety_multiplier
+        # Apply safety multiplier to depth-based size
+        depth_based_size = min_depth * self.config.trading.depth_safety_multiplier
+
+        # Return the LARGER of: depth-based size OR minimum for 5 shares
+        # This ensures we always meet Polymarket's minimum order requirements
+        # Cap at reasonable max to avoid over-sizing on thin books
+        safe_size = max(depth_based_size, min_usd_for_5_shares)
+
+        # Don't exceed available depth (with small buffer)
+        max_safe = min_depth * 0.95
+        if safe_size > max_safe:
+            # Not enough depth for minimum shares - return the minimum anyway
+            # and let the execution handle any partial fills
+            return min_usd_for_5_shares
+
+        return safe_size

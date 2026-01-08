@@ -63,10 +63,12 @@ class EdgeModelConfig:
     our_latency_ms_http: float = 800.0     # Our HTTP polling latency
     our_latency_ms_ws: float = 80.0        # Our WebSocket latency
 
-    # Fee structure (Polymarket)
-    maker_rebate_pct: float = 0.001  # 0.1% maker rebate
-    taker_fee_pct: float = 0.002     # 0.2% taker fee
-    gas_cost_usd: float = 0.01       # Average gas per tx
+    # Fee structure (Polymarket - Jan 2026)
+    # Per RN1 Round 28: Most markets are fee-free (0%)
+    # Only 15-minute crypto markets have taker fees for maker rebates
+    maker_rebate_pct: float = 0.0    # 0% - most markets fee-free
+    taker_fee_pct: float = 0.0       # 0% - most markets fee-free
+    gas_cost_usd: float = 0.0        # 0 for proxy wallets (Polymarket relayer pays)
 
 
 @dataclass
@@ -111,7 +113,8 @@ class EdgeExpectancyModel:
         # Track historical fill rates for calibration
         self._fill_attempts = 0
         self._successful_fills = 0
-        self._fill_history: List[Tuple[float, float, bool]] = []  # (latency, edge, filled)
+        # FIX: Changed to 4-tuple to match what's appended in record_fill
+        self._fill_history: List[Tuple[float, float, bool, Any]] = []  # (latency, edge, filled, heat)
 
         # Per Final Audit: Track WS vs HTTP mode for latency penalty
         self._using_websocket = True  # Default to WS

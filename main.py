@@ -25,12 +25,14 @@ from auth import AuthManager
 from wallet_manager import WalletManager
 from market_discovery import MarketDiscovery, Market
 from orderbook import OrderbookPoller, ArbOpportunity, ArbType
-from execution import ExecutionEngine, ExecutionResult
+from execution import ExecutionEngine, ExecutionResult, OrderStatus
 from positions import PositionMonitor, ProfitLocker
 from risk import RiskManager, DepthValidator, TradeRecord
 from edge_model import EdgeExpectancyModel, MarketHeat
 from supervisor import get_supervisor, heartbeat as supervisor_heartbeat
 from clob_client_patch import shutdown_executor as shutdown_clob_executor
+from position_tracker import PositionTracker, get_position_tracker
+from volatility_harvester import VolatilityHarvester, get_volatility_harvester, HarvestOpportunity
 # Note: Monkey-patching deprecated per audit - rate limiting handled at application level
 
 # Optional WebSocket support
@@ -274,6 +276,12 @@ class ArbBot:
         # Edge expectancy model for latency-adjusted sizing
         self.edge_model = EdgeExpectancyModel()
 
+        # RN1-style position tracker for volatility harvesting
+        self.position_tracker = get_position_tracker()
+
+        # Volatility harvester for RN1-style single-leg accumulation
+        self.volatility_harvester = get_volatility_harvester(config)
+
         # WebSocket support (hybrid mode: WS for detection, HTTP for verification)
         self.hybrid_manager: Optional[HybridOrderbookManager] = None
         self._use_websocket = HAS_WEBSOCKET and config.trading.use_websocket
@@ -501,7 +509,7 @@ class ArbBot:
                 # Ensure allowance >= 2x new capital for safe trading headroom
                 if not self.config.dry_run and self.config.wallet.signature_type == 0:
                     required_allowance = balance * 2
-                    client = self.execution_engine._client
+                    client = self.execution_engine.client
                     if client:
                         self.auth_manager.ensure_sufficient_allowance(client, required_allowance)
 
@@ -511,7 +519,11 @@ class ArbBot:
         logger.info("POLYMARKET MICROSTRUCTURE ARBITRAGE BOT v2.1")
         logger.info("=" * 60)
         logger.info(f"Mode: {'DRY RUN' if self.config.dry_run else 'LIVE TRADING'}")
-        logger.info(f"Starting capital: ${self.config.starting_capital_usd:,.2f}")
+        # Per Grok Round 26: Show dynamic capital status
+        if self.config.starting_capital_usd > 0:
+            logger.info(f"Starting capital: ${self.config.starting_capital_usd:,.2f}")
+        else:
+            logger.info("Starting capital: DYNAMIC (will use wallet balance)")
         logger.info(f"Min capital required: ${self.config.min_capital_required:,.2f}")
         logger.info(f"Min volume filter: ${self.config.trading.min_volume_usd:,.0f}")
         logger.info(f"Min depth: ${self.config.trading.min_depth_usd:,.0f}")
@@ -527,15 +539,21 @@ class ArbBot:
         logger.info(f"Max % per trade: {self.config.trading.max_size_per_trade_percent:.1f}%")
         logger.info(f"Capital scaling factor: {self.config.trading.capital_scaling_factor}")
         logger.info(f"Min trade size: ${self.config.trading.min_trade_size_usd:.0f}")
+        logger.info(f"BUY_ARB_ONLY mode: {self.config.trading.buy_arb_only}")  # Debug
 
-        # Show rn1 target metrics
-        rn1_targets = get_rn1_target_metrics(self.config.starting_capital_usd, days=90)
-        logger.info("-" * 60)
-        logger.info("RN1 BENCHMARK TARGETS (90 days)")
-        logger.info(f"Target daily geo return: {rn1_targets['rn1_daily_geo_return_pct']:.1f}%")
-        logger.info(f"Target capital (90d): ${rn1_targets['target_capital']:,.0f}")
-        logger.info(f"Target trades/day: {rn1_targets['trades_per_day_target']}")
-        logger.info(f"Target avg edge: {rn1_targets['avg_edge_pct']:.1f}%")
+        # Show rn1 target metrics (only if capital is known)
+        # Per Grok Round 26: Skip if dynamic capital not yet set
+        if self.config.starting_capital_usd > 0:
+            rn1_targets = get_rn1_target_metrics(self.config.starting_capital_usd, days=90)
+            logger.info("-" * 60)
+            logger.info("RN1 BENCHMARK TARGETS (90 days)")
+            logger.info(f"Target daily geo return: {rn1_targets['rn1_daily_geo_return_pct']:.1f}%")
+            logger.info(f"Target capital (90d): ${rn1_targets['target_capital']:,.0f}")
+            logger.info(f"Target trades/day: {rn1_targets['trades_per_day_target']}")
+            logger.info(f"Target avg edge: {rn1_targets['avg_edge_pct']:.1f}%")
+        else:
+            logger.info("-" * 60)
+            logger.info("RN1 BENCHMARK: Will calculate after detecting wallet balance")
 
         # WebSocket mandatory mode
         if self._ws_required:
@@ -612,6 +630,19 @@ class ArbBot:
                 ready, ready_msg = await self.execution_engine.verify_trading_ready()
                 if ready:
                     logger.info(ready_msg)
+                    # Per RN1 Round 28: ALWAYS update capital tracking with actual balance
+                    # Previous bug: When STARTING_CAPITAL=0 (auto-detect), risk_manager never got updated
+                    # This caused "Insufficient capital: $41.26" errors even with valid balance
+                    effective_capital = self.config.starting_capital_usd if self.config.starting_capital_usd > 0 else actual_balance
+                    if effective_capital > 0:
+                        self._current_capital = effective_capital
+                        self.metrics_exporter.set_starting_capital(effective_capital)
+                        # CRITICAL: Also update risk manager's capital (was causing max_trade_size = $0)
+                        self.risk_manager.update_capital(effective_capital)
+                        # Update execution engine's capital tracking
+                        self.execution_engine._current_capital = effective_capital
+                        self.execution_engine._session_high_capital = effective_capital
+                        logger.info(f"Capital initialized: ${effective_capital:,.2f} (actual balance: ${actual_balance:.2f})")
                 else:
                     logger.error("=" * 60)
                     logger.error("FATAL: NOT READY FOR LIVE TRADING")
@@ -649,6 +680,17 @@ class ArbBot:
             try:
                 self.auth_manager.initialize()
                 logger.info("Read-only client initialized for dry run")
+
+                # Set simulated capital for dry run mode
+                # Use STARTING_CAPITAL env var if set, otherwise default to $100 for testing
+                dry_run_capital = self.config.starting_capital_usd if self.config.starting_capital_usd > 0 else 100.0
+                self._current_capital = dry_run_capital
+                self.config.starting_capital_usd = dry_run_capital
+                self.metrics_exporter.set_starting_capital(dry_run_capital)
+                self.risk_manager.update_capital(dry_run_capital)
+                self.execution_engine._current_capital = dry_run_capital
+                self.execution_engine._session_high_capital = dry_run_capital
+                logger.info(f"Dry run capital initialized: ${dry_run_capital:,.2f}")
             except Exception as e:
                 logger.warning(f"Could not initialize read-only client: {e}")
 
@@ -830,26 +872,49 @@ class ArbBot:
         Returns:
             ExecutionResult if executed, None otherwise.
         """
+        # Per Grok Round 25: Skip stale opportunities (>300ms old)
+        # "no match" errors indicate we're executing on moved books
+        # If opportunity is too old, book has likely changed
+        if hasattr(opportunity, 'detected_at') and opportunity.detected_at:
+            from datetime import timezone
+            age_ms = (datetime.now(timezone.utc) - opportunity.detected_at).total_seconds() * 1000
+            if age_ms > 300:  # 300ms max age
+                logger.debug(f"Skipping stale opportunity: {age_ms:.0f}ms old")
+                return None
+
+        # Per Grok Round 26: Cap trade size BEFORE risk check to prevent rejection
+        # With small capital, max_size_per_trade_percent creates valid small trades
+        max_trade_for_capital = self._current_capital * (self.config.trading.max_size_per_trade_percent / 100)
+        if opportunity.trade_size_usd > max_trade_for_capital and max_trade_for_capital > 0:
+            opportunity.trade_size_usd = max_trade_for_capital
+
         # Validate depth
         depth_valid, depth_reason = self.depth_validator.validate_opportunity(opportunity)
         if not depth_valid:
-            logger.debug(f"Depth validation failed: {depth_reason}")
+            logger.info(f"Depth validation FAILED: {depth_reason}")  # Changed to INFO for debugging
             return None
 
         # Check risk limits
         trade_allowed, risk_reason = self.risk_manager.check_trade_allowed(opportunity)
         if not trade_allowed:
-            logger.debug(f"Risk check failed: {risk_reason}")
+            logger.info(f"Risk check FAILED: {risk_reason}")  # Changed to INFO for debugging
             return None
 
         # Calculate optimal position size
+        # Depth validator now returns size that respects Polymarket 5-share minimum
         safe_size = self.depth_validator.get_safe_trade_size(opportunity)
-        if safe_size < 10:  # Minimum $10 trade
-            logger.debug(f"Trade size too small: ${safe_size:.2f}")
+
+        # Polymarket minimum: 5 shares per leg = ~$2.50-5.00 for typical prices
+        # Only reject if safe_size is 0 (no valid orderbook data)
+        # The depth validator already ensures minimum 5 shares per leg
+        POLYMARKET_MIN_USD = 2.50  # Absolute minimum ($0.50 price × 5 shares)
+        if safe_size < POLYMARKET_MIN_USD:
+            logger.info(f"Trade size too small: ${safe_size:.2f} < ${POLYMARKET_MIN_USD:.2f}")
             return None
 
-        # Update opportunity with safe size
-        opportunity.trade_size_usd = min(safe_size, opportunity.trade_size_usd)
+        # Update opportunity with safe size (use the larger of safe_size and WS-calculated size)
+        # WS already calculated minimum for 5 shares - use that if it's larger
+        opportunity.trade_size_usd = max(safe_size, opportunity.trade_size_usd)
 
         # Per Grok Round 21: WS disconnect → reduce size by 80% + alert webhook
         # HTTP fallback has ~800ms latency vs ~50ms WS = fill prob drops from ~70% to ~10%
@@ -898,6 +963,19 @@ class ArbBot:
             )
             self.risk_manager.record_trade(trade_record)
 
+            # RN1 STRATEGY: Record fills for position tracking (volatility harvesting)
+            # This tracks accumulated positions across outcomes for guaranteed profit calc
+            for order in result.orders:
+                if order.status.value == 'filled' and order.executed_size_usd > 0:
+                    self.position_tracker.record_fill(
+                        condition_id=opportunity.market.condition_id,
+                        market_question=opportunity.market.question,
+                        token_id=order.token_id,
+                        outcome_name=order.outcome_name,
+                        shares=order.executed_size_usd / order.price if order.price > 0 else 0,
+                        price=order.price
+                    )
+
             # Record for CSV export
             self.metrics_exporter.record_trade({
                 "market_id": opportunity.market.market_id,
@@ -922,6 +1000,209 @@ class ArbBot:
             await self._verify_post_execution_book(opportunity)
 
         return result
+
+    async def process_harvest_opportunity(self, opportunity: HarvestOpportunity) -> bool:
+        """
+        Process a volatility harvesting opportunity (RN1 strategy).
+
+        This is the NEW strategy: buy ONE side at a time, accumulate over time.
+        No atomic execution requirement - we accept any fills.
+
+        Args:
+            opportunity: The harvest opportunity to process.
+
+        Returns:
+            True if trade was successful, False otherwise.
+        """
+        # Log the opportunity
+        logger.info(
+            f"HARVEST OPP: {opportunity.outcome_name} @ ${opportunity.price:.4f} | "
+            f"Size: ${opportunity.size_usd:.2f} | Reason: {opportunity.reason}"
+        )
+
+        # Check circuit breaker
+        if not self._check_circuit_breaker():
+            logger.info("HARVEST BLOCKED: Circuit breaker open")
+            return False
+
+        # Check rate limit
+        if not self._check_rate_limit():
+            logger.info("HARVEST BLOCKED: Rate limit hit")
+            return False
+
+        # Apply capital-based size limit, but ensure at least $5 if we have the capital
+        # RN1 uses small frequent trades - we should too, but not below Polymarket minimums
+        MIN_TRADE_USD = 5.0  # Polymarket minimum
+        max_trade_for_capital = self._current_capital * (self.config.trading.max_size_per_trade_percent / 100)
+
+        # If percentage-based limit is below $5, use $5 if we have enough capital
+        if max_trade_for_capital < MIN_TRADE_USD and self._current_capital >= MIN_TRADE_USD:
+            max_trade_for_capital = MIN_TRADE_USD
+
+        trade_size = min(opportunity.size_usd, max_trade_for_capital)
+
+        # Ensure minimum size ($5 Polymarket minimum)
+        if trade_size < MIN_TRADE_USD:
+            logger.info(f"HARVEST BLOCKED: Trade size ${trade_size:.2f} below minimum ${MIN_TRADE_USD} (capital=${self._current_capital:.2f})")
+            return False
+
+        logger.info(f"HARVEST EXECUTING: ${trade_size:.2f} for {opportunity.outcome_name}")
+
+        # Execute single-leg trade via execution engine
+        result = await self.execution_engine.execute_single_leg(
+            token_id=opportunity.token_id,
+            outcome_name=opportunity.outcome_name,
+            size_usd=trade_size,
+            limit_price=opportunity.price,
+            market_condition_id=opportunity.market.condition_id,
+            market_question=opportunity.market.question,
+            reason=opportunity.reason
+        )
+
+        # Check if trade was successful (FILLED or PARTIAL status)
+        if result and result.status in (OrderStatus.FILLED, OrderStatus.PARTIAL):
+            # Record the fill in volatility harvester
+            fill_price = result.price if result.price > 0 else opportunity.price
+            shares_filled = result.executed_size_usd / fill_price if fill_price > 0 else 0
+            self.volatility_harvester.record_trade(opportunity, shares_filled, fill_price)
+
+            # Update capital tracking
+            # For single-leg buys, we're investing (not profiting yet)
+            # Profit comes when we have matched pairs
+            self._trades_executed += 1
+            self._record_success()
+
+            # Log position status
+            position = self.position_tracker.get_position(opportunity.market.condition_id)
+            if position:
+                logger.info(
+                    f"POSITION UPDATE: {position.matched_shares:.2f} matched | "
+                    f"Edge: {position.edge*100:.2f}% | "
+                    f"Guaranteed profit: ${position.guaranteed_profit:.2f}"
+                )
+
+            # Record for metrics
+            self.metrics_exporter.record_trade({
+                "market_id": opportunity.market.market_id,
+                "market_question": opportunity.market.question[:100],
+                "strategy": "volatility_harvest",
+                "outcome": opportunity.outcome_name,
+                "trade_size_usd": result.executed_size_usd,
+                "price": result.fill_price,
+                "reason": opportunity.reason,
+                "combined_price": opportunity.combined_price,
+                "projected_edge": opportunity.projected_edge,
+            })
+
+            return True
+        else:
+            self._record_failure()
+            return False
+
+    async def detect_and_process_harvest_opportunities(self) -> int:
+        """
+        Detect and process volatility harvesting opportunities.
+
+        This is the RN1 strategy - called in the main loop.
+
+        OPTIMIZED: Uses WebSocket orderbook cache when available instead of
+        fetching 200 HTTP requests.
+
+        Returns:
+            Number of trades executed.
+        """
+        if not self._target_markets:
+            return 0
+
+        trades_executed = 0
+
+        # Build orderbook data for all markets
+        # Format: {condition_id: {token_id: {best_ask, best_bid, outcome_name, ...}}}
+        all_orderbooks: Dict[str, Dict[str, dict]] = {}
+
+        # Send heartbeat at start
+        supervisor_heartbeat()
+
+        # OPTIMIZATION: Use WebSocket cache if available (much faster than HTTP)
+        use_ws_cache = self._use_websocket and self.hybrid_manager and self.hybrid_manager.ws_client
+
+        # Check if WS cache has data - if not, limit to top 30 markets by volume
+        # This prevents timeout when WS hasn't populated yet
+        ws_has_data = False
+        if use_ws_cache and hasattr(self.hybrid_manager.ws_client, '_cache'):
+            ws_has_data = len(self.hybrid_manager.ws_client._cache._books) > 100
+
+        # If WS cache is empty, only check top 30 to avoid HTTP timeout
+        markets_to_check = self._target_markets
+        if not ws_has_data:
+            markets_to_check = sorted(self._target_markets, key=lambda m: m.volume, reverse=True)[:30]
+            logger.debug(f"HARVEST: WS cache empty, limiting to top {len(markets_to_check)} markets by volume")
+
+        markets_processed = 0
+        for market in markets_to_check:
+            if not market.is_binary:
+                continue  # Focus on binary markets for now
+
+            # Send heartbeat every 50 markets to prevent watchdog timeout
+            markets_processed += 1
+            if markets_processed % 50 == 0:
+                supervisor_heartbeat()
+
+            token_ids = [o.token_id for o in market.outcomes]
+            token_id_to_outcome = {o.token_id: o.name for o in market.outcomes}
+
+            try:
+                books = None
+
+                # Try WebSocket cache first (instant, no HTTP)
+                if use_ws_cache:
+                    ws_books = {}
+                    for outcome in market.outcomes:
+                        cached = self.hybrid_manager.ws_client._cache.get(outcome.token_id)
+                        if cached:
+                            ws_books[outcome.token_id] = cached
+
+                    if len(ws_books) == 2:  # Both sides cached
+                        books = ws_books
+
+                # Fallback to HTTP if WS cache miss
+                if not books:
+                    books = await self.orderbook_poller.fetch_orderbooks_batch(token_ids, token_id_to_outcome)
+
+                if books:
+                    market_books = {}
+                    for outcome in market.outcomes:
+                        if outcome.token_id in books:
+                            ob = books[outcome.token_id]
+                            # Orderbook is a dataclass with best_ask_price, best_bid_price properties
+                            market_books[outcome.token_id] = {
+                                'best_ask': ob.best_ask_price,
+                                'best_bid': ob.best_bid_price,
+                                'outcome_name': outcome.name,
+                                'asks': [(lvl.price, lvl.size) for lvl in ob.asks],
+                                'bids': [(lvl.price, lvl.size) for lvl in ob.bids],
+                            }
+                    if len(market_books) == 2:  # Binary market
+                        all_orderbooks[market.condition_id] = market_books
+            except Exception as e:
+                logger.debug(f"Error fetching orderbooks for {market.question[:30]}: {e}")
+                continue
+
+        # Send heartbeat before processing
+        supervisor_heartbeat()
+
+        # Get best opportunity across all markets
+        best_opp = self.volatility_harvester.get_best_opportunity(
+            self._target_markets,
+            all_orderbooks
+        )
+
+        if best_opp:
+            success = await self.process_harvest_opportunity(best_opp)
+            if success:
+                trades_executed += 1
+
+        return trades_executed
 
     def _check_big_arb_alert(self, opportunity: ArbOpportunity, result: ExecutionResult):
         """
@@ -1321,7 +1602,14 @@ class ArbBot:
                         if result and result.success:
                             self._update_capital_tracking(result.realized_profit_usd)
 
-                # Also do periodic HTTP poll as backup (every 2s)
+                # RN1 VOLATILITY HARVESTING: Detect and execute single-leg opportunities
+                # This is the NEW strategy - buy one side when cheap, accumulate over time
+                harvest_trades = await self.detect_and_process_harvest_opportunities()
+                if harvest_trades > 0:
+                    logger.info(f"HARVEST: Executed {harvest_trades} single-leg trade(s)")
+
+                # Also do periodic HTTP poll as backup for instant arb (every 2s)
+                # Keep instant arb as secondary - volatility harvesting is primary
                 http_poll_interval = 2.0  # Reduced frequency since WS handles detection
 
                 if (now - loop_start).total_seconds() >= http_poll_interval:
@@ -1372,10 +1660,16 @@ class ArbBot:
                 if self.market_discovery.needs_refresh():
                     await self.refresh_markets()
 
-                # Poll for opportunities
+                # RN1 VOLATILITY HARVESTING (PRIMARY STRATEGY)
+                # Detect and execute single-leg opportunities
+                harvest_trades = await self.detect_and_process_harvest_opportunities()
+                if harvest_trades > 0:
+                    logger.info(f"HARVEST: Executed {harvest_trades} single-leg trade(s)")
+
+                # Poll for instant arb opportunities (SECONDARY - backup strategy)
                 opportunities = await self.poll_and_detect()
 
-                # Process each opportunity
+                # Process each instant arb opportunity
                 for opp in opportunities:
                     if not self._running:
                         break
@@ -1477,6 +1771,16 @@ class ArbBot:
                 f"HTTP Arbs: {ws_stats['http_arbs_detected']} | "
                 f"Latency: {ws_stats['ws']['latency_avg_ms']:.0f}ms avg"
             )
+
+        # RN1 STRATEGY: Position tracker stats (volatility harvesting)
+        pos_stats = self.position_tracker.get_stats()
+        if pos_stats['active_positions'] > 0:
+            logger.info(
+                f"POSITIONS: {pos_stats['active_positions']} markets | "
+                f"${pos_stats['total_invested']:.2f} invested | "
+                f"${pos_stats['total_guaranteed_profit']:.2f} guaranteed profit"
+            )
+            self.position_tracker.log_status()
 
         logger.info("-" * 40)
 

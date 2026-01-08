@@ -617,7 +617,35 @@ class MarketDiscovery:
         elif market.volume >= 20000:
             score += 0.05
 
-        return min(1.0, score)
+        # Per Grok Round 25: Time-of-day boost for peak trading hours
+        # rn1 research shows trades clustered in UTC hours aligning with European soccer (12-22 UTC)
+        # These hours have more live events and higher volatility
+        current_hour_utc = now.hour
+        if 12 <= current_hour_utc <= 22:
+            score += 0.1  # Peak trading hours boost
+        elif 8 <= current_hour_utc < 12 or 22 < current_hour_utc <= 24:
+            score += 0.05  # Secondary hours (some events)
+        # No boost for 0-8 UTC (low activity)
+
+        # Per RN1 Round 29: Tennis priority boost
+        # RN1 traded 95% tennis in 5-hour sample - tennis markets have best arb conditions
+        # Keywords: "open", "international", "classic", "atp", "wta", "tennis"
+        tennis_keywords = ['tennis', 'open', 'international', 'classic', 'atp', 'wta',
+                          'wimbledon', 'roland', 'garros', 'australian']
+        market_text = (market.question + ' ' + market.slug + ' ' +
+                      (market.event_title or '')).lower()
+        if any(kw in market_text for kw in tennis_keywords):
+            tennis_boost = getattr(self.config.sports, 'tennis_priority_boost', 2.0)
+            score *= tennis_boost
+            # Log occasionally for debugging
+            if hasattr(self, '_tennis_log_count'):
+                self._tennis_log_count += 1
+            else:
+                self._tennis_log_count = 1
+            if self._tennis_log_count <= 5:
+                logger.debug(f"Tennis boost applied: {market.question[:40]} -> score {score:.2f}")
+
+        return min(2.0, score)  # Allow tennis to exceed 1.0
 
     def _get_sport_duration(self, market: Market) -> int:
         """

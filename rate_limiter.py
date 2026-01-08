@@ -175,21 +175,25 @@ class PerWalletRateLimiter:
 
     def __init__(
         self,
-        requests_per_second: float = 2.0,
+        requests_per_second: float = 30.0,  # Per Grok Round 26: Increased from 2.0
         window_size_seconds: float = 1.0,
-        min_delay_between_requests: float = 0.1,
-        jitter_min: float = 0.05,
-        jitter_max: float = 0.2
+        min_delay_between_requests: float = 0.02,  # Per Grok Round 26: 20ms minimum
+        jitter_min: float = 0.01,  # Per Grok Round 26: Tighter jitter for latency
+        jitter_max: float = 0.05
     ):
         """
         Initialize per-wallet rate limiter.
+
+        Per Grok Round 26: Polymarket docs show 3500/10s burst capacity per API key.
+        Previous 2 req/s was overly conservative. Increased to 30/s with tighter jitter.
+        Still well under the 350/s theoretical limit to avoid Cloudflare queuing.
 
         Args:
             requests_per_second: Max requests per wallet per second.
             window_size_seconds: Rolling window size for counting requests.
             min_delay_between_requests: Minimum delay between any two requests.
-            jitter_min: Minimum random jitter in seconds (Per Grok Round 8).
-            jitter_max: Maximum random jitter in seconds (Per Grok Round 8).
+            jitter_min: Minimum random jitter in seconds.
+            jitter_max: Maximum random jitter in seconds.
         """
         self.requests_per_second = requests_per_second
         self.window_size_seconds = window_size_seconds
