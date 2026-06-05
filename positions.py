@@ -3,7 +3,7 @@ Position Monitoring & Auto-Claim Module.
 Monitors positions and automatically claims winnings on market resolution.
 """
 
-import logging
+import logginggag
 import asyncio
 import secrets
 from dataclasses import dataclass, field
