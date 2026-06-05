@@ -15,7 +15,7 @@ Without monitoring, WS can go stale without error → falls back to slow HTTP.
 
 import asyncio
 import json
-import logging
+import loggingasws
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
