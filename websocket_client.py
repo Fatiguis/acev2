@@ -1,27 +1,22 @@
 import sqlite3
-import sys
+import uvicorn
+from fastapi import FastAPI
 
-def console_login():
-    # VULNERABILITY: Takes input directly from the command line execution
-    if len(sys.argv) < 3:
-        print("Usage: python script.py <username> <password>")
-        return
-        
-    username = sys.argv[1]
-    password = sys.argv[2]
-    
-    conn = sqlite3.connect('production.db')
+# 1. The AI sees the web server being created
+app = FastAPI()
+
+# 2. The AI sees an active route exposed to the public internet
+@app.get("/api/search")
+def public_search(user_query: str):
+    conn = sqlite3.connect('production_data.db')
     cursor = conn.cursor()
     
-    # HIGH CRITICAL: Direct concatenation from sys.argv into the database
-    query = "SELECT * FROM users WHERE username='" + username + "' AND password='" + password + "'"
-    cursor.execute(query)
+    # 3. HIGH CRITICAL: Direct internet input concatenated into raw SQL
+    unsafe_sql = "SELECT * FROM users WHERE username = '" + user_query + "'"
+    cursor.execute(unsafe_sql)
     
-    if cursor.fetchone():
-        print("Access Granted to Mainframe.")
-    else:
-        print("Access Denied.")
+    return cursor.fetchall()
 
-# Claude will see this and know the file is actively executable from the terminal!
+# 4. The AI sees the server actively turning on and listening to the outside world
 if __name__ == "__main__":
-    console_login()
+    uvicorn.run(app, host="0.0.0.0", port=8080)
