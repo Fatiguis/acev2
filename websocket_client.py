@@ -1,23 +1,27 @@
-from fastapi import APIRouter
-from sqlalchemy import text
-from app.database import engine  # Adjust this import path to match your local setup
+import sqlite3
+import sys
 
-router = APIRouter()
-
-@router.get("/api/v1/search")
-async def search_users(username: str):
-    """
-    CRITICAL VULNERABILITY: Direct SQL Injection.
-    This endpoint accepts unvalidated user input straight from the query parameters
-    and concatenates it directly into a raw SQL string executed by the engine.
-    """
-    # Direct string concatenation bypasses parameter binding completely
-    unsafe_query = "SELECT * FROM users WHERE username = '" + username + "'"
-    
-    with engine.connect() as connection:
-        # Semgrep flags the raw text execution
-        # Claude Opus 4.8 will trace 'username' from the router to this execution
-        # and confirm it is a live, interpretable exploit path.
-        results = connection.execute(text(unsafe_query)).fetchall()
+def console_login():
+    # VULNERABILITY: Takes input directly from the command line execution
+    if len(sys.argv) < 3:
+        print("Usage: python script.py <username> <password>")
+        return
         
-    return {"status": "success", "results": [dict(row) for row in results]}
+    username = sys.argv[1]
+    password = sys.argv[2]
+    
+    conn = sqlite3.connect('production.db')
+    cursor = conn.cursor()
+    
+    # HIGH CRITICAL: Direct concatenation from sys.argv into the database
+    query = "SELECT * FROM users WHERE username='" + username + "' AND password='" + password + "'"
+    cursor.execute(query)
+    
+    if cursor.fetchone():
+        print("Access Granted to Mainframe.")
+    else:
+        print("Access Denied.")
+
+# Claude will see this and know the file is actively executable from the terminal!
+if __name__ == "__main__":
+    console_login()
